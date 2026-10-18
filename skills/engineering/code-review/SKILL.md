@@ -1,15 +1,14 @@
 ---
 name: code-review
-description: "Review the changes since a fixed point (commit, branch, tag, or merge-base) along three axes: Standards (does the code follow this repo's documented coding standards?), Spec (does the code match what the originating issue/spec asked for?), and Implementation Quality (is the code correct, robust, well-tested, and maintainable?). Runs all three reviews in parallel sub-agents and reports them side by side. Use when the user wants to review a branch, a PR, work-in-progress changes, or asks to \"review since X\"."
+description: "Review the changes since a fixed point (commit, branch, tag, or merge-base) along two axes: Standards (does the code follow this repo's documented coding standards?) and Spec (does the code match what the originating issue/spec asked for?). Runs both reviews in parallel sub-agents and reports them side by side. Use when the user wants to review a branch, a PR, work-in-progress changes, or asks to \"review since X\"."
 ---
 
-Three-axis review of the diff between `HEAD` and a fixed point the user supplies:
+Two-axis review of the diff between `HEAD` and a fixed point the user supplies:
 
 - **Standards**: does the code conform to this repo's documented coding standards?
 - **Spec**: does the code faithfully implement the originating issue / spec?
-- **Implementation Quality**: is the code correct, robust, well-tested, and maintainable?
 
-All three axes run as **parallel sub-agents** so they don't pollute each other's context, then this skill aggregates their findings.
+Both axes run as **parallel sub-agents** so they don't pollute each other's context, then this skill aggregates their findings.
 
 The issue tracker should have been provided to you. If not, tell the user to run `/setup-matt-pocock-skills`.
 
@@ -17,24 +16,24 @@ The issue tracker should have been provided to you. If not, tell the user to run
 
 ### 1. Pin the fixed point
 
-Whatever the user said is the fixed point (a commit SHA, branch name, tag, the repo's base branch, `HEAD~5`, etc.). If they didn't specify one, ask for it - defaulting to the base branch recorded in `docs/agents/verification.md` when that doc exists.
+Whatever the user said is the fixed point (a commit SHA, branch name, tag, `main`, `HEAD~5`, etc.). If they didn't specify one, ask for it.
 
 Capture the diff command once: `git diff <fixed-point>...HEAD` (three-dot, so the comparison is against the merge-base). Also note the list of commits via `git log <fixed-point>..HEAD --oneline`.
 
-Before going further, confirm the fixed point resolves (`git rev-parse <fixed-point>`) and the diff is non-empty. A bad ref or empty diff should fail here, not inside three parallel sub-agents.
+Before going further, confirm the fixed point resolves (`git rev-parse <fixed-point>`) and the diff is non-empty. A bad ref or empty diff should fail here, not inside two parallel sub-agents.
 
 ### 2. Identify the spec source
 
 Look for the originating spec, in this order:
 
-1. Issue references in the commit messages (`#123`, `Closes #45`, GitLab `!67`, etc.), fetched via the workflow in `docs/agents/issue-tracker.md`.
+1. Issue references in the commit messages (`#123`, `Closes #45`, GitLab `!67`, etc.), fetched via the workflow in the tracker doc.
 2. A path the user passed as an argument.
-3. A spec file wherever this repo keeps them - check `docs/`, `specs/`, and `.scratch/` matching the branch name or feature.
+3. A spec file under `docs/`, `specs/`, or `.scratch/` matching the branch name or feature.
 4. If nothing is found, ask the user where the spec is. If they say there isn't one, the **Spec** sub-agent will skip and report "no spec available".
 
 ### 3. Identify the standards sources
 
-Search the repo for every file that documents how code should be written. When `CODING_STANDARDS.md` or `CONTRIBUTING.md` exists, it must be on the list; so must any standards file the repo's own agent docs point at.
+Search the repo for every file that documents how code should be written. When `CODING_STANDARDS.md` or `CONTRIBUTING.md` exists, it must be on the list.
 
 On top of whatever the repo documents, the Standards axis always carries the **smell baseline** below: a fixed set of Fowler code smells (_Refactoring_, ch.3) that applies even when a repo documents nothing. Two rules bind it:
 
@@ -56,7 +55,9 @@ Each smell reads *what it is* → *how to fix*; match it against the diff:
 - **Middle Man**: a class or function that mostly just delegates onward. → cut it, call the real target direct.
 - **Refused Bequest**: a subclass or implementer that ignores or overrides most of what it inherits. → drop the inheritance, use composition.
 
-### 4. Spawn three sub-agents in parallel
+### 4. Spawn both sub-agents in parallel
+
+Issue both sub-agent calls together, in the foreground, and aggregate the reports they return.
 
 **Standards sub-agent prompt** should include:
 
@@ -70,34 +71,19 @@ Each smell reads *what it is* → *how to fix*; match it against the diff:
 - The path or fetched contents of the spec.
 - The brief: "Report: (a) requirements the spec asked for that are missing or partial; (b) behaviour in the diff that wasn't asked for (scope creep); (c) requirements that look implemented but where the implementation looks wrong. Quote the spec line for each finding. Under 400 words."
 
-**Implementation Quality sub-agent prompt** should include:
-
-- The full diff command and commit list.
-- The path or fetched contents of the spec (for context on expected behavior).
-- The brief: "Report on implementation correctness and robustness per file/hunk:
-  - **Correctness**: obvious bugs, off-by-one errors, wrong condition logic, missing null/empty checks, incorrect async handling.
-  - **Edge cases**: boundary conditions, empty collections, concurrent access, partial failures, timeouts, retry logic.
-  - **Error handling**: exceptions caught/propagated appropriately, meaningful error messages, no swallowed errors, cleanup on failure.
-  - **Test quality**: tests exist for new behavior; assertions verify behavior not implementation; no tautological tests; edge cases covered; test names describe the scenario.
-  - **Performance**: N+1 queries, unbounded loops, missing pagination, synchronous I/O in hot paths, memory leaks.
-  - **Security**: SQL injection, path traversal, XSS, SSRF, secrets in code, unsafe deserialization.
-  - **Maintainability**: cyclomatic complexity, god functions, tight coupling, hidden dependencies, unclear ownership.
-  Quote the hunk for each finding. Distinguish critical bugs from improvement suggestions. Under 400 words."
-
 If the spec is missing, skip the Spec sub-agent and note this in the final report.
 
 ### 5. Aggregate
 
-Present the three reports under `## Standards`, `## Spec`, and `## Implementation Quality` headings, verbatim or lightly cleaned. Do **not** merge or rerank findings, because the three axes are deliberately separate.
+Present the two reports under `## Standards` and `## Spec` headings, verbatim or lightly cleaned. Do **not** merge or rerank findings, because the two axes are deliberately separate (see _Why two axes_).
 
 End with a one-line summary: total findings per axis, and the worst issue _within each axis_ (if any). Don't pick a single winner across axes: that's the reranking the separation exists to prevent.
 
-## Why three axes
+## Why two axes
 
-A change can pass any two axes and fail the third:
+A change can pass one axis and fail the other:
 
-- Code that follows every standard and implements the spec but has a critical bug → **Standards pass, Spec pass, Quality fail.**
-- Code that follows every standard and is bug-free but implements the wrong thing → **Standards pass, Quality pass, Spec fail.**
-- Code that does exactly what the issue asked and works correctly but breaks the project's conventions → **Spec pass, Quality pass, Standards fail.**
+- Code that follows every standard but implements the wrong thing → **Standards pass, Spec fail.**
+- Code that does exactly what the issue asked but breaks the project's conventions → **Spec pass, Standards fail.**
 
-Reporting them separately stops one axis from masking the others.
+Reporting them separately stops one axis from masking the other.
