@@ -11,6 +11,7 @@ Scaffold the per-repo configuration that the engineering skills assume:
 - **Issue tracker**: where issues live (GitHub by default; local markdown is also supported out of the box)
 - **Triage labels**: the strings used for the five canonical triage roles
 - **Domain docs**: where `GLOSSARY.md` and ADRs live, and the consumer rules for reading them
+- **Verification**: the commands that prove work is correct, the base branch work lands on, and whether PRs are a surface here
 
 This is a prompt-driven skill, not a deterministic script. Explore, present what you found, confirm with the user, then write.
 
@@ -26,6 +27,9 @@ Look at the current repo to understand its starting state. Read whatever exists;
 - `docs/adr/` and any `src/*/docs/adr/` directories
 - `docs/agents/`: does this skill's prior output already exist?
 - `.scratch/`: a sign that a local-markdown issue tracker convention is already in use
+- The repo's own check commands: `package.json` scripts, `Makefile` targets, `justfile`, `pyproject.toml`/`pytest` config, and the CI workflow (`.github/workflows/*`, `.gitlab-ci.yml`). Prefer CI: it is what the maintainers actually gate on. Look for a *fast* tier as well as the full suite (a `test-fast`-style target, a unit-only directory, a job that skips the slow tests)
+- The base branch: `git symbolic-ref refs/remotes/origin/HEAD`; if that fails, the remote's HEAD or the repo's only long-lived branch
+- Whether the remote hosting has a merge-request surface at all (a repo with no remote, or one that commits straight to its base branch, has none)
 - Is the `triage` skill installed? (a `triage` skill folder alongside this one, or `triage` in your available skills.) This decides whether Section B runs at all.
 - Monorepo signals: a `pnpm-workspace.yaml`, a `workspaces` field in `package.json`, or a populated `packages/*` with its own `src/`. These are present only in a genuinely large multi-package repo; their absence means single-context, which is almost every repo.
 
@@ -60,12 +64,25 @@ The defaults are the five canonical roles, each label string equal to its name: 
 
 Offer **multi-context** (a root `GLOSSARY-MAP.md` pointing to per-context `GLOSSARY.md` files) only when exploration found monorepo signals. Then confirm which layout they want.
 
+**Section D: Verification.**
+
+> Explainer: "Verification" is how an agent proves it didn't break something. Skills like `implement-spec`, `code-review`, and `tdd` need a real command to run, and an unattended run cannot stop and ask mid-flight. This is also where the base branch and the PR flow get recorded, so nobody has to guess whether this repo lands work through merge requests.
+
+Lead with what exploration found, as one question: the full-suite command, the fast tier, the single-test form, any static checks, and the base branch. The recommendation is the command CI runs (or the `Makefile`/`package.json` script wrapping it); the fallback is to work it out from the project's tooling and confirm. Ask about the timeout only when the suite is slow enough that a default cap would falsely fail it; otherwise record the default.
+
+Two cases to state out loud rather than improvise:
+
+- **No automated check exists.** Record `none`. Don't invent a command and don't leave the field blank: a later skill needs to know the absence is a fact about the repo, not a gap in this file.
+- **The slow tier can't pass on demand** (browser tests needing a display, a service that isn't running). Record it in the full-suite command anyway, and note here how to run *without* that tier, so an orchestrated run can gate narrow through the middle and full at the end.
+
+Record the answers in `docs/agents/verification.md` using the seed template's headings. Nothing here duplicates `issue-tracker.md`: if the tracker has no PR surface, **PR surface** is `no`.
+
 ### 3. Confirm and edit
 
 Show the user a draft of:
 
 - The `## Agent skills` block to add to whichever of `CLAUDE.md` / `AGENTS.md` is being edited (see step 4 for selection rules)
-- The contents of `docs/agents/issue-tracker.md`, `docs/agents/domain.md`, and `docs/agents/triage-labels.md` (the last only when `triage` is installed)
+- The contents of `docs/agents/issue-tracker.md`, `docs/agents/verification.md`, `docs/agents/domain.md`, and `docs/agents/triage-labels.md` (the last only when `triage` is installed)
 
 Let them edit before writing.
 
@@ -97,11 +114,13 @@ The block:
 ### Domain docs
 
 [one-line summary of layout: "single-context" or "multi-context"]. See `docs/agents/domain.md`.
+
+### Verification
+
+[one line: the full-suite command, the fast tier, and the base branch]. See `docs/agents/verification.md`.
 ```
 
 Include the `### Triage labels` sub-block, and write `docs/agents/triage-labels.md`, only when `triage` is installed and Section B ran. When it isn't, both are omitted.
-
-When Section B ran on GitHub or GitLab, create each configured label the tracker lacks (`gh label create` / `glab label create`).
 
 Then write the docs files using the seed templates in this skill folder as a starting point:
 
@@ -109,6 +128,7 @@ Then write the docs files using the seed templates in this skill folder as a sta
 - [issue-tracker-gitlab.md](./issue-tracker-gitlab.md): GitLab issue tracker
 - [issue-tracker-local.md](./issue-tracker-local.md): local-markdown issue tracker
 - [triage-labels.md](./triage-labels.md): label mapping (only if `triage` is installed)
+- [verification.md](./verification.md): check commands, branches, and PR surface
 - [domain.md](./domain.md): domain doc consumer rules + layout
 
 For "other" issue trackers, write `docs/agents/issue-tracker.md` from scratch using the user's description.
