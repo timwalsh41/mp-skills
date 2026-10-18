@@ -64,4 +64,4 @@ otherwise, including when you have judgement-call smells to report but nothing m
 ```
 Review verdict: MISSING_TARGET
 ```
-only when the branch or spec/ticket paths named in your task do not exist. Report what was absent and stop — reviewing a nearby branch or another feature's tickets is never the fallback, because the orchestrator cannot tell that report from a real one.
+only when the branch or spec/ticket references named in your task do not exist. Report what was absent and stop — reviewing a nearby branch or another feature's tickets is never the fallback, because the orchestrator cannot tell that report from a real one.

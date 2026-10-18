@@ -14,7 +14,7 @@
 // (check commands, base branch, PR surface). This script has no filesystem
 // access, so it carries no project defaults and fails fast on missing ones.
 //   specPath           REQUIRED  e.g. ".scratch/<feature-slug>/spec.md"
-//   issuesDir          REQUIRED  e.g. ".scratch/<feature-slug>/issues"
+//   ticketsRef         REQUIRED  e.g. ".scratch/<feature-slug>/issues"
 //   integrationBranch  REQUIRED  named branch only, e.g. "<feature-slug>-integration"
 //   fullGate           REQUIRED  the repo's full-suite command
 //   narrowGate         default = fullGate; the repo's fast subset
@@ -23,7 +23,7 @@
 //   skipPR             default false
 //   verifyOnly         default false. Skip implementation entirely and run
 //                      only the closing sequence (final verify, reviews, fix,
-//                      PR) over whatever the ticket files already mark
+//                      PR) over whatever the tickets already mark
 //                      resolved. Resume mode for mid-stream pickups.
 //   fullGateTickets    default null = every ticket gates on the FULL suite.
 //                      When only some tickets own the slow tier (browser tests,
@@ -48,9 +48,6 @@
 //                      "npm test -- <path> -t <name>", "go test ./pkg -run <Name>"
 //   flakePattern       extra regex vocabulary this repo's transient failures
 //                      use, appended to the generic set
-//   statusField / blockingField / answerHeading / resolvedStatuses
-//                      ticket-file vocabulary; defaults are the local-markdown
-//                      tracker conventions written by to-tickets
 //   agents             role-name map { scout, implementer, merger, prWriter,
 //                      reviewerStandards, reviewerSpec, reviewerQuality } for
 //                      projects whose agent definitions use other names
@@ -66,8 +63,8 @@
 //   - Every implementer/fixer/merger carries a verification gate that runs on
 //     the host in that child's tree; a run is not ok unless the gate passes.
 //     Child claims alone never count as verified.
-//   - Ticket statuses are re-read from the ticket FILES every wave by a scout
-//     child; the script never trusts a child's self-report of resolution.
+//   - Ticket state is re-read from the tracker every wave by a scout child;
+//     the script never trusts a child's self-report of resolution.
 //   - A review axis that returns no 'Review verdict:' line is INCOMPLETE, not
 //     a pass: the PR is suppressed and the lead is escalated. (Silently
 //     reading a missing verdict as OK was how a crashed reviewer green-lit a
@@ -101,7 +98,7 @@
 // ---------------------------------------------------------------------------
 const A = args || {};
 const specPath = A.specPath || null;
-const issuesDir = A.issuesDir || null;
+const ticketsRef = A.ticketsRef || null;
 const integrationBranch = A.integrationBranch || null;
 const FULL_GATE = A.fullGate || null;
 
@@ -110,7 +107,7 @@ const FULL_GATE = A.fullGate || null;
 // nobody named is worse. Bail before any child launches.
 const missingArgs = [];
 if (!specPath) missingArgs.push("specPath");
-if (!issuesDir) missingArgs.push("issuesDir");
+if (!ticketsRef) missingArgs.push("ticketsRef");
 if (!integrationBranch) missingArgs.push("integrationBranch");
 if (!FULL_GATE) missingArgs.push("fullGate");
 if (missingArgs.length) {
@@ -133,13 +130,14 @@ const STANDARDS_DOCS = A.standardsDocs ||
   "the files this repo documents as coding standards (search for CODING_STANDARDS.md, CONTRIBUTING.md, and anything AGENTS.md points at)";
 const RETEST_COMMAND = A.singleRetestCommand || null;
 
-// Ticket-file vocabulary: the local-markdown tracker conventions from
-// to-tickets / docs/agents/issue-tracker.md, overridable per repo.
-const STATUS_FIELD = A.statusField || "Status";
-const BLOCKING_FIELD = A.blockingField || "Blocked by";
-const ANSWER_HEADING = A.answerHeading || "## Answer";
-const RESOLVED_STATUSES = A.resolvedStatuses || ["resolved", "wontfix"];
-function isResolved(status) { return RESOLVED_STATUSES.indexOf(status) >= 0; }
+// Default Markdown-body conventions for the completion instructions handed to
+// children. The tracker doc (docs/agents/issue-tracker.md) is the authority;
+// these only seed the task text for trackers whose tickets use a Markdown body.
+const STATUS_FIELD = "Status";
+const ANSWER_HEADING = "## Answer";
+const RESOLVED_STATUSES = ["resolved", "wontfix"];
+// A run key safe for any tracker's ticket reference (paths, #42, PROJ-123).
+function keyOf(ref) { return String(ref).replace(/[^a-zA-Z0-9._-]+/g, "_"); }
 
 // Child roles. Projects that define these agents under other names pass an
 // `agents` map instead of editing this script.
@@ -156,25 +154,24 @@ const AG = {
 
 const IMPL_TIMEOUT_MS = A.implTimeoutMs || 45 * 60 * 1000;
 const MERGE_TIMEOUT_MS = A.mergeTimeoutMs || 20 * 60 * 1000;
-// Audit finding #2: the harness default gate cap is 120s, under the real
+// The harness default gate cap is 120s, under the real
 // suite runtime. EVERY gate must carry an explicit generous deadline — so
 // children get the launch object, never a bare command string.
 const GATE_TIMEOUT_MS = A.gateTimeoutMs || 15 * 60 * 1000;
 const MAX_REMEDIATIONS = A.maxRemediations || 2;
 
-// Gate commands are args-only (audit finding: hardcoded gate strings forced
-// three mid-run patches).
+// Gate commands are args-only
 const NARROW_GATE = A.narrowGate || FULL_GATE;
 const fullGateTickets = A.fullGateTickets || null;
 function gateObj(command) { return { command: command, timeoutMs: GATE_TIMEOUT_MS }; }
-function gateFor(ticketNumber) {
+function gateFor(ref) {
   if (!fullGateTickets) return gateObj(FULL_GATE);
-  return gateObj(fullGateTickets.indexOf(ticketNumber) >= 0 ? FULL_GATE : NARROW_GATE);
+  return gateObj(fullGateTickets.indexOf(ref) >= 0 ? FULL_GATE : NARROW_GATE);
 }
 // The command STRING, for prompt text. Interpolating a gate *object* into a
 // task renders "[object Object]", which is what children were being told to
 // run. Anything user-facing needs .command via this helper.
-function gateCommand(ticketNumber) { return gateFor(ticketNumber).command; }
+function gateCommand(ref) { return gateFor(ref).command; }
 
 // Transient-failure vocabulary; repos can add their own wording via
 // args.flakePattern (an invalid pattern degrades to the generic set).
@@ -187,7 +184,7 @@ try {
   emit("implement-spec: ignoring invalid args.flakePattern (" + eFlake + "); using the generic set");
 }
 
-emit("implement-spec: spec=" + specPath + " issues=" + issuesDir +
+emit("implement-spec: spec=" + specPath + " tickets=" + ticketsRef +
       " integration=" + integrationBranch + " base=" + BASE_BRANCH +
       " maxParallel=" + maxParallel + " maxWaves=" + maxWaves +
       " gates=[full: " + FULL_GATE + "]" +
@@ -202,42 +199,43 @@ emit("implement-spec: spec=" + specPath + " issues=" + issuesDir +
 // rejected by workflow validation).
 // ---------------------------------------------------------------------------
 
-// Wave 0/per-wave discovery child: enumerate tickets, statuses, and the
-// blocker graph straight from the ticket files. No typed gate here — the
+// Wave 0/per-wave discovery child: enumerate the run's tickets and the
+// blocker graph from the configured issue tracker. No typed gate here — the
 // gate command's own stdout must be the JSON document, and discovery has no
 // natural command to emit it; instead the script parses the child's returned
 // output text (statusesFromGraph) and fails loudly if it cannot.
 function readTicketGraph() {
-  const fileList = issuesDir + "/*.md";
   const task = [
-    "Read every markdown ticket file in " + issuesDir + " (glob: " + fileList + ").",
-    "Read ONLY that directory. If it does not exist, or matches no files, return",
-    'an empty tickets array. Never substitute a similar-looking directory, a',
-    "different feature folder, or files you found by searching: an empty answer",
-    "is the correct answer for an empty target, while a plausible answer about",
-    "someone else's tickets would be read as a verified run over this one.",
+    "Enumerate this run's tickets from the configured issue tracker.",
+    "The tracker target for this run: " + ticketsRef,
+    "Use the tracker convention your role defines. Do NOT assume tickets are files.",
+    "Read ONLY that target. If it does not exist, or matches no tickets, return",
+    'an empty tickets array. Never substitute a similar-looking target, another',
+    "feature's tickets, or issues you found by searching: an empty answer is the",
+    "correct answer for an empty target, while a plausible answer about someone",
+    "else's tickets would be read as a verified run over this one.",
     "For EACH ticket output one object with:",
-    "  file: the path relative to the repo root (e.g. " + issuesDir + "/07-tickets-list.md),",
-    "  number: the integer ticket number parsed from the filename prefix,",
-    "  status: the exact value of the '**" + STATUS_FIELD + ":**' field (e.g. resolved, ready-for-agent),",
-    "  blockedBy: every integer listed on the '**" + BLOCKING_FIELD + ":**' field ([] if none or empty).",
-    "Keep each object on ONE line. No title field. Compact JSON, no whitespace.",
-    "If a ticket file contains more than one '**" + STATUS_FIELD + ":**' line, use the LAST one",
-    "and after the JSON append 'DUP_STATUS:<ticket-number>' — one line per affected file.",
-    "If a file cannot be read at all, append 'UNREADABLE:<path>' for it.",
+    "  ref: the ticket's reference in this tracker (e.g. 07, #42, PROJ-123),",
+    "  title: the ticket title,",
+    "  resolved: true when the tracker marks the ticket closed/done, else false,",
+    "  blockedBy: the refs of every ticket this one is blocked by ([] if none).",
+    "Keep each object on ONE line. Compact JSON, no whitespace.",
+    "If a ticket cannot be read at all, append 'UNREADABLE:<ref>' for it.",
     "",
     "Preflight, reported in the same JSON document:",
-    "  integrationBranchExists — run `git rev-parse --verify " + baseRef + "` and",
-    "  report true only if it exits 0; integrationBranch — the name you tested.",
+    "  trackerConfigured: true when a usable issue tracker is configured; if",
+    "  not, report false and stop.",
+    "  integrationBranchExists: run `git rev-parse --verify " + baseRef + "` and",
+    "  report true only if it exits 0; integrationBranch: the name you tested.",
     "  Report only. Never create, fetch, switch to, or merge that branch.",
     "",
     "Your FINAL response must begin with ONLY this JSON document (no prose",
     "before or inside it):",
-    '{"tickets":[{"file":"...","number":1,"status":"...","blockedBy":[]}],',
-    ' "preflight":{"integrationBranchExists":true,"integrationBranch":"' + integrationBranch + '"}}'
+    '{"tickets":[{"ref":"07","title":"...","resolved":false,"blockedBy":[]}],',
+    ' "preflight":{"trackerConfigured":true,"integrationBranchExists":true,"integrationBranch":"' + integrationBranch + '"}}'
   ].join("\n");
   return runs.run("ticket-graph", {
-    label: "Read ticket graph from " + issuesDir,
+    label: "Read ticket graph from " + ticketsRef,
     agent: AG.scout,
     task: task,
     timeoutMs: 10 * 60 * 1000,
@@ -250,18 +248,19 @@ function readTicketGraph() {
           type: "array",
           items: {
             type: "object",
-            required: ["file", "number", "status", "blockedBy"],
+            required: ["ref", "resolved", "blockedBy"],
             properties: {
-              file: { type: "string" },
-              number: { type: "integer" },
-              status: { type: "string" },
-              blockedBy: { type: "array", items: { type: "integer" } }
+              ref: { type: "string" },
+              title: { type: "string" },
+              resolved: { type: "boolean" },
+              blockedBy: { type: "array", items: { type: "string" } }
             }
           }
         },
         preflight: {
           type: "object",
           properties: {
+            trackerConfigured: { type: "boolean" },
             integrationBranchExists: { type: "boolean" },
             integrationBranch: { type: "string" }
           }
@@ -269,12 +268,6 @@ function readTicketGraph() {
       }
     }
   });
-}
-
-function ticketNumberFromPath(file) {
-  const base = file.split("/").pop() || file;
-  const match = base.match(/^(\d+)/);
-  return match ? parseInt(match[1], 10) : null;
 }
 
 // Read the preflight object out of the discovery child's JSON envelope, when it
@@ -290,15 +283,6 @@ function preflightFromGraph(result) {
   } catch (e) {
     return null;  // the tolerant per-object recovery path keeps no envelope
   }
-}
-
-// Enforcement: a discovery child that cannot find its target must say so with an
-// empty array, not go and read a directory that merely looks right. Anything
-// outside issuesDir is refused here rather than run on.
-function withinIssuesDir(file) {
-  const p = String(file || "").replace(/^\.\//, "");
-  const dir = String(issuesDir).replace(/^\.\//, "").replace(/\/+$/, "");
-  return p === dir || p.indexOf(dir + "/") === 0;
 }
 
 function statusesFromGraph(result) {
@@ -324,7 +308,7 @@ function statusesFromGraph(result) {
       while ((m = re.exec(slice)) !== null) {
         try {
           const obj = JSON.parse(m[0]);
-          if (obj && obj.file && obj.status !== undefined) recovered.push(obj);
+          if (obj && obj.ref !== undefined && obj.resolved !== undefined) recovered.push(obj);
         } catch (e2) { /* skip incomplete object */ }
       }
       if (recovered.length) {
@@ -339,16 +323,16 @@ function statusesFromGraph(result) {
 // One implementer child: isolated worktree off the integration branch,
 // verified by the gate running on the host afterwards.
 function spawnImplementer(ticket, wave) {
-  const key = "impl-" + wave + "-t" + ticket.number;
+  const key = "impl-" + wave + "-t" + keyOf(ticket.ref);
   const task = [
     "Implement EXACTLY ONE ticket, end to end, using TDD (red-green-refactor).",
     "",
-    "Ticket file (read it first, it is your single source of truth): " + ticket.file,
+    "Ticket (read it first, using the tracker convention your role defines): " + ticket.ref,
     "Full spec for background context only: " + specPath,
     "",
     "Rules:",
     "- Implement only this ticket. Other tickets belong to other workers.",
-    "- Check off every `- [ ]` acceptance criterion in the ticket file as you",
+    "- Check off every `- [ ]` acceptance criterion in the ticket as you",
     "  satisfy it, and set `**" + STATUS_FIELD + ":** " + RESOLVED_STATUSES[0] + "` ONLY when all are checked.",
     "- EDIT the existing '**" + STATUS_FIELD + ":**' line in place — never append a second one.",
     "- Append a short implementation summary under '" + ANSWER_HEADING + "' in the ticket.",
@@ -361,13 +345,13 @@ function spawnImplementer(ticket, wave) {
     "Return a concise summary: what you implemented, test results, decisions."
   ].join("\n");
   return runs.run(key, {
-    label: "Implement ticket " + ticket.number + ": " + ticket.title,
+    label: "Implement ticket " + ticket.ref + ": " + ticket.title,
     agent: AG.implementer,
     task: task,
     worktree: true,
     baseRef: baseRef,
     timeoutMs: IMPL_TIMEOUT_MS,
-    gate: gateFor(ticket.number),
+    gate: gateFor(ticket.ref),
     quiet: true
   });
 }
@@ -383,27 +367,27 @@ function spawnImplementer(ticket, wave) {
 // A retained resume reuses the child's stored contract, so `agent` and `gate`
 // cannot be attached to it: the revived child self-verifies, and the merge
 // gate re-verifies on the integration branch before the ticket counts merged.
-function tryResume(runId, ticketNumber, wave) {
+function tryResume(runId, ref, wave) {
   if (!runId) {
-    emit("ticket " + ticketNumber + ": no run id to resume; using continue-child fallback");
+    emit("ticket " + ref + ": no run id to resume; using continue-child fallback");
     return null;
   }
   // Both shapes of failure must degrade to the continue-child: a rejected
   // launch (async) and a preflight rejection thrown at call time (sync).
   try {
-    return runs.run("resume-" + wave + "-t" + ticketNumber, {
+    return runs.run("resume-" + wave + "-t" + keyOf(ref), {
       resume: runId,
       task: "You timed out mid-ticket. Continue from where you left off in your " +
         "own worktree (your partial changes are still there). Finish the remaining " +
-        "acceptance criteria, run the gate yourself until green: " + gateCommand(ticketNumber) +
+        "acceptance criteria, run the gate yourself until green: " + gateCommand(ref) +
         ", then finish with the acceptance-report block.",
       timeoutMs: IMPL_TIMEOUT_MS
     }).catch(function(e) {
-      emit("ticket " + ticketNumber + ": resume rejected (" + e + "); using continue-child fallback");
+      emit("ticket " + ref + ": resume rejected (" + e + "); using continue-child fallback");
       return null;
     });
   } catch (eSync) {
-    emit("ticket " + ticketNumber + ": resume launch threw (" + eSync + "); using continue-child fallback");
+    emit("ticket " + ref + ": resume launch threw (" + eSync + "); using continue-child fallback");
     return null;
   }
 }
@@ -413,9 +397,9 @@ function tryResume(runId, ticketNumber, wave) {
 // here — it works directly in the existing worktree, so it must report the
 // path back for the merger (WORKTREE_PATH handshake).
 function spawnContinueChild(ticket, runId, wave) {
-  const key = "continue-" + wave + "-t" + ticket.number;
+  const key = "continue-" + wave + "-t" + keyOf(ticket.ref);
   const task = [
-    "REMEDIATION: a previous implementer for ticket " + ticket.number + " timed",
+    "REMEDIATION: a previous implementer for ticket " + ticket.ref + " timed",
     "out mid-implementation. Its partial, uncommitted work still exists in a",
     "managed git worktree. Its run id: " + (runId || "unknown"),
     "",
@@ -427,8 +411,8 @@ function spawnContinueChild(ticket, runId, wave) {
     "   run reported artifact paths, use those. If nothing matches, say so rather",
     "   than reimplementing.",
     "2. cd into that worktree; git status shows the partial changes. Read the",
-    "   ticket file (" + ticket.file + ") for the remaining acceptance criteria.",
-    "3. Finish the remaining criteria, keep the gate green yourself: " + gateCommand(ticket.number),
+    "   ticket (" + ticket.ref + ") for the remaining acceptance criteria.",
+    "3. Finish the remaining criteria, keep the gate green yourself: " + gateCommand(ticket.ref),
     "4. Leave changes uncommitted. Do NOT commit, stage, or spawn subagents.",
     "",
     "The ABSOLUTE LAST LINE of your final response MUST be exactly:",
@@ -436,11 +420,11 @@ function spawnContinueChild(ticket, runId, wave) {
     "so the orchestrator can hand your worktree to the merger."
   ].join("\n");
   return runs.run(key, {
-    label: "Continue ticket " + ticket.number + " (finish timed-out work in place)",
+    label: "Continue ticket " + ticket.ref + " (finish timed-out work in place)",
     agent: AG.implementer,
     task: task,
     timeoutMs: IMPL_TIMEOUT_MS,
-    gate: gateFor(ticket.number)
+    gate: gateFor(ticket.ref)
   });
 }
 
@@ -448,15 +432,15 @@ function spawnContinueChild(ticket, runId, wave) {
 // applies the previous run's captured patch and repairs it. The worktree is
 // new but the WORK is not from scratch — it starts from the previous patch.
 function spawnFixer(ticket, priorResult, wave) {
-  const key = "fix-" + wave + "-t" + ticket.number;
+  const key = "fix-" + wave + "-t" + keyOf(ticket.ref);
   const manifestHint = (priorResult && priorResult.artifactPaths || []).join(" ");
   const runId = priorResult && priorResult.runId;
   const task = [
-    "REMEDIATION: the implementer for ticket " + ticket.number + " completed but",
+    "REMEDIATION: the implementer for ticket " + ticket.ref + " completed but",
     "FAILED its verification gate. Its work is preserved as a captured patch;",
     "your job is to repair it, not rewrite it from scratch.",
     "",
-    "Ticket file: " + ticket.file,
+    "Ticket: " + ticket.ref,
     "Previous run id: " + (runId || "unknown"),
     "Candidate manifest/artifact paths: " + (manifestHint || "(search by the run id below)"),
     "The run's handoff artifacts live under the subagent artifact root, e.g.",
@@ -466,7 +450,7 @@ function spawnFixer(ticket, priorResult, wave) {
     "1. Locate the previous run's handoff manifest / captured patch.",
     "2. Apply it to YOUR worktree: git apply --index <patch>",
     "   (your worktree already branches from " + integrationBranch + ").",
-    "3. Run the gate: " + gateCommand(ticket.number),
+    "3. Run the gate: " + gateCommand(ticket.ref),
     "4. Fix the failures the gate reports. Stay within this ticket's scope.",
     "5. Re-run the gate until green, then finish with the acceptance-report block.",
     "",
@@ -474,13 +458,13 @@ function spawnFixer(ticket, priorResult, wave) {
     "change nothing."
   ].join("\n");
   return runs.run(key, {
-    label: "Fix ticket " + ticket.number + " (repair after gate failure)",
+    label: "Fix ticket " + ticket.ref + " (repair after gate failure)",
     agent: AG.implementer,
     task: task,
     worktree: true,
     baseRef: baseRef,
     timeoutMs: IMPL_TIMEOUT_MS,
-    gate: gateFor(ticket.number)
+    gate: gateFor(ticket.ref)
   });
 }
 
@@ -491,15 +475,15 @@ function spawnFixer(ticket, priorResult, wave) {
 // merger after a partial merge succeeds cleanly.
 function spawnMerger(ticket, implResult, wave, worktreePath) {
   const manifestHint = (implResult && implResult.artifactPaths || []).join(" ");
-  const key = "merge-" + wave + "-t" + ticket.number;
-  const gate = gateFor(ticket.number);
+  const key = "merge-" + wave + "-t" + keyOf(ticket.ref);
+  const gate = gateFor(ticket.ref);
   const source = worktreePath
     ? [
         "The implementer worked directly in a retained worktree at:",
         "  " + worktreePath,
         "Capture its uncommitted changes from there, e.g.:",
-        "  git -C " + worktreePath + " diff > /tmp/ticket-" + ticket.number + ".patch",
-        "then apply in the main checkout: git apply --index /tmp/ticket-" + ticket.number + ".patch"
+        "  git -C " + worktreePath + " diff > /tmp/ticket-" + keyOf(ticket.ref) + ".patch",
+        "then apply in the main checkout: git apply --index /tmp/ticket-" + keyOf(ticket.ref) + ".patch"
       ]
     : [
         "The implementer ran in a managed worktree; its patch is recorded in a",
@@ -509,7 +493,7 @@ function spawnMerger(ticket, implResult, wave, worktreePath) {
   const task = [
     "Merge one completed implementer's work into " + integrationBranch + ".",
     "",
-    "Ticket: " + ticket.file + " (number " + ticket.number + ")",
+    "Ticket: " + ticket.ref,
     "",
     "Implementer changes source:",
     source.join("\n"),
@@ -518,11 +502,11 @@ function spawnMerger(ticket, implResult, wave, worktreePath) {
     "1. Confirm the main checkout is on " + integrationBranch + " and clean",
     "   (git status). If it is dirty or on another branch, STOP and report.",
     "2. If a commit implementing this ticket ALREADY exists on the integration",
-    "   branch (git log --grep 'ticket " + ticket.number + "'), report that the",
+    "   branch (git log --grep 'ticket " + ticket.ref + "'), report that the",
     "   merge was already done and exit successfully — do not merge twice.",
     "3. Apply the implementer's changes (per the source above). If the patch is",
     "   empty or already applied, note that and continue.",
-    "4. Commit: git commit -m \"Implement ticket " + ticket.number + ": " + ticket.title + "\"",
+    "4. Commit: git commit -m \"Implement ticket " + ticket.ref + ": " + ticket.title + "\"",
     "5. Re-run the verification gate yourself as well: " + gate.command,
     "6. Do NOT delete branches or run any worktree-manager commands.",
     "",
@@ -532,7 +516,7 @@ function spawnMerger(ticket, implResult, wave, worktreePath) {
     "Return: merge status, commit hash, gate result."
   ].join("\n");
   return runs.run(key, {
-    label: "Merge ticket " + ticket.number + " into " + integrationBranch,
+    label: "Merge ticket " + ticket.ref + " into " + integrationBranch,
     agent: AG.merger,
     task: task,
     timeoutMs: MERGE_TIMEOUT_MS,
@@ -547,7 +531,7 @@ function spawnReviews(wave) {
       "You are the " + axis + " reviewer for the implement-spec workflow.",
       "Review the work integrated on branch " + integrationBranch + " in this",
       "checkout (git log/diff against " + BASE_BRANCH + " as needed). Focus: " + focus,
-      "Spec: " + specPath + "  Tickets: " + issuesDir + "/",
+      "Spec: " + specPath + "  Tickets: " + ticketsRef,
       "",
       "Review ONLY that target. First confirm it exists: if the branch named",
       "above does not resolve, or the spec/ticket paths are missing, do NOT",
@@ -601,7 +585,7 @@ function classifyFailure(result) {
   if (result.ok) return "ok";
   const err = String(result.error || "");
   if (/timed?\s?out|timeout|deadline/i.test(err)) return "timeout";
-  // Audit finding #4: a single flaky e2e test failure must not abort the
+  // A single flaky e2e test failure must not abort the
   // whole workflow. Classify it explicitly so the ladder can re-run the
   // gate (quarantine/recheck) instead of paying for a full code fixer.
   if (FLAKE_RE.test(err)) return "flake";
@@ -620,10 +604,10 @@ function classifyFailure(result) {
 // tracking the tree the child works in), so the script parses the reported
 // label and the merge gate re-verifies the work for real afterwards.
 function spawnFlakeRecheck(ticket, priorResult, wave) {
-  const key = "flake-recheck-" + wave + "-t" + ticket.number;
+  const key = "flake-recheck-" + wave + "-t" + keyOf(ticket.ref);
   const runId = priorResult && priorResult.runId;
   const task = [
-    "The verification gate for ticket " + ticket.number + " failed once, in run " +
+    "The verification gate for ticket " + ticket.ref + " failed once, in run " +
       (runId || "unknown") + ". That looks like a LIKELY FLAKE (a single",
     "transient-looking test failure), not a real defect. Prove it either way.",
     "",
@@ -649,37 +633,32 @@ function spawnFlakeRecheck(ticket, priorResult, wave) {
     "Return ONLY the test result and one of the labels above."
   ].join("\n");
   return runs.run(key, {
-    label: "Flake recheck ticket " + ticket.number + " (in the failed run's worktree)",
+    label: "Flake recheck ticket " + ticket.ref + " (in the failed run's worktree)",
     agent: AG.implementer,
     task: task,
     timeoutMs: 15 * 60 * 1000
   });
 }
 
-// Audit finding #10: caching the ticket graph. Because the ticket files
-// are the source of truth and can be edited by implementers (status flips)
-// and mergers (patch application), we must refresh the graph when we know
-// we've mutated the issues dir — but not on every single wave start. We
-// cache the last-read result and only force a re-fetch after a merger
-// commits changes to the integration branch (which can update ticket files).
+// Because the tracker is the source of truth and can be updated by 
+// implementers (status flips) and mergers (patch application), we must
+// refresh the graph when a ticket may have changed, but not on every single
+// wave start. We cache the last-read result and only force a re-fetch after
+// a merger commits changes to the
+// integration branch.
 let ticketGraphCache = null;
-// The scout's lint tokens are load-bearing: a duplicate status field makes a
-// ticket's state ambiguous, and an unreadable file means it silently dropped
-// out of this wave's frontier. Emit both instead of dropping them.
+// An unreadable ticket silently drops out of this wave's frontier, so report
+// it instead of dropping it.
 function scoutLints(result) {
   const text = String((result && result.output) || "");
-  const dups = text.match(/DUP_STATUS:\s*(\d+)/g) || [];
   const unreadable = text.match(/UNREADABLE:\s*\S+/g) || [];
-  dups.forEach(function(d) {
-    emit("ticket-graph: " + d + " — ambiguous status; leave exactly one '" + STATUS_FIELD + ":' line in that file");
-  });
   unreadable.forEach(function(u) {
-    emit("ticket-graph: " + u + " — ticket file unreadable this wave");
+    emit("ticket-graph: " + u + ": ticket unreadable this wave");
   });
 }
 function getTicketGraph(forceDiscovery) {
   if (ticketGraphCache && !forceDiscovery) {
-    emit("ticket graph: reused cached discovery (issuesDir unchanged since last read)");
+    emit("ticket graph: reused cached discovery (ticketsRef unchanged since last read)");
     return Promise.resolve(ticketGraphCache);
   }
   return readTicketGraph().then(function(result) {
@@ -698,8 +677,8 @@ function extractWorktreePath(output) {
 }
 
 // Structured escalation: the lead (not the script) decides what happens next.
-function escalate(ticketNumber, reason, detail) {
-  emit("ESCALATION: ticket " + ticketNumber + " — " + reason +
+function escalate(ref, reason, detail) {
+  emit("ESCALATION: ticket " + ref + " — " + reason +
        (detail ? " | detail: " + detail : "") +
        " | Lead decision needed: resume/fix/park this ticket. Dependents are waiting.");
 }
@@ -708,33 +687,34 @@ function escalate(ticketNumber, reason, detail) {
 // Main flow — top-level awaits only.
 // ---------------------------------------------------------------------------
 
-// Wave 0: discover the ticket graph from the files themselves (#10: this is
-// the only point where we force a fresh read; later waves re-use the cache).
+// Wave 0: discover the ticket graph from the tracker (#10: this is the only
+// point where we force a fresh read; later waves re-use the cache).
 const graphRun = await getTicketGraph(true);
 const graphOk = !!(graphRun && graphRun.ok);
-const rawTickets = statusesFromGraph(graphRun);
-const tickets = rawTickets.filter(function (t) { return withinIssuesDir(t.file); });
-const offTarget = rawTickets.length - tickets.length;
-if (offTarget > 0) {
-  emit("ESCALATION: ticket-graph: " + offTarget + " of " + rawTickets.length +
-       " discovered file(s) are not under issuesDir=" + issuesDir +
-       " — refusing to run on substituted tickets.");
-}
+const tickets = statusesFromGraph(graphRun);
 if (!tickets.length) {
   return {
     ok: false,
-    error: "ticket discovery found no tickets under " + issuesDir + "/*.md"
+    error: "ticket discovery found no tickets for " + ticketsRef
       + (graphOk ? "" : " (the discovery run itself failed)")
-      + ". Check the path against docs/agents/issue-tracker.md and relaunch with the right issuesDir.",
-    discoveredOffTarget: offTarget,
+      + ". Check the target against docs/agents/issue-tracker.md and relaunch.",
     discoveryRunId: graphRun && graphRun.runId
   };
 }
 
-// Wave 0 preflight: the integration branch must already exist. Without this,
-// every implementer dies on an unresolvable baseRef and the run burns its whole
-// remediation budget discovering a typo in a branch name.
+// Wave 0 preflight: a tracker must be configured and the integration branch
+// must already exist. Without these, the run either has nothing to read or
+// every implementer dies on an unresolvable baseRef.
 const preflight = preflightFromGraph(graphRun);
+if (preflight && preflight.trackerConfigured === false) {
+  return {
+    ok: false,
+    error: "no usable issue tracker is configured. Run /setup-matt-pocock-skills, " +
+      "then relaunch. The tracker is recorded in docs/agents/issue-tracker.md.",
+    preflight: preflight,
+    discoveredTickets: tickets.length
+  };
+}
 if (preflight && preflight.integrationBranchExists === false) {
   return {
     ok: false,
@@ -751,39 +731,39 @@ if (!preflight) {
 }
 
 // Normalize + index. Script-side ledger of what has been merged.
-const byNumber = {};
+const byRef = {};
 const order = [];
 for (const t of tickets) {
-  const num = (typeof t.number === "number") ? t.number : ticketNumberFromPath(t.file || "");
-  if (num === null || Number.isNaN(num)) continue;
-  if (!byNumber[num]) { order.push(num); }
-  byNumber[num] = {
-    number: num,
-    file: t.file,
-    title: t.title || ("ticket " + num),
-    blockedBy: Array.isArray(t.blockedBy) ? t.blockedBy : []
+  const ref = (t.ref === undefined || t.ref === null) ? "" : String(t.ref);
+  if (!ref) continue;
+  if (!byRef[ref]) { order.push(ref); }
+  byRef[ref] = {
+    ref: ref,
+    title: t.title || ("ticket " + ref),
+    resolved: !!t.resolved,
+    blockedBy: Array.isArray(t.blockedBy) ? t.blockedBy.map(String) : []
   };
 }
 emit("implement-spec: discovered " + order.length + " tickets: " + order.join(", "));
 
-const merged = [];        // ticket numbers implemented AND merged
+const merged = [];        // ticket refs implemented AND merged
 const escalated = [];     // tickets given up to the lead after maxRemediations
 const waveReports = [];
 let totalRemediations = 0;
 let waveCount = 0;        // survives the wave loop for the closing sequence
 
 if (verifyOnly) {
-  // Resume mode: no implementation. Treat whatever the files mark resolved
+  // Resume mode: no implementation. Treat whatever the tracker marks resolved
   // as the merged set, then run only the closing sequence.
   const st0 = statusesFromGraph(graphRun);
   for (const s of st0) {
-    const num = (typeof s.number === "number") ? s.number : ticketNumberFromPath(s.file || "");
-    if (num === null) continue;
-    if (isResolved(s.status)) {
-      merged.push(num);
-      ledgerFor(num).state = "merged";
+    const ref = (s.ref === undefined || s.ref === null) ? "" : String(s.ref);
+    if (!ref) continue;
+    if (s.resolved) {
+      merged.push(ref);
+      ledgerFor(ref).state = "merged";
     } else {
-      ledgerFor(num).state = "unresolved";
+      ledgerFor(ref).state = "unresolved";
     }
   }
   emit("verifyOnly: " + merged.length + " tickets already resolved; skipping implementation waves");
@@ -793,28 +773,27 @@ if (verifyOnly) {
   while (wave < maxWaves) {
     wave = wave + 1;
 
-    // Re-read statuses from the ticket FILES every wave — files are the
+    // Re-read ticket state from the tracker every wave. The tracker is the
     // source of truth, not child claims.
-    // Audit finding #10: use the cached graph unless a merger has just
-    // mutated the ticket files on the integration branch.
+    // Use the cached graph unless a merge may have changed
+    // ticket state on the integration branch.
     const statusRun = await getTicketGraph(false);
     const statuses = statusesFromGraph(statusRun);
-    const statusByNumber = {};
+    const resolvedByRef = {};
     for (const s of statuses) {
-      const num = (typeof s.number === "number") ? s.number : ticketNumberFromPath(s.file || "");
-      if (num !== null) statusByNumber[num] = s.status;
+      const ref = (s.ref === undefined || s.ref === null) ? "" : String(s.ref);
+      if (ref) resolvedByRef[ref] = !!s.resolved;
     }
 
     // Frontier: unresolved, not merged, not escalated, all blockers merged.
     const frontier = [];
-    for (const num of order) {
-      const t = byNumber[num];
-      const ld = ledgerFor(num);
+    for (const ref of order) {
+      const t = byRef[ref];
+      const ld = ledgerFor(ref);
       if (ld.state === "merged" || ld.state === "escalated") continue;
-      const st = statusByNumber[num];
-      if (isResolved(st)) {
+      if (resolvedByRef[ref]) {
         ld.state = "merged";
-        merged.push(num);
+        merged.push(ref);
         continue;
       }
       const blockerOpen = t.blockedBy.some(function(b) {
@@ -828,16 +807,15 @@ if (verifyOnly) {
 
     const batch = frontier.slice(0, maxParallel);
     emit("wave " + wave + ": implementing tickets " +
-         batch.map(function(t) { return t.number; }).join(", "));
+         batch.map(function(t) { return t.ref; }).join(", "));
 
     // Fan out implementers. If runs.all rejects (any single child failure),
     // fall back to SERIAL spawns so one failure cannot lose its siblings'
     // completed work — the pre-ladder failure mode.
     let implResults = null;
-    // Audit finding #1: retry-once-on-retryable-failure. A transient sandbox
-    // or transport error should not abort the whole fan-out. If the first
-    // parallel attempt fails, we retry ONCE; if that also fails, we fall back
-    // to serial spawns (preserving sibling work).
+    // A transient sandbox or transport error should not abort the whole
+    // fan-out. If the first parallel attempt fails, we retry ONCE; if that
+    // also fails, we fall back to serial spawns (preserving sibling work).
     function tryRunAll() {
       return runs.all(batch.map(function(ticket) {
         return spawnImplementer(ticket, wave);
@@ -868,7 +846,7 @@ if (verifyOnly) {
     let remediationsThisWave = 0;
     for (let i = 0; i < batch.length; i++) {
       const ticket = batch[i];
-      const ld = ledgerFor(ticket.number);
+      const ld = ledgerFor(ticket.ref);
       let implResult = implResults ? implResults[i] : null;
       const cls = classifyFailure(implResult);
       ld.runId = implResult && implResult.runId ? implResult.runId : ld.runId;
@@ -878,46 +856,45 @@ if (verifyOnly) {
         ld.lastError = (implResult && implResult.error) || cls;
         remediationsThisWave = remediationsThisWave + 1;
         totalRemediations = totalRemediations + 1;
-        emit("ticket " + ticket.number + ": " + cls + " failure — remediation attempt " +
+        emit("ticket " + ticket.ref + ": " + cls + " failure — remediation attempt " +
              ld.attempts + "/" + MAX_REMEDIATIONS);
 
         if (ld.attempts > MAX_REMEDIATIONS) {
-          escalate(ticket.number, "exhausted " + MAX_REMEDIATIONS + " remediation attempts (" + cls + ")",
+          escalate(ticket.ref, "exhausted " + MAX_REMEDIATIONS + " remediation attempts (" + cls + ")",
                    "runId=" + ld.runId + " lastError=" + ld.lastError);
           ld.state = "escalated";
-          escalated.push(ticket.number);
+          escalated.push(ticket.ref);
           continue;
         }
 
         let remediated = null;
         if (cls === "timeout") {
           // Tier 1: resume the same child/session/worktree when possible.
-          remediated = await tryResume(ld.runId, ticket.number, wave);
+          remediated = await tryResume(ld.runId, ticket.ref, wave);
           // Tier 2: a continue-child that finishes the retained worktree.
           if (!remediated) {
             try {
               remediated = await spawnContinueChild(ticket, ld.runId, wave);
             } catch (eC) {
-              emit("ticket " + ticket.number + ": continue-child rejected (" + eC + ")");
+              emit("ticket " + ticket.ref + ": continue-child rejected (" + eC + ")");
             }
           }
           if (remediated && remediated.ok) {
             const wt = extractWorktreePath(remediated.output);
             if (wt) {
               ld.worktreePath = wt;
-              emit("ticket " + ticket.number + ": continue-child reported worktree " + wt);
+              emit("ticket " + ticket.ref + ": continue-child reported worktree " + wt);
             } else {
-              emit("ticket " + ticket.number + ": continue-child gave no WORKTREE_PATH; merger falls back to manifest");
+              emit("ticket " + ticket.ref + ": continue-child gave no WORKTREE_PATH; merger falls back to manifest");
             }
           }
         } else if (cls === "flake") {
-          // Audit finding #4: flake quarantine. Re-run the single failing
-          // test once before paying for a full code fixer.
-          emit("ticket " + ticket.number + ": flake detected — running quarantine recheck before fixer");
+          // Re-run the single failing test once before paying for a full code fixer.
+          emit("ticket " + ticket.ref + ": flake detected — running quarantine recheck before fixer");
           try {
             const flakeResult = await spawnFlakeRecheck(ticket, implResult, wave);
             if (flakeResult && flakeResult.ok && /FLAKE_CONFIRMED_TRANSIENT/i.test(String(flakeResult.output || ""))) {
-              emit("ticket " + ticket.number + ": flake confirmed transient — proceeding to merge on the preserved work");
+              emit("ticket " + ticket.ref + ": flake confirmed transient — proceeding to merge on the preserved work");
               // implResult.ok is false — that is why we are in this branch — so
               // handing it back as the "remediation" would fail the ok check
               // below and escalate a ticket whose failure was just proven
@@ -934,30 +911,30 @@ if (verifyOnly) {
               };
               ld.flakeQuarantined = true;
             } else {
-              emit("ticket " + ticket.number + ": flake persistent or recheck failed — escalating to fixer");
+              emit("ticket " + ticket.ref + ": flake persistent or recheck failed — escalating to fixer");
               remediated = await spawnFixer(ticket, implResult, wave);
             }
           } catch (eR) {
-            emit("ticket " + ticket.number + ": flake recheck rejected (" + eR + ")");
+            emit("ticket " + ticket.ref + ": flake recheck rejected (" + eR + ")");
           }
         } else {
           // Gate or unknown failure: fixer child repairs the captured patch.
           try {
             remediated = await spawnFixer(ticket, implResult, wave);
           } catch (eF) {
-            emit("ticket " + ticket.number + ": fixer rejected (" + eF + ")");
+            emit("ticket " + ticket.ref + ": fixer rejected (" + eF + ")");
           }
         }
 
         if (remediated && remediated.ok) {
           implResult = remediated;
           ld.runId = remediated.runId ? remediated.runId : ld.runId;
-          emit("ticket " + ticket.number + ": remediation succeeded");
+          emit("ticket " + ticket.ref + ": remediation succeeded");
         } else {
-          escalate(ticket.number, cls + " remediation failed",
+          escalate(ticket.ref, cls + " remediation failed",
                    "runId=" + ld.runId + " lastError=" + ((remediated && remediated.error) || ld.lastError));
           ld.state = "escalated";
-          escalated.push(ticket.number);
+          escalated.push(ticket.ref);
           continue;
         }
       }
@@ -970,21 +947,21 @@ if (verifyOnly) {
           mergeRun = await spawnMerger(ticket, implResult, wave, ld.worktreePath || null);
         } catch (e2) {
           mergeErr = String(e2);
-          emit("ticket " + ticket.number + ": merger run rejected (" + e2 + ")");
+          emit("ticket " + ticket.ref + ": merger run rejected (" + e2 + ")");
         }
         if (mergeRun && mergeRun.ok) break;
-        if (attempt === 0) emit("ticket " + ticket.number + ": merge failed; one idempotent merger retry");
+        if (attempt === 0) emit("ticket " + ticket.ref + ": merge failed; one idempotent merger retry");
       }
       if (mergeRun && mergeRun.ok) {
         ld.state = "merged";
-        merged.push(ticket.number);
+        merged.push(ticket.ref);
         progressThisWave = progressThisWave + 1;
-        emit("ticket " + ticket.number + ": merged into " + integrationBranch);
+        emit("ticket " + ticket.ref + ": merged into " + integrationBranch);
       } else {
-        escalate(ticket.number, "merge failed after retry", mergeErr ||
+        escalate(ticket.ref, "merge failed after retry", mergeErr ||
                  ((mergeRun && mergeRun.error) || "unknown"));
         ld.state = "escalated";
-        escalated.push(ticket.number);
+        escalated.push(ticket.ref);
       }
     }
 
@@ -996,11 +973,11 @@ if (verifyOnly) {
     });
     waveCount = wave;
 
-    // Files are the source of truth, and a merge just rewrote the ticket files
-    // on the integration branch (status flips ride in with the patch). Drop the
-    // cached graph so the next wave re-discovers from disk — without this the
-    // whole run would reuse wave 0's discovery and the invariant above would be
-    // a comment, not behaviour. Costs one quiet read-only scout per active wave.
+    // The tracker is the source of truth, and a merge may have updated ticket
+    // state. Drop the cached graph so the next wave re-discovers it. Without
+    // this the whole run would reuse wave 0's discovery and the invariant above
+    // would be a comment, not behaviour. Costs one quiet read-only scout per
+    // active wave.
     if (progressThisWave > 0) ticketGraphCache = null;
 
     if (progressThisWave === 0) {
@@ -1092,8 +1069,7 @@ if (merged.length) {
 
   if (blockedAxes.length) {
     // Fix pass: worktree-isolated so the main checkout stays clean, then a
-    // dedicated merger commits the fixes BEFORE the PR (audit finding: the
-    // old sequence opened the PR from the pre-fix commit).
+    // dedicated merger commits the fixes BEFORE the PR
     const fixBrief = [
       "Reviewers BLOCKED the integrated work on branch " + integrationBranch + ".",
       "Findings (excerpts):",
@@ -1169,7 +1145,7 @@ if (merged.length) {
               "command recorded in docs/agents/verification.md and the issue tracker doc.",
           "Branch: " + integrationBranch + " -> " + BASE_BRANCH + ", covering tickets " +
             merged.join(", ") + " (spec: " + specPath + ").",
-          "Ticket files under " + issuesDir + "/ hold the per-ticket answers.",
+          "The tickets at " + ticketsRef + " hold the per-ticket answers.",
           "If this repo has no request surface, commit the integration branch and say so."
         ].join("\n"),
         timeoutMs: MERGE_TIMEOUT_MS

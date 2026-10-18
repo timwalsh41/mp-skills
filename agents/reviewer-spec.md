@@ -49,4 +49,4 @@ otherwise.
 ```
 Review verdict: MISSING_TARGET
 ```
-only when the branch or the spec/ticket paths named in your task do not exist. Say what was absent and stop: substituting a nearby branch or a different feature's tickets produces a confident verdict on work nobody asked about.
+only when the branch or the spec/ticket references named in your task do not exist. Say what was absent and stop: substituting a nearby branch or a different feature's tickets produces a confident verdict on work nobody asked about.

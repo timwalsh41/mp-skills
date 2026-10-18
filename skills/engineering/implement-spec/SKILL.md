@@ -24,7 +24,7 @@ subagent({
   async: true,
   args: {
     specPath: ".scratch/<feature-slug>/spec.md",
-    issuesDir: ".scratch/<feature-slug>/issues",
+    ticketsRef: "<the tracker's target for this feature's tickets>",
     integrationBranch: "<feature-slug>-integration",
     fullGate: "<the repo's full-suite command>",
     narrowGate: "<the repo's fast subset>",
@@ -35,11 +35,11 @@ subagent({
 })
 ```
 
-`specPath`, `issuesDir`, `integrationBranch` and `fullGate` are **required**: the script returns a structured error naming the missing arg instead of launching children. `narrowGate` defaults to `fullGate`.
+`specPath`, `ticketsRef`, `integrationBranch` and `fullGate` are **required**: the script returns a structured error naming the missing arg instead of launching children. `narrowGate` defaults to `fullGate`.
 
 Adjust with `args` when the defaults don't match this run:
 
-- `verifyOnly: true` — resume mode. Skips implementation entirely and runs only the closing sequence (final full-suite verify → three-axis review → fix pass → PR) over whatever the ticket files already mark resolved. Use this to pick up a partially completed run without re-implementing finished tickets.
+- `verifyOnly: true` — resume mode. Skips implementation entirely and runs only the closing sequence (final full-suite verify → three-axis review → fix pass → PR) over whatever the tickets already mark resolved. Use this to pick up a partially completed run without re-implementing finished tickets.
 - `fullGateTickets` — only these tickets gate on the full suite; the rest gate narrow. Use when the slow tier (browser tests, a service that must be running) is bundled into a single ticket that merges last, so a tier that
   cannot pass yet does not falsely fail every other ticket mid-run. Default is `null`: every ticket gates on the full suite.
 - `gateTimeoutMs` (default 15 min) — harness gate caps are shorter than most real suites; set this above the suite's runtime, from `docs/agents/verification.md`.
@@ -49,7 +49,6 @@ Adjust with `args` when the defaults don't match this run:
 - `singleRetestCommand` — how to re-run one failing test, for the flake
   quarantine step. Include the placeholder form from the verification doc.
 - `flakePattern` — extra regex vocabulary this repo's failures use to mean "transient" (timing helpers, settle assertions, a specific harness's wording).
-- Ticket-file vocabulary overrides, for repos whose tracker doc records different field names: `statusField` (default `Status`), `resolvedStatuses` (default `resolved`, `wontfix`), `blockingField` (default `Blocked by`), `answerHeading` (default `## Answer`).
 - `implTimeoutMs` (default 45 min), `mergeTimeoutMs` (default 20 min), `maxRemediations` (default 2).
 - `skipPR: true` — stop before the PR child.
 
@@ -61,9 +60,9 @@ For each complete implementation, manually launch a verification run with the `v
 
 - **Worktree isolation**: every implementer, fixer, and the review-fix pass run with `worktree: true` and `baseRef: refs/heads/<integrationBranch>`, a managed git worktree. The main checkout is never switched off the integration branch.
 - **Verification gating**: every implementer/fixer/merger carries a `gate`. The gate runs on the host after the child completes, in that child's tree; a run is not `ok` unless the gate passes. Child claims alone never count as verified.
-- **Files are the source of truth**: ticket statuses are re-read from the ticket every wave (the discovery cache is dropped whenever a wave merges because a merge rewrites those files on the integration branch); the script never trusts a child's self-report of resolution, and a ticket is only marked merged after its merger run verifies green on the integration branch.
-- **Sparse context**: children get file paths, not inlined spec text.
-- **The target is the target**: discovery results outside `issuesDir` are refused, and discovery reports whether `refs/heads/<integrationBranch>` resolves before wave 1. A nonexistent path or branch ends the run with a structured error — it never falls back to "some nearby tickets/branch", which is how a placeholder in `args` can otherwise produce a confident review of unrelated work. If you want that check on a run whose scout reports no preflight, the script warns and continues; the merger still refuses a missing branch.
+- **The tracker is the source of truth**: ticket state is re-read from the tracker every wave (the discovery cache is dropped whenever a wave merges, because a child may have resolved a ticket); subagents read and update tickets through `docs/agents/issue-tracker.md`. The script never trusts a child's self-report of resolution, and a ticket is only marked merged after its merger run verifies green on the integration branch.
+- **Sparse context**: children get ticket references, not inlined spec text.
+- **The target is the target**: the scout is told to report only the target's tickets, and discovery reports whether `refs/heads/<integrationBranch>` resolves before wave 1. A nonexistent target or branch ends the run with a structured error — it never falls back to "some nearby tickets/branch", which is how a placeholder in `args` can otherwise produce a confident review of unrelated work. If you want that check on a run whose scout reports no preflight, the script warns and continues; the merger still refuses a missing branch.
 - **A review without a verdict is incomplete, not a pass**: each axis must end with `Review verdict: BLOCK` or `Review verdict: OK`. A missing line — or an axis that failed to run — suppresses the PR and escalates to you, because an unknown review state is not evidence of a clean one.
 
 ## The remediation ladder (what happens when a child fails)

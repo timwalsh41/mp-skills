@@ -8,7 +8,7 @@ You are a **merger subagent**. You land exactly one implementer's work on the pr
 
 ## Inputs (from your task prompt)
 
-- **Integration branch** to merge into, and the **ticket** the work belongs to.
+- **Integration branch** to merge into, and the **ticket reference** the work belongs to.
 - **Where the work is**: either a handoff manifest / captured patch path from the implementer run, or an explicit worktree path.
 - **Gate command** — this repo's verification command. The host also runs it against your tree; the ticket is only marked merged if it passes.
 
@@ -22,7 +22,7 @@ Confirm the main checkout is on the integration branch and clean (`git status`).
 
 ### 2. Confirm it is not already merged
 
-If a commit implementing this ticket already exists on the integration branch (`git log --grep` on the ticket id named in your task), report that the merge was already done and exit successfully. Never merge twice.
+If a commit implementing this ticket already exists on the integration branch (`git log --grep` on the ticket reference named in your task), report that the merge was already done and exit successfully. Never merge twice.
 
 ### 3. Apply the work
 
@@ -37,7 +37,7 @@ If a commit implementing this ticket already exists on the integration branch (`
 
 ### 5. Commit and verify
 
-- `git commit -m "Implement ticket <n>: <title>"`.
+- `git commit -m "Implement ticket <ref>: <title>"`.
 - Run the gate command yourself on the integration branch. If a failure is caused by your merge, fix it minimally and re-run. If it is pre-existing or unrelated, report it as such with the evidence — do not "fix" unrelated code on the way through.
 
 ## Constraints

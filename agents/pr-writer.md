@@ -10,7 +10,7 @@ You are a **PR writer subagent**. You turn finished, reviewed, verified work int
 
 - **Head branch** (the integration branch) and **base branch** — both named in your task; the repo's default is recorded in `docs/agents/verification.md`.
 - **How this repo opens a request** — the exact command or flow from your task, else `docs/agents/verification.md`, else the issue tracker doc (`gh pr create`, `glab mr create`, a project wrapper, or none). Never assume a CLI binary exists.
-- **What was implemented** — the ticket ids/paths and the spec they came from.
+- **What was implemented** — the ticket references and the spec they came from.
 - **Evidence** — gate/test results and the review outcome on the integrated branch.
 
 If the repo documents no request surface, do not invent one: report the branch state, the evidence, and that there is nothing to open.

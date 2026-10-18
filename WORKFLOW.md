@@ -4,31 +4,33 @@ The control flow of `skills/engineering/implement-spec/orchestrate.js`, the scri
 
 ## What the diagram does not say
 
-- **The lead resolves the args; the script only consumes them.** `specPath`, `issuesDir`, `integrationBranch`, and `fullGate` are required and repo-specific, read from `docs/agents/issue-tracker.md` and `docs/agents/verification.md`. A missing arg hard-fails before any child launches, because a wrong gate or branch would burn the whole remediation budget on a typo.
+- **The lead resolves the args; the script only consumes them.** `specPath`, `ticketsRef`, `integrationBranch`, and `fullGate` are required and repo-specific, read from `docs/agents/issue-tracker.md` and `docs/agents/verification.md`. A missing arg hard-fails before any child launches, because a wrong gate or branch would burn the whole remediation budget on a typo.
 - **Worktree isolation has one exception.** Implementers, fixers, and the review-fix pass run with `worktree: true` and `baseRef = refs/heads/<integrationBranch>`, and the main checkout never leaves the integration branch. The final verify runs in the main checkout instead, not a fresh worktree.
 - **Gates run on the host and are the only proof.** Every gated child (implementer, fixer, merger, final verify) carries a `gate` object the harness runs in the child's working tree; a child's own "done" never counts. Tickets gate on the full suite unless `fullGateTickets` narrows the rest to `narrowGate`, so a slow tier bundled into one ticket cannot fail every other ticket mid-run.
-- **Ticket files are the source of truth.** Statuses are re-read from the files each wave, never a child's self-report, and a merge rewrites those files on the integration branch, so the discovery cache is dropped whenever a wave merges anything. A ticket already marked resolved on disk is absorbed into `merged` without being implemented, which is also how `verifyOnly` resumes a partial run.
+- **The tracker is the source of truth.** Ticket state is re-read from the tracker each wave, never a child's self-report, and the discovery cache is dropped whenever a wave merges anything because a merge implies a child may have updated ticket state. A ticket already resolved is absorbed into `merged` without being implemented, which is also how `verifyOnly` resumes a partial run.
 - **Escalation is not abandonment.** A ticket that exhausts `maxRemediations` (default 2) stops being spawned and emits a structured `ESCALATION:` line; its dependents wait for the lead's decision rather than being poisoned. The lead resumes the named run, spawns a targeted fixer, or parks the ticket and re-plans.
 - **Two caveats the diagram only hints at.** A failed final verify is logged but does not suppress the PR, so a PR opened over a red integration branch is unreviewed work. The timeout tier-1 revive cannot carry a gate, so the revived child self-verifies and the merge gate re-checks.
 
 ```mermaid
 flowchart TD
     %% ===== ENTRY =====
-    Start(["Lead resolves args from docs/agents<br/>and launches orchestrate.js"]) --> ArgCheck{"specPath, issuesDir,<br/>integrationBranch, fullGate<br/>all present?"}
+    Start(["Lead resolves args from docs/agents<br/>and launches orchestrate.js"]) --> ArgCheck{"specPath, ticketsRef,<br/>integrationBranch, fullGate<br/>all present?"}
     ArgCheck -- "no" --> ArgErr(["return ok:false + error<br/>naming the missing args"])
     ArgCheck -- "yes" --> W0["Wave 0: scout discovery"]
 
     %% ===== WAVE 0 =====
-    W0 --> ReadGraph[/"readTicketGraph via runs.run:<br/>read issuesDir/*.md,<br/>parse Status + Blocked by per file,<br/>report preflight integrationBranch check"/]
-    ReadGraph --> Lint{"DUP_STATUS or UNREADABLE?"}
-    Lint -- "yes" --> EmitLint["emit lint lines to lead<br/>(non-blocking)"]
-    EmitLint --> Filter
-    Lint -- "no" --> Filter
-    Filter["Drop files outside issuesDir (ESCALATION)"] --> AnyTickets{"any tickets left?"}
+    W0 --> ReadGraph[/"readTicketGraph via runs.run:<br/>read tickets from the configured tracker,<br/>normalize ref + resolved + blockedBy,<br/>report tracker + integrationBranch preflight"/]
+    ReadGraph --> Lint{"UNREADABLE?"}
+    Lint -- "yes" --> EmitLint["emit UNREADABLE:<ref><br/>to lead (non-blocking)"]
+    EmitLint --> AnyTickets
+    Lint -- "no" --> AnyTickets
+    AnyTickets{"any tickets found?"}
     AnyTickets -- "no" --> NoTickets(["return ok:false:<br/>no tickets found"])
-    AnyTickets -- "yes" --> BranchMissing{"preflight reported<br/>integrationBranch missing?"}
+    AnyTickets -- "yes" --> TrackerMissing{"preflight reported<br/>tracker missing?"}
+    TrackerMissing -- "yes" --> TrackerErr(["return ok:false:<br/>run /setup-matt-pocock-skills"])
+    TrackerMissing -- "no" --> BranchMissing{"preflight reported<br/>integrationBranch missing?"}
     BranchMissing -- "yes" --> BranchErr(["return ok:false:<br/>branch does not resolve"])
-    BranchMissing -- "no; absent preflight only warns" --> Index["Index byNumber / order"]
+    BranchMissing -- "no; absent preflight only warns" --> Index["Index byRef / order"]
 
     %% ===== VERIFY-ONLY SHORTCUT =====
     Index --> VerifyOnly{"verifyOnly?"}
@@ -39,7 +41,7 @@ flowchart TD
     %% ===== MAIN WAVE LOOP =====
     Loop{"wave < maxWaves?"}
     Loop -- "no" --> CloseGate
-    Loop -- "yes" --> Scan["getTicketGraph(false):<br/>reuse cached graph;<br/>re-read files only after<br/>a merge dropped the cache"]
+    Loop -- "yes" --> Scan["getTicketGraph(false):<br/>reuse cached graph;<br/>re-read from the tracker only<br/>after a merge dropped the cache"]
     Scan --> Frontier["Frontier: unresolved,<br/>not escalated,<br/>all blockers merged;<br/>already-resolved tickets<br/>are absorbed into merged"]
     Frontier -- "empty" --> CloseGate
     Frontier --> Batch["batch = frontier.slice(0, maxParallel)"]
