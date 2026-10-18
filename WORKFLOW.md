@@ -1,148 +1,136 @@
 # implement-spec orchestration workflow
 
-This diagram captures the control flow of
-`.agents/skills/implement-spec/orchestrate.js`, the script launched by the
-`implement-spec` skill to turn a spec + ticket graph into a verified, reviewed,
-merged pull request. The script itself runs inside the pi subagent workflow
-sandbox — a plain JS body with top-level `await` and **no** `fs`/`shell`/`require`
-access — so every action on the world (reading files, branching, running tests,
-opening PRs) happens through child agents invoked via `runs.run` / `runs.all`.
+The control flow of `skills/engineering/implement-spec/orchestrate.js`, the script the `implement-spec` skill launches to turn a spec and its ticket graph into a verified, reviewed, merged pull request. The script runs inside the pi subagent workflow sandbox, a plain JS body with top-level `await` and no `fs`, `shell`, or `require`, so every action on the world goes through child agents launched with `runs.run` / `runs.all`.
 
-## What the diagram does not say (but the diagram depends on)
+## What the diagram does not say
 
-- **Lead resolves, script launches.** The `args` (`specPath`, `issuesDir`,
-  `integrationBranch`, `fullGate`, …) are **required** and **repo-specific**.
-  The invoking lead reads them from `docs/agents/issue-tracker.md` and
-  `docs/agents/verification.md` and passes them in; the script hard-fails on any
-  missing required arg rather than guessing.
-- **Files are the source of truth.** Ticket statuses are re-read from the ticket
-  *files* every wave — never a child's self-reported resolution — and the
-  discovery cache is dropped whenever a merger commits to the integration branch,
-  since that rewrite carries status flips along with the patch.
-- **Worktree isolation.** Every implementer, fixer, and the review-fix pass run
-  with `worktree: true` and `baseRef = refs/heads/<integrationBranch>`. The main
-  checkout is never switched off the integration branch; merges happen via
-  captured patches / handoff manifests.
-- **Gating on the host.** Each implementer/fixer/merger carries a `gate`
-  command object that the harness runs on the host inside that child's tree. A
-  run is `ok` only if the gate passes — child claims alone never count.
-- **Verdicts are mandatory.** A review axis that returns no `Review verdict:`
-  line is treated as **INCOMPLETE**, not `OK`; that condition suppresses the PR
-  and escalates to the lead. The PR is opened only when all three axes verdicted
-  `OK`.
-- **A ticket is not abandoned on first failure.** The per-ticket remediation
-  ladder (timeout → resume/continue; flake → quarantine; gate → fixer) retries
-  up to `maxRemediations` (default 2) before emitting a structured `ESCALATION:`
-  line. Dependents of an escalated ticket simply wait for the lead's decision.
+- **The lead resolves the args; the script only consumes them.** `specPath`, `issuesDir`, `integrationBranch`, and `fullGate` are required and repo-specific, read from `docs/agents/issue-tracker.md` and `docs/agents/verification.md`. A missing arg hard-fails before any child launches, because a wrong gate or branch would burn the whole remediation budget on a typo.
+- **Worktree isolation has one exception.** Implementers, fixers, and the review-fix pass run with `worktree: true` and `baseRef = refs/heads/<integrationBranch>`, and the main checkout never leaves the integration branch. The final verify runs in the main checkout instead, not a fresh worktree.
+- **Gates run on the host and are the only proof.** Every gated child (implementer, fixer, merger, final verify) carries a `gate` object the harness runs in the child's working tree; a child's own "done" never counts. Tickets gate on the full suite unless `fullGateTickets` narrows the rest to `narrowGate`, so a slow tier bundled into one ticket cannot fail every other ticket mid-run.
+- **Ticket files are the source of truth.** Statuses are re-read from the files each wave, never a child's self-report, and a merge rewrites those files on the integration branch, so the discovery cache is dropped whenever a wave merges anything. A ticket already marked resolved on disk is absorbed into `merged` without being implemented, which is also how `verifyOnly` resumes a partial run.
+- **Escalation is not abandonment.** A ticket that exhausts `maxRemediations` (default 2) stops being spawned and emits a structured `ESCALATION:` line; its dependents wait for the lead's decision rather than being poisoned. The lead resumes the named run, spawns a targeted fixer, or parks the ticket and re-plans.
+- **Two caveats the diagram only hints at.** A failed final verify is logged but does not suppress the PR, so a PR opened over a red integration branch is unreviewed work. The timeout tier-1 revive cannot carry a gate, so the revived child self-verifies and the merge gate re-checks.
 
 ```mermaid
 flowchart TD
     %% ===== ENTRY =====
-    Start([Lead resolves args from docs/agents and launches orchestrate.js]) --> Preflight{Required args present?<br/>integrationBranch exists?}
-    Preflight -- no --> ArgError[(Missing arg / branch\nreturns ok:false + error)]
-    Preflight -- yes --> W0[Wave 0 — Scout discovery]
+    Start(["Lead resolves args from docs/agents<br/>and launches orchestrate.js"]) --> ArgCheck{"specPath, issuesDir,<br/>integrationBranch, fullGate<br/>all present?"}
+    ArgCheck -- "no" --> ArgErr(["return ok:false + error<br/>naming the missing args"])
+    ArgCheck -- "yes" --> W0["Wave 0: scout discovery"]
 
-    %% ===== WAVE 0: discovery =====
-    W0 --> ReadGraph[/readTicketGraph: glob issuesDir/*.md,\nparse status/blockedBy per file/]
-    ReadGraph --> Lint{DUP_STATUS?<br/>UNREADABLE?}
-    Lint -- yes --> EmitLint["emit DUP_STATUS:<n>\n/ UNREADABLE:<path>\nlint to lead"]
-    Lint -- no --> Index[Index & normalize\nbyNumber / order]
-    EmitLint --> Index
+    %% ===== WAVE 0 =====
+    W0 --> ReadGraph[/"readTicketGraph via runs.run:<br/>read issuesDir/*.md,<br/>parse Status + Blocked by per file,<br/>report preflight integrationBranch check"/]
+    ReadGraph --> Lint{"DUP_STATUS or UNREADABLE?"}
+    Lint -- "yes" --> EmitLint["emit lint lines to lead<br/>(non-blocking)"]
+    EmitLint --> Filter
+    Lint -- "no" --> Filter
+    Filter["Drop files outside issuesDir (ESCALATION)"] --> AnyTickets{"any tickets left?"}
+    AnyTickets -- "no" --> NoTickets(["return ok:false:<br/>no tickets found"])
+    AnyTickets -- "yes" --> BranchMissing{"preflight reported<br/>integrationBranch missing?"}
+    BranchMissing -- "yes" --> BranchErr(["return ok:false:<br/>branch does not resolve"])
+    BranchMissing -- "no; absent preflight only warns" --> Index["Index byNumber / order"]
+
+    %% ===== VERIFY-ONLY SHORTCUT =====
+    Index --> VerifyOnly{"verifyOnly?"}
+    VerifyOnly -- "yes" --> Seed["Seed merged from tickets<br/>already marked resolved;<br/>skip all implementation waves"]
+    Seed --> CloseGate
+    VerifyOnly -- "no" --> Loop
 
     %% ===== MAIN WAVE LOOP =====
-    Index --> Loop{while wave < maxWaves\nand frontier not empty}
-    Loop -- no --> Closing([Closing sequence])
-
-    %% per wave header
-    Loop --> Scan["Re-read ticket\ngraph (cache dropped\nafter any merge)"]
-    Scan --> Frontier[["Compute frontier:\nunresolved, not escalated,\nall blockers merged"]]
+    Loop{"wave < maxWaves?"}
+    Loop -- "no" --> CloseGate
+    Loop -- "yes" --> Scan["getTicketGraph(false):<br/>reuse cached graph;<br/>re-read files only after<br/>a merge dropped the cache"]
+    Scan --> Frontier["Frontier: unresolved,<br/>not escalated,<br/>all blockers merged;<br/>already-resolved tickets<br/>are absorbed into merged"]
+    Frontier -- "empty" --> CloseGate
     Frontier --> Batch["batch = frontier.slice(0, maxParallel)"]
 
-    %% ---- fan-out implementers ----
-    Batch --> FanOut{"Fan out implementers\n(runs.all, batch)"}
-    FanOut -- rejects --> Retry{"Retry runs.all ONCE"}
-    Retry -- ok --> ImplDone[Collect impl results]
-    Retry -- rejects --> Serial["Serial spawns\n(preserve sibling work)"]
-    FanOut -- ok --> ImplDone
+    %% ---- fan-out ----
+    Batch --> FanOut{"Fan out implementers<br/>via runs.all"}
+    FanOut -- "ok" --> ImplDone["Collect impl results"]
+    FanOut -- "rejects" --> Retry{"Retry runs.all once"}
+    Retry -- "ok" --> ImplDone
+    Retry -- "rejects" --> Serial["Serial spawns<br/>(preserve sibling work)"]
+    Serial --> ImplDone
 
-    %% ---- per-ticket ladder (subgraph) ----
-    subgraph Ladder ["Ladder per ticket (maxRemediations)"]
-        direction TB
-        ImplDone --> Classify["classifyFailure(result)"]
-        Classify --> cls{cls}
-        cls -- "ok" --> MergerPending
-        cls -- "timeout" --> Resume{"tryResume(runId)?\n(Tier 1: same session)"}
-        cls -- "flake" --> Flake["spawnFlakeRecheck\n(single failing test\nin retained worktree)"]
-        cls -- "gate / unknown" --> Fixer["spawnFixer\n( fresh worktree,\napply prior patch,\nrepair )"]
+    %% ---- per-ticket ladder ----
+    ImplDone --> Classify{"For each ticket in batch:<br/>classifyFailure(result)"}
+    Classify -- "ok" --> Merge
+    Classify -- "timeout / flake /<br/>gate / unknown" --> Attempts{"attempts++ ;<br/>attempts > maxRemediations?"}
+    Attempts -- "yes" --> EscExhausted[["ESCALATION: remediation budget<br/>exhausted for ticket N;<br/>stop spawning it"]]
+    Attempts -- "no" --> Remedy{"remediation by class"}
 
-        Resume -- resumable --> ResumeRun[runs.run resume:<runId>,\nsame worktree]
-        Resume -- no runId / rejected --> Continue["spawnContinueChild\n(Tier 2: locate\nretained worktree from\n`git worktree list`,\nfinish in place,\nemit WORKTREE_PATH)"]
+    Remedy -- "timeout" --> Resume{"tryResume(runId)?"}
+    Resume -- "resumed" --> ResumeRun["runs.run resume:runId<br/>(same session + worktree;<br/>no gate rides on it)"]
+    Resume -- "no runId / rejected" --> Continue["spawnContinueChild:<br/>find retained worktree via<br/>git worktree list,<br/>finish in place,<br/>report WORKTREE_PATH"]
+    ResumeRun -- "ok" --> Merge
+    ResumeRun -- "failed" --> EscRemediation
+    Continue -- "ok" --> Merge
+    Continue -- "failed" --> EscRemediation
 
-        ResumeRun --> MergerPending
-        Continue --> MergerPending
-        Flake --> FlakeOut{recheck ok\n+ FLAKE_CONFIRMED_TRANSIENT?}
-        Fixer --> MergerPending
-        FlakeOut -- transient --> MergeOnPatch["Pass-through as ok,\ncarry original run +\ncaptured patch forward"]
-        FlakeOut -- persistent --> Fixer
-        MergeOnPatch --> MergerPending
-    end
+    Remedy -- "flake" --> FlakeRecheck["spawnFlakeRecheck:<br/>re-run only the failing test<br/>in the failed run's retained worktree"]
+    FlakeRecheck -- "rejected" --> EscRemediation
+    FlakeRecheck -- "returned" --> FlakeOut{"FLAKE_CONFIRMED_TRANSIENT?"}
+    FlakeOut -- "transient" --> PassThru["pass through as ok;<br/>carry original run + patch"] --> Merge
+    FlakeOut -- "persistent" --> Fixer
 
-    MergerPending --> Merge{"spawnMerger\n(apply patch onto\nintegration branch,\ncommit, re-gate)"}
-    Merge -- ok --> Merged["ledger state = merged\npush to `merged`"]
-    Merge -- fail --> MergeRetry["idempotent merger\nretry (x1)"]
-    MergeRetry -- ok --> Merged
-    MergeRetry -- fail --> EscalateT["ESCALATION:\nmerge failed — <number>\nstop spawning this ticket"]
+    Remedy -- "gate / unknown" --> Fixer["spawnFixer:<br/>fresh worktree,<br/>apply prior patch,<br/>repair in place"]
+    Fixer -- "ok" --> Merge
+    Fixer -- "failed / rejected" --> EscRemediation[["ESCALATION: remediation failed<br/>for ticket N"]]
 
-    %% attempts / escalation boundary
-    Ladder -- remediation ok --> Merge
-    Ladder -- attempts > maxRemediations --> EscalateA["ESCALATION:\n<maxRemediations> attempts\nexhausted — <number>\nstop spawning"]
+    %% ---- merge ----
+    Merge{"spawnMerger:<br/>apply patch onto integration branch,<br/>commit, re-gate"} -- "ok" --> Merged["ledger = merged;<br/>push to merged;<br/>progressThisWave++"]
+    Merge -- "fail" --> MergeRetry{"Idempotent merger retry (x1)"}
+    MergeRetry -- "ok" --> Merged
+    MergeRetry -- "fail" --> EscMerge[["ESCALATION: merge failed<br/>after retry for ticket N"]]
+    Merged --> NextTicket
+    EscExhausted --> NextTicket
+    EscRemediation --> NextTicket
+    EscMerge --> NextTicket
+    NextTicket{"More tickets in batch?"}
+    NextTicket -- "yes" --> Classify
+    NextTicket -- "no" --> WaveEnd["waveReports.push;<br/>waveCount = wave"]
 
-    Merged --> CacheDrop["drop cached graph\n(if merge happened)"]
-    EscalateT --> CacheHold["keep cache"]
-    EscalateA --> CacheHold
-
-    %% progress / stall guard
-    CacheDrop --> Progress{"progressThisWave + 1"}
-    CacheHold --> EndWave["waveReports.push;\nwaveCount++"]
-
-    %% stall guard
-    Progress --> Stall{"progressThisWave == 0\ntwice in a row?"}
-    Stall -- yes --> LoopEnd([Stop waves — no frontier progress])
-    Stall -- no --> Loop
-    EndWave --> Loop
-    LoopEnd --> Closing
+    %% ---- wave end ----
+    WaveEnd --> Progress{"any merge this wave?"}
+    Progress -- "yes" --> DropCache["drop cached graph"] --> ResetGuard["stallGuard = 0"] --> Loop
+    Progress -- "no" --> IncGuard["stallGuard++"] --> StallGuard{"stallGuard >= 2?"}
+    StallGuard -- "yes" --> Stop(["Stop waves:<br/>no progress in 2 consecutive waves"])
+    StallGuard -- "no" --> Loop
+    Stop --> CloseGate
 
     %% ===== CLOSING SEQUENCE =====
-    Closing --> FinalV["Final verify:\nfull-suite gate\non integration branch\n(managed child, NOT worktree:true)"]
-    FinalV --> ReviewFanOut{"spawnReviews all:\nstandards +\nspec +\nquality\n(parallel)"}
-    ReviewFanOut --> Parse["Parse each axis\noutput for verdict"]
-    Parse --> Judge{"verdicts"}
-    Judge -- "any BLOCK" --> BlockedYes
-    Judge -- "all OK (≥3) & none unreviewed" --> BlockedNo
-    Judge -- "any axis no verdict /\n<3 returned" --> Incomplete["reviewsIncomplete = true\nESCALATION:\nreview incomplete — PR suppressed"]
+    CloseGate{"any tickets merged?"}
+    CloseGate -- "no" --> Result
+    CloseGate -- "yes" --> FinalV["Final verify: full-suite gate<br/>on integration branch<br/>(merger agent, NOT worktree-isolated;<br/>failure is logged only)"]
+    FinalV --> ReviewFanOut{"spawnReviews via runs.all:<br/>standards + spec + quality<br/>(parallel)"}
+    ReviewFanOut -- "rejects" --> NoReviews["reviews = [];<br/>proceed without reviews"]
+    NoReviews --> IncompleteQ
+    ReviewFanOut -- "ok" --> Parse["Parse each axis for<br/>Review verdict: line"]
+    Parse --> BlockedQ{"any axis BLOCK?"}
+    BlockedQ -- "yes" --> FixPass["spawnFixReviewFindings<br/>(worktree-isolated,<br/>baseRef = integration;<br/>keep gate green)"]
+    FixPass --> FixMerge["merge-review-fixes:<br/>apply patch, commit,<br/>re-gate FULL"]
+    FixMerge --> FixMergedQ{"fixRun ok AND<br/>fixMerger ok?"}
+    FixMergedQ -- "no" --> EscFix[["ESCALATION: fix pass failed<br/>or fixes not merged;<br/>PR suppressed"]]
+    FixMergedQ -- "yes" --> IncompleteQ
+    BlockedQ -- "no" --> IncompleteQ
 
-    BlockedYes --> FixPass["spawnFixReviewFindings\n(worktree:true,\nbaseRef = integration)\nkeep gate green"]
-    FixPass --> FixMerge["merge-review-fixes\n(apply patch, commit,\nre-gate FULL)"]
-    FixMerge --> FixesOK{"fixRun ok\nAND fixMerger ok\nAND !incomplete?"}
+    IncompleteQ{"any axis without a verdict,<br/>or fewer than 3 axes?"}
+    IncompleteQ -- "yes" --> Suppress(["PR suppressed:<br/>review incomplete"])
+    IncompleteQ -- "no" --> PRGate{"skipPR?"}
+    PRGate -- "yes" --> BranchOnly(["End: integration branch only"])
+    PRGate -- "no" --> PR["spawnPR (prWriter):<br/>PR_INSTRUCTIONS,<br/>integration branch to baseBranch"]
+    PR --> Result
+    EscFix --> Result
+    Suppress --> Result
+    BranchOnly --> Result
 
-    BlockedNo --> BlockCheck{"skipPR?"}
-    Incomplete --> BlockCheck
+    Result(["Return result object:<br/>ok, waves, merged, escalated,<br/>unresolved, reviews, reviewsIncomplete,<br/>fixApplied, fixMerged, prCreated"])
 
-    FixesOK -- yes --> PR["spawnPR\n(prWriter agent,\nPR_INSTRUCTIONS)"]
-    FixPass -- fail --> EscalateFix["ESCALATION:\nfix pass failed —\nlead decides before PR"]
-    FixMerge -- fail --> EscalateMerge["ESCALATION:\nfixes not merged —\nfixer worktree holds\nuncommitted work"]
-    BlockCheck -- skipPR --> End([End — branch only])
-    BlockCheck -- open PR --> PR
-
-    PR --> End
-    End --> Return([Return result object:\nok, waves, merged,\nescalated, unresolved,\nreviews, fixesClean, prCreated])
-
-    %% ===== ESCALATION STYLE =====
+    %% ===== STYLES =====
     classDef esc fill:#fdd,stroke:#b00,stroke-width:1px,color:#800;
     classDef gate fill:#eef,stroke:#007,stroke-width:1px,color:#125;
     classDef cache fill:#ffe6b3,stroke:#b88,stroke-width:1px,color:#753;
-    class EscalateT,EscalateA,EscalateFix,EscalateMerge,Incomplete esc;
-    class Merge,MergeRetry,FixMerge gate;
-    class CacheDrop,CacheHold,Scan cache;
+    class EscExhausted,EscRemediation,EscMerge,EscFix,Suppress,ArgErr,NoTickets,BranchErr esc;
+    class Merge,MergeRetry,FixMerge,FinalV gate;
+    class Scan,DropCache cache;
 ```
-
