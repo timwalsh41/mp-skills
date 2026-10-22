@@ -66,6 +66,15 @@
 //                      Appended to the implementer's task, so a child whose
 //                      worktree does not carry the repo's tracker doc still
 //                      knows how to read its own ticket and close it.
+//   repoPath           optional. The absolute path of the checkout this run
+//                      integrates into. Children that work in the MAIN
+//                      checkout (merger, verifier, final verify, review axes,
+//                      request writer) are told where it is and told to
+//                      confirm their own working directory before they
+//                      conclude that a branch, a spec or a file is missing:
+//                      a child that lands in the wrong directory otherwise
+//                      reports a missing target, which suppresses the
+//                      request and escalates a run that is actually fine.
 //   implTimeoutMs      default 45 min per implementer/fixer/continue child
 //   mergeTimeoutMs     default 20 min per merger
 //   maxRemediations    default 2 remediation attempts per ticket before
@@ -164,6 +173,7 @@ const STANDARDS_DOCS = A.standardsDocs ||
   "the files this repo documents as coding standards (search for CODING_STANDARDS.md, CONTRIBUTING.md, and anything AGENTS.md points at)";
 const RETEST_COMMAND = A.singleRetestCommand || null;
 const TRACKER_HINT = A.trackerHint || null;
+const REPO_PATH = A.repoPath || null;
 
 // Default Markdown-body conventions for the completion instructions handed to
 // children. The tracker doc (docs/agents/issue-tracker.md) is the authority;
@@ -208,6 +218,34 @@ function gateFor(ref) {
 // task renders "[object Object]", which is what children were being told to
 // run. Anything user-facing needs .command via this helper.
 function gateCommand(ref) { return gateFor(ref).command; }
+
+// The checkout the run integrates into. A child's working directory is not
+// guaranteed to be it — a workflow child can be launched with a directory
+// resolved from somewhere else entirely — and a child in the wrong directory
+// will happily report that the branch, the spec or the ticket file is
+// missing. That is a missing TARGET verdict, which suppresses the request
+// and escalates a run that is actually fine. So every child that works in
+// the main checkout is told where it is, and told to confirm its own
+// working directory before it calls anything missing.
+function checkoutHint() {
+  if (!REPO_PATH) {
+    return [
+      "Before you conclude that anything is missing, confirm you are in the",
+      "right checkout: run `git rev-parse --show-toplevel` and check it is the",
+      "repository this run is integrating into. A child launched in the wrong",
+      "directory sees no branch, no spec and no ticket — that is a wrong",
+      "directory, not a missing target."
+    ];
+  }
+  return [
+    "The checkout to work in: " + REPO_PATH,
+    "Your working directory may not be that checkout. Start with:",
+    "  git -C " + REPO_PATH + " rev-parse --show-toplevel",
+    "and work in " + REPO_PATH + " (cd there) before you conclude that any",
+    "branch, spec or file is missing — a child in the wrong directory sees",
+    "none of them, and that is a wrong directory, not a missing target."
+  ];
+}
 
 // The harness raises a "needs attention" notice after 60s of silence and
 // wakes the parent to deal with it. A child running a verification gate is
@@ -611,8 +649,12 @@ function spawnMerger(ticket, implResult, wave, worktreePath) {
         "  git worktree list --porcelain | grep " + hint.runId,
         "Candidate manifest/artifact paths: " + hint.text
       ];
-  const task = [
+  const mergerTask = [
     "Merge one completed implementer's work into " + integrationBranch + ".",
+    ""
+  ];
+  mergerTask.push.apply(mergerTask, checkoutHint());
+  mergerTask.push(
     "",
     "Ticket: " + ticket.ref,
     "",
@@ -635,11 +677,11 @@ function spawnMerger(ticket, implResult, wave, worktreePath) {
     "change nothing.",
     "",
     "Return: merge status, commit hash, gate result."
-  ].join("\n");
+  );
   return runs.run(key, {
     label: "Merge ticket " + ticket.ref + " into " + integrationBranch,
     agent: AG.merger,
-    task: task,
+    task: mergerTask.join("\n"),
     timeoutMs: MERGE_TIMEOUT_MS,
     gate: gate,
     control: childControl()
@@ -657,18 +699,22 @@ function spawnVerifier(ticket, wave) {
   const key = "verify-" + wave + "-t" + keyOf(ticket.ref);
   const task = [
     "Independently verify ONE already-merged ticket's acceptance criteria",
-    "against the code in THIS checkout.",
+    "against the code in the checkout below.",
+    ""
+  ];
+  task.push.apply(task, checkoutHint());
+  task.push(
     "",
     "The one ticket you own: " + ticket.ref + ".",
     "Read it and record against it using the tracker convention in",
     "docs/agents/issue-tracker.md.",
-    "What to verify against: branch " + integrationBranch + " in this checkout,",
+    "What to verify against: branch " + integrationBranch + " in that checkout,",
     "the spec reference " + specRef + ", and the ticket above.",
     "Targeted test command form: " + (RETEST_COMMAND
       ? RETEST_COMMAND + " — substitute the test that covers the criterion."
       : "read docs/agents/verification.md for how this repo runs one narrow slice of tests."),
     ""
-  ];
+  );
   if (TRACKER_HINT) {
     task.push("Tracker (this repo's convention — your worktree may not carry the tracker doc):", TRACKER_HINT, "");
   }
@@ -718,11 +764,15 @@ function parseVerification(output) {
 // Three-axis review over the integrated branch, run in parallel.
 function spawnReviews(wave) {
   const axisTask = function(axis, focus) {
-    return [
+    const task = [
       "You are the " + axis + " reviewer for the implement-spec workflow.",
-      "Review the work integrated on branch " + integrationBranch + " in this",
-      "checkout (git log/diff against " + BASE_BRANCH + " as needed). Focus: " + focus,
+      "Review the work integrated on branch " + integrationBranch + " (git log/diff",
+      "against " + BASE_BRANCH + " as needed). Focus: " + focus,
       "Spec: " + specRef + "  Tickets: " + ticketsRef,
+      ""
+    ];
+    task.push.apply(task, checkoutHint());
+    task.push(
       "",
       "Review ONLY that target. First confirm it exists: if the branch named",
       "above does not resolve, or the spec or ticket reference does not",
@@ -736,7 +786,8 @@ function spawnReviews(wave) {
       "exactly one line: 'Review verdict: BLOCK' if there are must-fix defects,",
       "or 'Review verdict: OK' if there are none. No other final line is a",
       "verdict; the orchestrator treats a missing one as an unfinished review."
-    ].join("\n");
+    );
+    return task.join("\n");
   };
   return runs.all([
     {
@@ -1280,19 +1331,25 @@ let prRun = null;
 if (merged.length) {
   // Final verification: full suite (including e2e) on the integrated branch.
   let verifyRun = null;
+  const finalVerifyTask = [
+    "Final verification pass on branch " + integrationBranch + " in the checkout below.",
+    ""
+  ];
+  finalVerifyTask.push.apply(finalVerifyTask, checkoutHint());
+  finalVerifyTask.push(
+    "",
+    "First confirm that branch resolves. If it does not, change nothing, run",
+    "nothing, and reply 'MISSING_TARGET' with what you checked — do NOT",
+    "substitute another branch or treat the current checkout as the target.",
+    "Run the FULL test suite with: " + FULL_GATE,
+    "If anything fails, investigate and fix directly (no subagents), then",
+    "re-run until green, committing any fix. Return the test runner's summary line."
+  );
   try {
     verifyRun = await runs.run("final-verify", {
       label: "Final full-suite verification",
       agent: AG.merger,
-      task: [
-        "Final verification pass on branch " + integrationBranch + " in this checkout.",
-        "First confirm that branch resolves. If it does not, change nothing, run",
-        "nothing, and reply 'MISSING_TARGET' with what you checked — do NOT",
-        "substitute another branch or treat the current checkout as the target.",
-        "Run the FULL test suite with: " + FULL_GATE,
-        "If anything fails, investigate and fix directly (no subagents), then",
-        "re-run until green, committing any fix. Return the test runner's summary line."
-      ].join("\n"),
+      task: finalVerifyTask.join("\n"),
       timeoutMs: MERGE_TIMEOUT_MS,
       gate: gateObj(FULL_GATE),
       control: childControl()
@@ -1374,24 +1431,29 @@ if (merged.length) {
 
     if (fixRun && fixRun.ok) {
       const fixHint = patchHint(fixRun);
+      const fixMergeTask = [
+        "Merge the review-fix implementer's captured patch into " + integrationBranch + ".",
+        ""
+      ];
+      fixMergeTask.push.apply(fixMergeTask, checkoutHint());
+      fixMergeTask.push(
+        "",
+        "The fixer ran in a managed worktree; its patch was captured in that",
+        "run's own directory. Where it is: " + fixHint.text,
+        "  ls " + (fixHint.dir || "<run dir>/worktree-diffs/step-0/"),
+        "",
+        "Steps:",
+        "1. Confirm the main checkout is on " + integrationBranch + " and clean.",
+        "2. Locate and apply the captured patch (git apply --index <patch>).",
+        "3. Commit: git commit -m \"Address review findings\"",
+        "4. Re-run the full gate yourself: " + FULL_GATE,
+        "5. Return: merge status, commit hash, gate result."
+      );
       try {
         fixMergerRun = await runs.run("merge-review-fixes", {
           label: "Commit and merge review fixes into " + integrationBranch,
           agent: AG.merger,
-          task: [
-            "Merge the review-fix implementer's captured patch into " + integrationBranch + ".",
-            "",
-            "The fixer ran in a managed worktree; its patch was captured in that",
-            "run's own directory. Where it is: " + fixHint.text,
-            "  ls " + (fixHint.dir || "<run dir>/worktree-diffs/step-0/"),
-            "",
-            "Steps:",
-            "1. Confirm the main checkout is on " + integrationBranch + " and clean.",
-            "2. Locate and apply the captured patch (git apply --index <patch>).",
-            "3. Commit: git commit -m \"Address review findings\"",
-            "4. Re-run the full gate yourself: " + FULL_GATE,
-            "5. Return: merge status, commit hash, gate result."
-          ].join("\n"),
+          task: fixMergeTask.join("\n"),
           timeoutMs: MERGE_TIMEOUT_MS,
           gate: gateObj(FULL_GATE),
           control: childControl()
@@ -1418,22 +1480,28 @@ if (merged.length) {
   // not open a request that claims otherwise.
   const runComplete = escalated.length === 0;
   if (!skipPR && fixesClean && runComplete) {
+    const prTask = [
+      PR_INSTRUCTIONS
+        ? PR_INSTRUCTIONS
+        : "Open this repo's pull/merge request for the integrated work, using the\n" +
+          "command recorded in docs/agents/verification.md and the issue tracker doc.",
+      ""
+    ];
+    prTask.push.apply(prTask, checkoutHint());
+    prTask.push(
+      "",
+      "Branch: " + integrationBranch + " -> " + BASE_BRANCH + ", covering tickets " +
+        merged.join(", ") + " (spec: " + specRef + ").",
+      "The tickets at " + ticketsRef + " hold the per-ticket answers.",
+      "The head branch must exist on the remote before a request can be",
+      "opened — push it first (git push -u origin <branch>) if it is not there.",
+      "If this repo has no request surface, commit the integration branch and say so."
+    );
     try {
       prRun = await runs.run("pr", {
         label: "Open pull/merge request",
         agent: AG.prWriter,
-        task: [
-          PR_INSTRUCTIONS
-            ? PR_INSTRUCTIONS
-            : "Open this repo's pull/merge request for the integrated work, using the\n" +
-              "command recorded in docs/agents/verification.md and the issue tracker doc.",
-          "Branch: " + integrationBranch + " -> " + BASE_BRANCH + ", covering tickets " +
-            merged.join(", ") + " (spec: " + specRef + ").",
-          "The tickets at " + ticketsRef + " hold the per-ticket answers.",
-          "The head branch must exist on the remote before a request can be",
-          "opened — push it first (git push -u origin <branch>) if it is not there.",
-          "If this repo has no request surface, commit the integration branch and say so."
-        ].join("\n"),
+        task: prTask.join("\n"),
         timeoutMs: MERGE_TIMEOUT_MS,
         control: childControl()
       });
