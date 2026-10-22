@@ -359,7 +359,13 @@ function readTicketGraph() {
     "  ref: the ticket's reference in this tracker (e.g. 07, #42, PROJ-123),",
     "  title: the ticket title,",
     "  resolved: true when the tracker marks the ticket closed/done, else false,",
-    "  blockedBy: the refs of every ticket this one is blocked by ([] if none).",
+    "  blockedBy: the refs of every ticket this one is blocked by ([] if none),",
+    "  onBranch: true when the integration branch " + baseRef + " already carries",
+    "  this ticket's work — a commit whose message mentions ticket <ref> (this",
+    "  workflow's own merge commits read 'Implement ticket <ref>: ...'), or the",
+    "  work is otherwise present on that branch; false when it is not. A ticket",
+    "  the tracker marks resolved but whose work is NOT on the branch is not",
+    "  done: the run has to implement it, so report onBranch=false for it.",
     "Keep each object on ONE line. Compact JSON, no whitespace.",
     "If a ticket cannot be read at all, append 'UNREADABLE:<ref>' for it.",
     "",
@@ -372,7 +378,7 @@ function readTicketGraph() {
     "",
     "Your FINAL response must begin with ONLY this JSON document (no prose",
     "before or inside it):",
-    '{"tickets":[{"ref":"07","title":"...","resolved":false,"blockedBy":[]}],',
+    '{"tickets":[{"ref":"07","title":"...","resolved":false,"blockedBy":[],"onBranch":false}],',
     ' "preflight":{"trackerConfigured":true,"integrationBranchExists":true,"integrationBranch":"' + integrationBranch + '"}}'
   ].join("\n");
   return runs.run("ticket-graph", {
@@ -1013,14 +1019,18 @@ let waveCount = 0;        // survives the wave loop for the closing sequence
 
 if (verifyOnly) {
   // Resume mode: no implementation. Treat whatever the tracker marks resolved
-  // as the merged set, then run only the closing sequence.
+  // as the merged set, then run only the closing sequence — but only when the
+  // integration branch actually carries the work (see onBranch below).
   const st0 = statusesFromGraph(graphRun);
   for (const s of st0) {
     const ref = (s.ref === undefined || s.ref === null) ? "" : String(s.ref);
     if (!ref) continue;
-    if (s.resolved) {
+    if (s.resolved && s.onBranch) {
       merged.push(ref);
       ledgerFor(ref).state = "merged";
+    } else if (s.resolved) {
+      emit("ticket " + ref + ": the tracker marks it resolved but the integration branch does not carry the work; it is not done");
+      ledgerFor(ref).state = "unresolved";
     } else {
       ledgerFor(ref).state = "unresolved";
     }
@@ -1039,9 +1049,13 @@ if (verifyOnly) {
     const statusRun = await getTicketGraph(false);
     const statuses = statusesFromGraph(statusRun);
     const resolvedByRef = {};
+    const onBranchByRef = {};
     for (const s of statuses) {
       const ref = (s.ref === undefined || s.ref === null) ? "" : String(s.ref);
-      if (ref) resolvedByRef[ref] = !!s.resolved;
+      if (ref) {
+        resolvedByRef[ref] = !!s.resolved;
+        onBranchByRef[ref] = !!s.onBranch;
+      }
     }
 
     // Frontier: unresolved, not merged, not escalated, all blockers merged.
@@ -1051,9 +1065,19 @@ if (verifyOnly) {
       const ld = ledgerFor(ref);
       if (ld.state === "merged" || ld.state === "escalated") continue;
       if (resolvedByRef[ref]) {
-        ld.state = "merged";
-        merged.push(ref);
-        continue;
+        // The tracker says the ticket is done, but the work has to be ON the
+        // integration branch too. An implementer resolves the ticket in the
+        // tracker BEFORE its patch is merged, so a failed merge leaves a
+        // ticket that looks done and whose code is nowhere on the branch. Only
+        // absorb it when the branch actually carries the work; otherwise it
+        // has to be implemented (the implementer will find the work already
+        // present and the merger will see the commit is already there).
+        if (onBranchByRef[ref]) {
+          ld.state = "merged";
+          merged.push(ref);
+          continue;
+        }
+        emit("ticket " + ref + ": the tracker marks it resolved but the integration branch does not carry the work; it is not done");
       }
       const blockerOpen = t.blockedBy.some(function(b) {
         return ledgerFor(b).state !== "merged";
