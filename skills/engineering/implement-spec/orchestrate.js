@@ -361,11 +361,13 @@ function readTicketGraph() {
     "  resolved: true when the tracker marks the ticket closed/done, else false,",
     "  blockedBy: the refs of every ticket this one is blocked by ([] if none),",
     "  onBranch: true when the integration branch " + baseRef + " already carries",
-    "  this ticket's work — a commit whose message mentions ticket <ref> (this",
-    "  workflow's own merge commits read 'Implement ticket <ref>: ...'), or the",
-    "  work is otherwise present on that branch; false when it is not. A ticket",
-    "  the tracker marks resolved but whose work is NOT on the branch is not",
-    "  done: the run has to implement it, so report onBranch=false for it.",
+    "  this ticket's work. The workflow's own merge commits are written exactly",
+    "  as 'Implement ticket <ref>: <title>', so look for a commit on that branch",
+    "  whose message starts with 'Implement ticket " + "<ref>" + ":'. A commit that",
+    "  only changes the ticket's status line, or only mentions the ticket in",
+    "  passing, does NOT count — the work itself has to be on the branch. Report",
+    "  false when it is not. A ticket the tracker marks resolved but whose work",
+    "  is NOT on the branch is not done: the run has to implement it.",
     "Keep each object on ONE line. Compact JSON, no whitespace.",
     "If a ticket cannot be read at all, append 'UNREADABLE:<ref>' for it.",
     "",
@@ -735,6 +737,10 @@ function spawnVerifier(ticket, wave) {
     "3. Report each criterion as satisfied or not satisfied, with evidence",
     "   (file:line, test name, command, result).",
     "",
+    "The ticket may already be merged on that branch, but check rather than",
+    "assume: if the work is NOT there, that is a finding — report the criterion",
+    "as not satisfied. Do not conclude anything about work you cannot see.",
+    "",
     "Record what you found in the ticket, under the answer heading '" + ANSWER_HEADING + "':",
     "file paths, test names, commands run, and any gap. Treat the ticket as an",
     "append-only audit record — you may expand the answer heading, but do NOT",
@@ -1013,6 +1019,7 @@ emit("implement-spec: discovered " + order.length + " tickets: " + order.join(",
 const merged = [];        // ticket refs implemented AND merged
 const escalated = [];     // tickets given up to the lead after maxRemediations
 const verifications = []; // per-ticket independent verification verdicts
+const absorbedPending = []; // tickets the tracker calls done, awaiting verification
 const waveReports = [];
 let totalRemediations = 0;
 let waveCount = 0;        // survives the wave loop for the closing sequence
@@ -1020,14 +1027,15 @@ let waveCount = 0;        // survives the wave loop for the closing sequence
 if (verifyOnly) {
   // Resume mode: no implementation. Treat whatever the tracker marks resolved
   // as the merged set, then run only the closing sequence — but only when the
-  // integration branch actually carries the work (see onBranch below).
+  // integration branch actually carries the work (see onBranch below), and
+  // only once that work has been verified.
   const st0 = statusesFromGraph(graphRun);
   for (const s of st0) {
     const ref = (s.ref === undefined || s.ref === null) ? "" : String(s.ref);
     if (!ref) continue;
     if (s.resolved && s.onBranch) {
-      merged.push(ref);
       ledgerFor(ref).state = "merged";
+      absorbedPending.push(ref);
     } else if (s.resolved) {
       emit("ticket " + ref + ": the tracker marks it resolved but the integration branch does not carry the work; it is not done");
       ledgerFor(ref).state = "unresolved";
@@ -1073,8 +1081,11 @@ if (verifyOnly) {
         // has to be implemented (the implementer will find the work already
         // present and the merger will see the commit is already there).
         if (onBranchByRef[ref]) {
+          // The tracker says done AND the branch carries the work — but that
+          // is still a claim, so it is verified below before the ticket counts
+          // as merged.
           ld.state = "merged";
-          merged.push(ref);
+          absorbedPending.push(ref);
           continue;
         }
         emit("ticket " + ref + ": the tracker marks it resolved but the integration branch does not carry the work; it is not done");
@@ -1344,6 +1355,44 @@ if (verifyOnly) {
       }
     } else {
       stallGuard = 0;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Absorption check — a ticket the tracker already calls done is only merged
+// once the work is confirmed to be ON the integration branch AND to satisfy
+// its acceptance criteria. "Resolved in the tracker" is a claim, not proof:
+// an implementer resolves its ticket before its patch is merged, so a failed
+// merge leaves a ticket that looks done and whose code is nowhere. The
+// verifier settles it against the branch, not against the ticket.
+// ---------------------------------------------------------------------------
+if (absorbedPending.length) {
+  for (const ref of absorbedPending) {
+    const ticket = byRef[ref];
+    if (!ticket) continue;
+    let verifyRun = null;
+    try {
+      verifyRun = await spawnVerifier(ticket, 0);
+    } catch (eVer) {
+      emit("ticket " + ref + ": verifier launch rejected (" + eVer + ")");
+    }
+    const verdict = (verifyRun && verifyRun.ok) ? parseVerification(verifyRun.output) : "UNVERDICTED";
+    ledgerFor(ref).verification = verdict;
+    verifications.push({
+      ref: ref,
+      verdict: verdict,
+      excerpt: String((verifyRun && verifyRun.output) || "").slice(0, 400)
+    });
+    if (verdict === "OK") {
+      merged.push(ref);
+      emit("ticket " + ref + ": already resolved in the tracker — the work is on " + integrationBranch + " and independently verified");
+    } else {
+      escalate(ref, "the tracker marks it resolved but the work did not verify on " + integrationBranch + " (" + verdict + ")",
+               "the ticket was absorbed as done from the tracker; its acceptance criteria did not verify against the branch. " +
+               "Lead decision needed: implement it, or accept the gap explicitly.");
+      ledgerFor(ref).state = "escalated";
+      escalated.push(ref);
     }
   }
 }
