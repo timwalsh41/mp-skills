@@ -657,32 +657,41 @@ function spawnVerifier(ticket, wave) {
   const key = "verify-" + wave + "-t" + keyOf(ticket.ref);
   const task = [
     "Independently verify ONE already-merged ticket's acceptance criteria",
-    "against the code in THIS checkout, on branch " + integrationBranch + ".",
+    "against the code in THIS checkout.",
     "",
-    "Ticket: " + ticket.ref,
-    "Spec (for context): " + specRef,
-    "",
-    "The implementer for this ticket checked off its own acceptance criteria.",
-    "Do not take that as evidence — re-derive each criterion from the code:",
-    "1. Read the ticket and list every acceptance criterion.",
-    "2. For EACH criterion, gather first-hand evidence: read the code that",
-    "   implements it and, where meaningful, run the targeted test for it.",
-    "   Reading the code and its tests together is evidence; an unexecuted",
-    "   assertion is not.",
-    "3. Report each criterion as satisfied or not satisfied, with evidence",
-    "   (file:line, test name, command, result).",
+    "The one ticket you own: " + ticket.ref + ".",
+    "Read it and record against it using the tracker convention in",
+    "docs/agents/issue-tracker.md.",
+    "What to verify against: branch " + integrationBranch + " in this checkout,",
+    "the spec reference " + specRef + ", and the ticket above.",
+    "Targeted test command form: " + (RETEST_COMMAND
+      ? RETEST_COMMAND + " — substitute the test that covers the criterion."
+      : "read docs/agents/verification.md for how this repo runs one narrow slice of tests."),
     ""
   ];
   if (TRACKER_HINT) {
-    task.push("Tracker (this repo's convention):", TRACKER_HINT, "");
+    task.push("Tracker (this repo's convention — your worktree may not carry the tracker doc):", TRACKER_HINT, "");
   }
   task.push(
+    "The implementer for this ticket checked off its own acceptance criteria.",
+    "Do not take that as evidence — re-derive each criterion from the code:",
+    "1. Read the ticket via the tracker doc and list every acceptance criterion.",
+    "2. For EACH criterion, gather first-hand evidence: inspect the code that",
+    "   implements it and, where meaningful, run the targeted test for it.",
+    "   Reading the code and its tests together counts as evidence; an",
+    "   unexecuted assertion does not prove runtime behavior.",
+    "3. Report each criterion as satisfied or not satisfied, with evidence",
+    "   (file:line, test name, command, result).",
+    "",
+    "Record what you found in the ticket, under the answer heading '" + ANSWER_HEADING + "':",
+    "file paths, test names, commands run, and any gap. Treat the ticket as an",
+    "append-only audit record — you may expand the answer heading, but do NOT",
+    "toggle the implementer's acceptance checkboxes and do NOT change the ticket's",
+    "status. You report evidence; closing the ticket is someone else's decision.",
+    "",
     "Rules:",
     "- Touch only this ticket. Do NOT edit code, do NOT commit, do NOT change",
     "  git state, do NOT spawn subagents.",
-    "- Record your findings in the ticket as an append-only audit record.",
-    "- Do NOT change the ticket's status and do NOT tick its acceptance",
-    "  checkboxes — that is the implementer's and the orchestrator's domain.",
     "",
     "The LAST line of your final response MUST be exactly one of:",
     "  Verification verdict: OK    — every criterion is satisfied, with evidence",

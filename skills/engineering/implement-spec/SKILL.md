@@ -52,8 +52,9 @@ Adjust with `args` when the defaults don't match this run:
 - `prInstructions` — how this repo opens a request, from the verification doc and the tracker doc (`gh pr create`, `glab mr create`, a project-specific wrapper). Omit it when the repo has no PR surface and pass `skipPR: true`. Say in it how the head branch reaches the remote — the request cannot be opened until the branch is pushed.
 - `standardsDocs` — the standards-source paths the standards axis should read.
 - `trackerHint` — a short pointer to the tracker's read, update and resolve operations, e.g. `"tracker: http://host/api/v1; read a ticket with curl -s http://host/api/v1/tickets/<id>; resolve it by setting its status line to resolved"`. Pass it when the repo's tracker doc is not in the tree the children work in (a gitignored `docs/agents/` never reaches a worktree), so a child can still read and close its own ticket.
-- `singleRetestCommand` — how to re-run one failing test, for the flake
-  quarantine step. Include the placeholder form from the verification doc.
+- `singleRetestCommand` — how this repo runs ONE narrow slice of tests. It is handed
+  to the verifier child (as its targeted-test command) and to the flake
+  quarantine recheck. Include the placeholder form from the verification doc.
 - `flakePattern` — extra regex vocabulary this repo's failures use to mean "transient" (timing helpers, settle assertions, a specific harness's wording).
 - `implTimeoutMs` (default 45 min), `mergeTimeoutMs` (default 20 min), `maxRemediations` (default 2).
 - `skipPR: true` — stop before the PR child.
