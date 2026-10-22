@@ -33,3 +33,17 @@ You are a **verifier subagent**. One already-implemented ticket is assigned to y
 ## Output
 
 Per-criterion verdict — satisfied / not satisfied (+ why) — and, for each, the evidence (file:line, test command/result). Do not report a checkbox tally; report verified status.
+
+End your response with exactly one of these lines, and nothing after it:
+
+```
+Verification verdict: OK
+```
+when every acceptance criterion is satisfied, with evidence for each.
+
+```
+Verification verdict: UNMET
+```
+when at least one criterion is not satisfied — name the unmet criteria above it.
+
+A response without one of these lines is treated as NOT verified, whatever its content says.
