@@ -4,19 +4,24 @@ The control flow of `skills/engineering/implement-spec/orchestrate.js`, the scri
 
 ## What the diagram does not say
 
-- **The lead resolves the args; the script only consumes them.** `specPath`, `ticketsRef`, `integrationBranch`, and `fullGate` are required and repo-specific, read from `docs/agents/issue-tracker.md` and `docs/agents/verification.md`. A missing arg hard-fails before any child launches, because a wrong gate or branch would burn the whole remediation budget on a typo.
+- **The lead resolves the args; the script only consumes them.** `specRef`, `ticketsRef`, `integrationBranch`, and `fullGate` are required and repo-specific, read from `docs/agents/issue-tracker.md` and `docs/agents/verification.md`. A missing arg hard-fails before any child launches, because a wrong gate or branch would burn the whole remediation budget on a typo. `specRef` is a reference, not necessarily a file: a path in the repo, or the tracker ticket/epic that holds the spec.
+- **Args are coerced, then validated, before anything launches.** The caller may quote a number (`"900000"`), and the harness rejects a quoted number where an integer is required. Every numeric and boolean arg is coerced once, then checked; a bad one ends the run with a structured error and no child. A launch the harness rejects later is treated the same way — a config error, not a ticket failure — so it aborts the run instead of burning a remediation cycle and escalating a ticket that never started.
 - **Worktree isolation has one exception.** Implementers, fixers, and the review-fix pass run with `worktree: true` and `baseRef = refs/heads/<integrationBranch>`, and the main checkout never leaves the integration branch. The final verify runs in the main checkout instead, not a fresh worktree.
 - **Gates run on the host and are the only proof.** Every gated child (implementer, fixer, merger, final verify) carries a `gate` object the harness runs in the child's working tree; a child's own "done" never counts. Tickets gate on the full suite unless `fullGateTickets` narrows the rest to `narrowGate`, so a slow tier bundled into one ticket cannot fail every other ticket mid-run.
+- **A green gate is not a satisfied ticket.** After a ticket's work is merged and re-gated on the integration branch, a `verifier` child re-derives that ticket's acceptance criteria from the merged code and records the evidence in the ticket. Only then does the ticket count as merged; a missing verdict is not a pass, and the ticket is escalated like any other failure.
 - **The tracker is the source of truth.** Ticket state is re-read from the tracker each wave, never a child's self-report, and the discovery cache is dropped whenever a wave merges anything because a merge implies a child may have updated ticket state. A ticket already resolved is absorbed into `merged` without being implemented, which is also how `verifyOnly` resumes a partial run.
-- **Escalation is not abandonment.** A ticket that exhausts `maxRemediations` (default 2) stops being spawned and emits a structured `ESCALATION:` line; its dependents wait for the lead's decision rather than being poisoned. The lead resumes the named run, spawns a targeted fixer, or parks the ticket and re-plans.
+- **Escalation is not abandonment.** A ticket that exhausts `maxRemediations` (default 2) stops being spawned and emits a structured `ESCALATION:` line; its dependents wait for the lead's decision rather than being poisoned. The lead resumes the named run, spawns a targeted fixer, or parks the ticket and re-plans. An escalated ticket also suppresses the request: a run with an unverified ticket in it is not a finished run.
+- **The children are quiet on purpose.** Every child this workflow spawns carries a control override whose silence window is longer than its gate, and control notices are not pushed for them. A child running a test suite is silent by design, and the harness's 60-second "needs attention" notice used to wake the lead once per ticket per wave to say nothing.
 - **Two caveats the diagram only hints at.** A failed final verify is logged but does not suppress the PR, so a PR opened over a red integration branch is unreviewed work. The timeout tier-1 revive cannot carry a gate, so the revived child self-verifies and the merge gate re-checks.
 
 ```mermaid
 flowchart TD
     %% ===== ENTRY =====
-    Start(["Lead resolves args from docs/agents<br/>and launches orchestrate.js"]) --> ArgCheck{"specPath, ticketsRef,<br/>integrationBranch, fullGate<br/>all present?"}
+    Start(["Lead resolves args from docs/agents<br/>and launches orchestrate.js"]) --> ArgCheck{"specRef, ticketsRef,<br/>integrationBranch, fullGate<br/>all present?"}
     ArgCheck -- "no" --> ArgErr(["return ok:false + error<br/>naming the missing args"])
-    ArgCheck -- "yes" --> W0["Wave 0: scout discovery"]
+    ArgCheck -- "yes" --> ConfigCheck{"numeric/boolean args<br/>coerced and valid?"}
+    ConfigCheck -- "no" --> ConfigErr(["return ok:false:<br/>config error; no child launched"])
+    ConfigCheck -- "yes" --> W0["Wave 0: scout discovery"]
 
     %% ===== WAVE 0 =====
     W0 --> ReadGraph[/"readTicketGraph via runs.run:<br/>read tickets from the configured tracker,<br/>normalize ref + resolved + blockedBy,<br/>report tracker + integrationBranch preflight"/]
@@ -57,6 +62,7 @@ flowchart TD
     %% ---- per-ticket ladder ----
     ImplDone --> Classify{"For each ticket in batch:<br/>classifyFailure(result)"}
     Classify -- "ok" --> Merge
+    Classify -- "config (launch rejected;<br/>child never started)" --> ConfigAbort(["return ok:false:<br/>config error; no ticket blamed"])
     Classify -- "timeout / flake /<br/>gate / unknown" --> Attempts{"attempts++ ;<br/>attempts > maxRemediations?"}
     Attempts -- "yes" --> EscExhausted[["ESCALATION: remediation budget<br/>exhausted for ticket N;<br/>stop spawning it"]]
     Attempts -- "no" --> Remedy{"remediation by class"}
@@ -80,14 +86,18 @@ flowchart TD
     Fixer -- "failed / rejected" --> EscRemediation[["ESCALATION: remediation failed<br/>for ticket N"]]
 
     %% ---- merge ----
-    Merge{"spawnMerger:<br/>apply patch onto integration branch,<br/>commit, re-gate"} -- "ok" --> Merged["ledger = merged;<br/>push to merged;<br/>progressThisWave++"]
+    Merge{"spawnMerger:<br/>apply patch onto integration branch,<br/>commit, re-gate"} -- "ok" --> Verify["spawnVerifier:<br/>re-derive the ticket's acceptance<br/>criteria from the merged code"]
+    Verify --> VerifyQ{"Verification verdict: OK?"}
+    VerifyQ -- "yes" --> Merged["ledger = merged;<br/>push to merged;<br/>progressThisWave++"]
+    VerifyQ -- "no / missing verdict" --> EscVerify[["ESCALATION: verification did not pass;<br/>ticket not counted as merged"]]
     Merge -- "fail" --> MergeRetry{"Idempotent merger retry (x1)"}
-    MergeRetry -- "ok" --> Merged
+    MergeRetry -- "ok" --> Verify
     MergeRetry -- "fail" --> EscMerge[["ESCALATION: merge failed<br/>after retry for ticket N"]]
     Merged --> NextTicket
     EscExhausted --> NextTicket
     EscRemediation --> NextTicket
     EscMerge --> NextTicket
+    EscVerify --> NextTicket
     NextTicket{"More tickets in batch?"}
     NextTicket -- "yes" --> Classify
     NextTicket -- "no" --> WaveEnd["waveReports.push;<br/>waveCount = wave"]
@@ -118,7 +128,9 @@ flowchart TD
 
     IncompleteQ{"any axis without a verdict,<br/>or fewer than 3 axes?"}
     IncompleteQ -- "yes" --> Suppress(["PR suppressed:<br/>review incomplete"])
-    IncompleteQ -- "no" --> PRGate{"skipPR?"}
+    IncompleteQ -- "no" --> RunCompleteQ{"any ticket escalated<br/>and unverified?"}
+    RunCompleteQ -- "yes" --> Suppress
+    RunCompleteQ -- "no" --> PRGate{"skipPR?"}
     PRGate -- "yes" --> BranchOnly(["End: integration branch only"])
     PRGate -- "no" --> PR["spawnPR (prWriter):<br/>PR_INSTRUCTIONS,<br/>integration branch to baseBranch"]
     PR --> Result
@@ -126,13 +138,13 @@ flowchart TD
     Suppress --> Result
     BranchOnly --> Result
 
-    Result(["Return result object:<br/>ok, waves, merged, escalated,<br/>unresolved, reviews, reviewsIncomplete,<br/>fixApplied, fixMerged, prCreated"])
+    Result(["Return result object:<br/>ok, waves, merged, escalated,<br/>unresolved, reviews, reviewsIncomplete,<br/>verifications, fixApplied, fixMerged, prCreated"])
 
     %% ===== STYLES =====
     classDef esc fill:#fdd,stroke:#b00,stroke-width:1px,color:#800;
     classDef gate fill:#eef,stroke:#007,stroke-width:1px,color:#125;
     classDef cache fill:#ffe6b3,stroke:#b88,stroke-width:1px,color:#753;
-    class EscExhausted,EscRemediation,EscMerge,EscFix,Suppress,ArgErr,NoTickets,BranchErr esc;
+    class EscExhausted,EscRemediation,EscMerge,EscFix,EscVerify,Suppress,ArgErr,ConfigErr,ConfigAbort,NoTickets,BranchErr esc;
     class Merge,MergeRetry,FixMerge,FinalV gate;
     class Scan,DropCache cache;
 ```

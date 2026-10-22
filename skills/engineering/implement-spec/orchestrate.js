@@ -13,7 +13,14 @@
 // spec and tickets live, how work closes) and docs/agents/verification.md
 // (check commands, base branch, PR surface). This script has no filesystem
 // access, so it carries no project defaults and fails fast on missing ones.
-//   specPath           REQUIRED  e.g. ".scratch/<feature-slug>/spec.md"
+//   specRef            REQUIRED  the spec, as a REFERENCE: either a path in
+//                      the repo (e.g. ".scratch/<feature-slug>/spec.md") or
+//                      the tracker ticket/epic that holds it (e.g.
+//                      "JRB-001 (epic)"). specPath is accepted as an alias.
+//                      The script only interpolates it into child task text,
+//                      so either form works — but a tracker-held spec is
+//                      read by the children from the tracker, never from a
+//                      file in their worktree.
 //   ticketsRef         REQUIRED  e.g. ".scratch/<feature-slug>/issues"
 //   integrationBranch  REQUIRED  named branch only, e.g. "<feature-slug>-integration"
 //   fullGate           REQUIRED  the repo's full-suite command
@@ -49,8 +56,16 @@
 //   flakePattern       extra regex vocabulary this repo's transient failures
 //                      use, appended to the generic set
 //   agents             role-name map { scout, implementer, merger, prWriter,
-//                      reviewerStandards, reviewerSpec, reviewerQuality } for
-//                      projects whose agent definitions use other names
+//                      reviewerStandards, reviewerSpec, reviewerQuality,
+//                      verifier } for projects whose agent definitions use
+//                      other names
+//   trackerHint        optional. A short pointer to the tracker's read,
+//                      update and resolve operations, e.g. "tracker:
+//                      http://host/api/v1; read a ticket with curl ...;
+//                      resolve it by setting its status line to resolved".
+//                      Appended to the implementer's task, so a child whose
+//                      worktree does not carry the repo's tracker doc still
+//                      knows how to read its own ticket and close it.
 //   implTimeoutMs      default 45 min per implementer/fixer/continue child
 //   mergeTimeoutMs     default 20 min per merger
 //   maxRemediations    default 2 remediation attempts per ticket before
@@ -97,16 +112,35 @@
 // Configuration (args are frozen plain JSON; plain-JS defaults below)
 // ---------------------------------------------------------------------------
 const A = args || {};
-const specPath = A.specPath || null;
+// The spec is a reference, not necessarily a file: a path in the repo, or the
+// tracker ticket/epic that holds it. specPath is the older name, still
+// accepted.
+const specRef = A.specRef || A.specPath || null;
 const ticketsRef = A.ticketsRef || null;
 const integrationBranch = A.integrationBranch || null;
 const FULL_GATE = A.fullGate || null;
+
+// Args arrive exactly as the caller wrote them. A caller that quotes a
+// number ("900000") hands the harness a string, and the harness then rejects
+// the gate with "gate.timeoutMs must be an integer >= 1" — for EVERY ticket
+// in the run, while looking exactly like a broken implementation. Coerce
+// once, here, and never trust the caller's types.
+function numArg(value, fallback) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : NaN;
+}
+function boolArg(value) {
+  if (value === undefined || value === null || value === "") return false;
+  if (typeof value === "boolean") return value;
+  return String(value).toLowerCase() === "true";
+}
 
 // Repo-specific args have no fallback: running a gate that does not exist in
 // this repo burns a remediation cycle per ticket, and merging into a branch
 // nobody named is worse. Bail before any child launches.
 const missingArgs = [];
-if (!specPath) missingArgs.push("specPath");
+if (!specRef) missingArgs.push("specRef");
 if (!ticketsRef) missingArgs.push("ticketsRef");
 if (!integrationBranch) missingArgs.push("integrationBranch");
 if (!FULL_GATE) missingArgs.push("fullGate");
@@ -119,16 +153,17 @@ if (missingArgs.length) {
   };
 }
 
-const maxParallel = A.maxParallel || 4;
-const maxWaves = A.maxWaves || 6;
-const skipPR = !!A.skipPR;
-const verifyOnly = !!A.verifyOnly;
+const maxParallel = numArg(A.maxParallel, 4);
+const maxWaves = numArg(A.maxWaves, 6);
+const skipPR = boolArg(A.skipPR);
+const verifyOnly = boolArg(A.verifyOnly);
 const baseRef = "refs/heads/" + integrationBranch;
 const BASE_BRANCH = A.baseBranch || "main";
 const PR_INSTRUCTIONS = A.prInstructions || null;
 const STANDARDS_DOCS = A.standardsDocs ||
   "the files this repo documents as coding standards (search for CODING_STANDARDS.md, CONTRIBUTING.md, and anything AGENTS.md points at)";
 const RETEST_COMMAND = A.singleRetestCommand || null;
+const TRACKER_HINT = A.trackerHint || null;
 
 // Default Markdown-body conventions for the completion instructions handed to
 // children. The tracker doc (docs/agents/issue-tracker.md) is the authority;
@@ -149,16 +184,17 @@ const AG = {
   prWriter: ROLES.prWriter || "pr-writer",
   reviewerStandards: ROLES.reviewerStandards || "reviewer-standards",
   reviewerSpec: ROLES.reviewerSpec || "reviewer-spec",
-  reviewerQuality: ROLES.reviewerQuality || "reviewer-quality"
+  reviewerQuality: ROLES.reviewerQuality || "reviewer-quality",
+  verifier: ROLES.verifier || "verifier"
 };
 
-const IMPL_TIMEOUT_MS = A.implTimeoutMs || 45 * 60 * 1000;
-const MERGE_TIMEOUT_MS = A.mergeTimeoutMs || 20 * 60 * 1000;
+const IMPL_TIMEOUT_MS = numArg(A.implTimeoutMs, 45 * 60 * 1000);
+const MERGE_TIMEOUT_MS = numArg(A.mergeTimeoutMs, 20 * 60 * 1000);
 // The harness default gate cap is 120s, under the real
 // suite runtime. EVERY gate must carry an explicit generous deadline — so
 // children get the launch object, never a bare command string.
-const GATE_TIMEOUT_MS = A.gateTimeoutMs || 15 * 60 * 1000;
-const MAX_REMEDIATIONS = A.maxRemediations || 2;
+const GATE_TIMEOUT_MS = numArg(A.gateTimeoutMs, 15 * 60 * 1000);
+const MAX_REMEDIATIONS = numArg(A.maxRemediations, 2);
 
 // Gate commands are args-only
 const NARROW_GATE = A.narrowGate || FULL_GATE;
@@ -173,6 +209,73 @@ function gateFor(ref) {
 // run. Anything user-facing needs .command via this helper.
 function gateCommand(ref) { return gateFor(ref).command; }
 
+// The harness raises a "needs attention" notice after 60s of silence and
+// wakes the parent to deal with it. A child running a verification gate is
+// silent BY DESIGN for as long as the gate takes, so every gated child used
+// to trigger a notice that looked like a stall — the parent then had to go
+// and prove the child was fine, once per ticket per wave.
+//
+// Give every child this workflow spawns a silence window longer than its
+// gate, and stop the harness pushing control notices for them: the child's
+// own completion notice is the signal that matters. The control event still
+// updates the child's state (visible on demand via status), it just no
+// longer interrupts the lead.
+const CONTROL_SILENCE_MARGIN_MS = 2 * 60 * 1000;
+function childControl() {
+  return {
+    needsAttentionAfterMs: GATE_TIMEOUT_MS + CONTROL_SILENCE_MARGIN_MS,
+    notifyOn: []
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Config preflight — a malformed arg is a CONFIG error, not a ticket
+// failure. Left to the remediation ladder it gets laundered into a bogus
+// fixer, a bogus escalation and a dead run: the first observed case was a
+// quoted "900000" gate timeout, which the harness rejects for every ticket
+// in the run while looking exactly like a broken implementation. Fail once,
+// loudly, before any child launches.
+// ---------------------------------------------------------------------------
+const configErrors = [];
+function describeArg(value) {
+  if (typeof value === "number" && !Number.isFinite(value)) return String(value);
+  return JSON.stringify(value);
+}
+function requireInt(value, name, min) {
+  if (!Number.isInteger(value)) {
+    configErrors.push(name + " must be an integer (got " + describeArg(value) + ")");
+  } else if (value < min) {
+    configErrors.push(name + " must be >= " + min + " (got " + value + ")");
+  }
+}
+requireInt(maxParallel, "maxParallel", 1);
+requireInt(maxWaves, "maxWaves", 1);
+requireInt(GATE_TIMEOUT_MS, "gateTimeoutMs", 1000);
+requireInt(IMPL_TIMEOUT_MS, "implTimeoutMs", 1000);
+requireInt(MERGE_TIMEOUT_MS, "mergeTimeoutMs", 1000);
+requireInt(MAX_REMEDIATIONS, "maxRemediations", 0);
+if (fullGateTickets !== null && fullGateTickets !== undefined) {
+  if (!Array.isArray(fullGateTickets)) {
+    configErrors.push("fullGateTickets must be an array of ticket refs");
+  } else if (fullGateTickets.some(function(t) { return typeof t !== "string"; })) {
+    configErrors.push("fullGateTickets must contain ticket ref strings");
+  }
+}
+if (configErrors.length) {
+  return {
+    ok: false,
+    error: "implement-spec config error: " + configErrors.join("; ") +
+      ". No child was launched. Fix the args and relaunch — a numeric arg must be a " +
+      "number (a quoted number is a different number to the harness)."
+  };
+}
+
+// A launch that the harness rejects is a CONFIG failure, not a child
+// failure: the child never started, so no ticket can be blamed for it.
+function isConfigError(err) {
+  return /must be an integer|must be a valid|is not supported|is invalid|requires a params|accepts one child|gate cannot be combined|unsupported/i.test(String(err || ""));
+}
+
 // Transient-failure vocabulary; repos can add their own wording via
 // args.flakePattern (an invalid pattern degrades to the generic set).
 let FLAKE_RE;
@@ -184,7 +287,7 @@ try {
   emit("implement-spec: ignoring invalid args.flakePattern (" + eFlake + "); using the generic set");
 }
 
-emit("implement-spec: spec=" + specPath + " tickets=" + ticketsRef +
+emit("implement-spec: spec=" + specRef + " tickets=" + ticketsRef +
       " integration=" + integrationBranch + " base=" + BASE_BRANCH +
       " maxParallel=" + maxParallel + " maxWaves=" + maxWaves +
       " gates=[full: " + FULL_GATE + "]" +
@@ -239,34 +342,15 @@ function readTicketGraph() {
     agent: AG.scout,
     task: task,
     timeoutMs: 10 * 60 * 1000,
-    quiet: true,
-    outputSchema: {
-      type: "object",
-      required: ["tickets"],
-      properties: {
-        tickets: {
-          type: "array",
-          items: {
-            type: "object",
-            required: ["ref", "resolved", "blockedBy"],
-            properties: {
-              ref: { type: "string" },
-              title: { type: "string" },
-              resolved: { type: "boolean" },
-              blockedBy: { type: "array", items: { type: "string" } }
-            }
-          }
-        },
-        preflight: {
-          type: "object",
-          properties: {
-            trackerConfigured: { type: "boolean" },
-            integrationBranchExists: { type: "boolean" },
-            integrationBranch: { type: "string" }
-          }
-        }
-      }
-    }
+    quiet: true
+    // Deliberately NO outputSchema here. A step with an outputSchema must
+    // finish by calling the harness's structured_output tool; a model that
+    // answers with the JSON document as text — which is exactly what this
+    // task asks for — is then REJECTED, and the whole run dies with "no
+    // tickets found" while the correct JSON sits in the child's output. The
+    // script parses the child's text itself (statusesFromGraph), with a
+    // per-object recovery path for a truncated tail, so the schema bought
+    // nothing and cost the run its discovery.
   });
 }
 
@@ -328,8 +412,13 @@ function spawnImplementer(ticket, wave) {
     "Implement EXACTLY ONE ticket, end to end, using TDD (red-green-refactor).",
     "",
     "Ticket (read it first, using the tracker convention your role defines): " + ticket.ref,
-    "Full spec for background context only: " + specPath,
-    "",
+    "Full spec for background context only: " + specRef,
+    ""
+  ];
+  if (TRACKER_HINT) {
+    task.push("Tracker (this repo's convention — your worktree may not carry the tracker doc):", TRACKER_HINT, "");
+  }
+  task.push(
     "Rules:",
     "- Implement only this ticket. Other tickets belong to other workers.",
     "- Check off every `- [ ]` acceptance criterion in the ticket as you",
@@ -343,15 +432,16 @@ function spawnImplementer(ticket, wave) {
     "  the orchestrator captures and merges them.",
     "",
     "Return a concise summary: what you implemented, test results, decisions."
-  ].join("\n");
+  );
   return runs.run(key, {
     label: "Implement ticket " + ticket.ref + ": " + ticket.title,
     agent: AG.implementer,
-    task: task,
+    task: task.join("\n"),
     worktree: true,
     baseRef: baseRef,
     timeoutMs: IMPL_TIMEOUT_MS,
     gate: gateFor(ticket.ref),
+    control: childControl(),
     quiet: true
   });
 }
@@ -424,8 +514,34 @@ function spawnContinueChild(ticket, runId, wave) {
     agent: AG.implementer,
     task: task,
     timeoutMs: IMPL_TIMEOUT_MS,
-    gate: gateFor(ticket.ref)
+    gate: gateFor(ticket.ref),
+    control: childControl()
   });
+}
+
+// The harness captures an implementer's uncommitted work as a patch inside
+// the child's own run directory, and keeps the worktree on disk. The
+// workflow sandbox has no filesystem access, so the concrete location has to
+// be derived here and handed to the merger/fixer — otherwise they are told
+// to "inspect handoffs/" and have to guess where that is.
+function patchLocation(result) {
+  if (!result) return { runId: "unknown", asyncDir: null };
+  const runId = result.runId || "unknown";
+  const paths = Array.isArray(result.artifactPaths) ? result.artifactPaths : [];
+  const asyncDir = paths.find(function(p) {
+    return typeof p === "string" && p.indexOf("async-subagent-runs") >= 0;
+  }) || null;
+  return { runId: runId, asyncDir: asyncDir };
+}
+function patchHint(result) {
+  const loc = patchLocation(result);
+  return {
+    runId: loc.runId,
+    dir: loc.asyncDir ? loc.asyncDir + "/worktree-diffs/step-0/" : null,
+    text: loc.asyncDir
+      ? loc.asyncDir + "/worktree-diffs/step-0/  (the captured patch is the *.patch file in that directory)"
+      : ((result && result.artifactPaths || []).join(" ") || "(no artifact paths reported)")
+  };
 }
 
 // Gate-failure remediation: a fixer child in a FRESH managed worktree that
@@ -433,8 +549,8 @@ function spawnContinueChild(ticket, runId, wave) {
 // new but the WORK is not from scratch — it starts from the previous patch.
 function spawnFixer(ticket, priorResult, wave) {
   const key = "fix-" + wave + "-t" + keyOf(ticket.ref);
-  const manifestHint = (priorResult && priorResult.artifactPaths || []).join(" ");
-  const runId = priorResult && priorResult.runId;
+  const hint = patchHint(priorResult);
+  const runId = hint.runId;
   const task = [
     "REMEDIATION: the implementer for ticket " + ticket.ref + " completed but",
     "FAILED its verification gate. Its work is preserved as a captured patch;",
@@ -442,12 +558,12 @@ function spawnFixer(ticket, priorResult, wave) {
     "",
     "Ticket: " + ticket.ref,
     "Previous run id: " + (runId || "unknown"),
-    "Candidate manifest/artifact paths: " + (manifestHint || "(search by the run id below)"),
-    "The run's handoff artifacts live under the subagent artifact root, e.g.",
+    "Where the captured patch is: " + hint.text,
     "  ls -d \"${TMPDIR:-/tmp}\"/pi-subagents-*/async-subagent-runs/" + (runId || "<runId>") + "/",
     "",
     "Steps:",
-    "1. Locate the previous run's handoff manifest / captured patch.",
+    "1. Locate the previous run's captured patch (the *.patch file in the",
+    "   directory named above).",
     "2. Apply it to YOUR worktree: git apply --index <patch>",
     "   (your worktree already branches from " + integrationBranch + ").",
     "3. Run the gate: " + gateCommand(ticket.ref),
@@ -464,7 +580,8 @@ function spawnFixer(ticket, priorResult, wave) {
     worktree: true,
     baseRef: baseRef,
     timeoutMs: IMPL_TIMEOUT_MS,
-    gate: gateFor(ticket.ref)
+    gate: gateFor(ticket.ref),
+    control: childControl()
   });
 }
 
@@ -474,7 +591,7 @@ function spawnFixer(ticket, priorResult, wave) {
 // re-verifies the gate there. The commit check is idempotent so a retried
 // merger after a partial merge succeeds cleanly.
 function spawnMerger(ticket, implResult, wave, worktreePath) {
-  const manifestHint = (implResult && implResult.artifactPaths || []).join(" ");
+  const hint = patchHint(implResult);
   const key = "merge-" + wave + "-t" + keyOf(ticket.ref);
   const gate = gateFor(ticket.ref);
   const source = worktreePath
@@ -486,9 +603,13 @@ function spawnMerger(ticket, implResult, wave, worktreePath) {
         "then apply in the main checkout: git apply --index /tmp/ticket-" + keyOf(ticket.ref) + ".patch"
       ]
     : [
-        "The implementer ran in a managed worktree; its patch is recorded in a",
-        "handoff manifest. Candidate manifest/artifact paths:",
-        (manifestHint ? manifestHint : "(none provided — inspect handoffs/ under the session artifact dir)")
+        "The implementer ran in a managed worktree; its uncommitted work was",
+        "captured as a patch in that run's own directory. Find it with:",
+        "  ls " + (hint.dir || "<run dir>/worktree-diffs/step-0/"),
+        "  (the *.patch file in there is the captured work)",
+        "Its run id is " + hint.runId + ". Its worktree is still on disk:",
+        "  git worktree list --porcelain | grep " + hint.runId,
+        "Candidate manifest/artifact paths: " + hint.text
       ];
   const task = [
     "Merge one completed implementer's work into " + integrationBranch + ".",
@@ -520,8 +641,69 @@ function spawnMerger(ticket, implResult, wave, worktreePath) {
     agent: AG.merger,
     task: task,
     timeoutMs: MERGE_TIMEOUT_MS,
-    gate: gate
+    gate: gate,
+    control: childControl()
   });
+}
+
+// Independent verification of one merged ticket's acceptance criteria.
+//
+// The implementer checks off its own boxes; the merger proves the gate is
+// green on the integration branch. Neither answers "does the code actually do
+// what the ticket asked for?". This child answers that from first-hand
+// evidence, and a ticket only counts as merged when it does. It runs in the
+// main checkout, because the work it verifies is the merged work.
+function spawnVerifier(ticket, wave) {
+  const key = "verify-" + wave + "-t" + keyOf(ticket.ref);
+  const task = [
+    "Independently verify ONE already-merged ticket's acceptance criteria",
+    "against the code in THIS checkout, on branch " + integrationBranch + ".",
+    "",
+    "Ticket: " + ticket.ref,
+    "Spec (for context): " + specRef,
+    "",
+    "The implementer for this ticket checked off its own acceptance criteria.",
+    "Do not take that as evidence — re-derive each criterion from the code:",
+    "1. Read the ticket and list every acceptance criterion.",
+    "2. For EACH criterion, gather first-hand evidence: read the code that",
+    "   implements it and, where meaningful, run the targeted test for it.",
+    "   Reading the code and its tests together is evidence; an unexecuted",
+    "   assertion is not.",
+    "3. Report each criterion as satisfied or not satisfied, with evidence",
+    "   (file:line, test name, command, result).",
+    ""
+  ];
+  if (TRACKER_HINT) {
+    task.push("Tracker (this repo's convention):", TRACKER_HINT, "");
+  }
+  task.push(
+    "Rules:",
+    "- Touch only this ticket. Do NOT edit code, do NOT commit, do NOT change",
+    "  git state, do NOT spawn subagents.",
+    "- Record your findings in the ticket as an append-only audit record.",
+    "- Do NOT change the ticket's status and do NOT tick its acceptance",
+    "  checkboxes — that is the implementer's and the orchestrator's domain.",
+    "",
+    "The LAST line of your final response MUST be exactly one of:",
+    "  Verification verdict: OK    — every criterion is satisfied, with evidence",
+    "  Verification verdict: UNMET  — at least one criterion is not satisfied",
+    "A missing verdict is treated as NOT verified."
+  );
+  return runs.run(key, {
+    label: "Verify ticket " + ticket.ref + " against the merged code",
+    agent: AG.verifier,
+    task: task.join("\n"),
+    timeoutMs: MERGE_TIMEOUT_MS,
+    control: childControl()
+  });
+}
+
+// A missing verdict is not a pass — the same rule the review axes follow.
+function parseVerification(output) {
+  const text = String(output || "");
+  if (text.indexOf("Verification verdict: OK") >= 0) return "OK";
+  if (text.indexOf("Verification verdict: UNMET") >= 0) return "UNMET";
+  return "UNVERDICTED";
 }
 
 // Three-axis review over the integrated branch, run in parallel.
@@ -531,11 +713,12 @@ function spawnReviews(wave) {
       "You are the " + axis + " reviewer for the implement-spec workflow.",
       "Review the work integrated on branch " + integrationBranch + " in this",
       "checkout (git log/diff against " + BASE_BRANCH + " as needed). Focus: " + focus,
-      "Spec: " + specPath + "  Tickets: " + ticketsRef,
+      "Spec: " + specRef + "  Tickets: " + ticketsRef,
       "",
       "Review ONLY that target. First confirm it exists: if the branch named",
-      "above does not resolve, or the spec/ticket paths are missing, do NOT",
-      "pick a nearby branch, another feature's tickets, or the current",
+      "above does not resolve, or the spec or ticket reference does not",
+      "resolve (a path that is not there, a ticket the tracker does not have),",
+      "do NOT pick a nearby branch, another feature's tickets, or the current",
       "checkout and review that instead — a confident report about the wrong",
       "work is worse than no report. In that case answer with one line:",
       "'Review verdict: MISSING_TARGET' plus what was absent, and stop.",
@@ -552,21 +735,24 @@ function spawnReviews(wave) {
       label: "Review standards axis",
       agent: AG.reviewerStandards,
       task: axisTask("standards", "conformance to " + STANDARDS_DOCS + ", plus the repo's conventions"),
-      timeoutMs: MERGE_TIMEOUT_MS
+      timeoutMs: MERGE_TIMEOUT_MS,
+      control: childControl()
     },
     {
       key: "review-spec-" + wave,
       label: "Review spec axis",
       agent: AG.reviewerSpec,
       task: axisTask("spec", "does the integrated work satisfy the spec and ticket acceptance criteria"),
-      timeoutMs: MERGE_TIMEOUT_MS
+      timeoutMs: MERGE_TIMEOUT_MS,
+      control: childControl()
     },
     {
       key: "review-quality-" + wave,
       label: "Review quality axis",
       agent: AG.reviewerQuality,
       task: axisTask("quality", "correctness, robustness, test coverage, maintainability"),
-      timeoutMs: MERGE_TIMEOUT_MS
+      timeoutMs: MERGE_TIMEOUT_MS,
+      control: childControl()
     }
   ]);
 }
@@ -584,6 +770,9 @@ function classifyFailure(result) {
   if (!result) return "unknown";
   if (result.ok) return "ok";
   const err = String(result.error || "");
+  // A launch the harness rejected is a CONFIG failure: the child never
+  // started, so no ticket is at fault and no remediation cycle applies.
+  if (isConfigError(err)) return "config";
   if (/timed?\s?out|timeout|deadline/i.test(err)) return "timeout";
   // A single flaky e2e test failure must not abort the
   // whole workflow. Classify it explicitly so the ladder can re-run the
@@ -696,7 +885,11 @@ if (!tickets.length) {
   return {
     ok: false,
     error: "ticket discovery found no tickets for " + ticketsRef
-      + (graphOk ? "" : " (the discovery run itself failed)")
+      + (graphOk
+          ? ""
+          : " (the discovery run itself failed"
+            + (graphRun && graphRun.error ? ": " + String(graphRun.error).slice(0, 300) : "")
+            + ")")
       + ". Check the target against docs/agents/issue-tracker.md and relaunch.",
     discoveryRunId: graphRun && graphRun.runId
   };
@@ -748,6 +941,7 @@ emit("implement-spec: discovered " + order.length + " tickets: " + order.join(",
 
 const merged = [];        // ticket refs implemented AND merged
 const escalated = [];     // tickets given up to the lead after maxRemediations
+const verifications = []; // per-ticket independent verification verdicts
 const waveReports = [];
 let totalRemediations = 0;
 let waveCount = 0;        // survives the wave loop for the closing sequence
@@ -824,6 +1018,22 @@ if (verifyOnly) {
     try {
       implResults = await tryRunAll();
     } catch (e) {
+      if (isConfigError(e)) {
+        // The harness rejected the launch itself. No child started, so no
+        // ticket is at fault: stop the run instead of spending the whole
+        // remediation budget on a configuration mistake.
+        return {
+          ok: false,
+          error: "implement-spec config error while launching wave " + wave + ": " + String(e) +
+            ". No child was launched and no ticket is at fault. Fix the launch configuration and relaunch.",
+          integrationBranch: integrationBranch,
+          waves: waveReports.length,
+          merged: merged,
+          escalated: escalated,
+          unresolved: order.filter(function(num) { return merged.indexOf(num) < 0; }),
+          configError: true
+        };
+      }
       emit("wave " + wave + ": runs.all rejected (" + e + "); retrying once before serial fallback");
       try {
         implResults = await tryRunAll();
@@ -834,7 +1044,20 @@ if (verifyOnly) {
           try {
             implResults.push(await spawnImplementer(t, wave));
           } catch (e2) {
-            emit("wave " + wave + ": serial spawn for ticket " + t.number + " rejected (" + e2 + ")");
+            if (isConfigError(e2)) {
+              return {
+                ok: false,
+                error: "implement-spec config error while launching ticket " + t.ref + ": " + String(e2) +
+                  ". No child was launched and no ticket is at fault. Fix the launch configuration and relaunch.",
+                integrationBranch: integrationBranch,
+                waves: waveReports.length,
+                merged: merged,
+                escalated: escalated,
+                unresolved: order.filter(function(num) { return merged.indexOf(num) < 0; }),
+                configError: true
+              };
+            }
+            emit("wave " + wave + ": serial spawn for ticket " + t.ref + " rejected (" + e2 + ")");
             implResults.push({ ok: false, error: String(e2) });
           }
         }
@@ -850,6 +1073,25 @@ if (verifyOnly) {
       let implResult = implResults ? implResults[i] : null;
       const cls = classifyFailure(implResult);
       ld.runId = implResult && implResult.runId ? implResult.runId : ld.runId;
+
+      if (cls === "config") {
+        // The harness rejected the launch: the child never started, so the
+        // ticket is not at fault. Abort the run — a configuration mistake
+        // must not become a remediation cycle and a bogus escalation.
+        emit("implement-spec: CONFIG error launching ticket " + ticket.ref + " — aborting run");
+        return {
+          ok: false,
+          error: "implement-spec config error while launching ticket " + ticket.ref + ": " +
+            ((implResult && implResult.error) || "unknown") +
+            ". No child was launched and no ticket is at fault. Fix the launch configuration and relaunch.",
+          integrationBranch: integrationBranch,
+          waves: waveReports.length,
+          merged: merged,
+          escalated: escalated,
+          unresolved: order.filter(function(num) { return merged.indexOf(num) < 0; }),
+          configError: true
+        };
+      }
 
       if (cls !== "ok") {
         ld.attempts = ld.attempts + 1;
@@ -953,10 +1195,35 @@ if (verifyOnly) {
         if (attempt === 0) emit("ticket " + ticket.ref + ": merge failed; one idempotent merger retry");
       }
       if (mergeRun && mergeRun.ok) {
+        // The work is on the integration branch and the gate is green there.
+        // That proves the branch is not broken — not that the ticket's
+        // acceptance criteria are met. Verify them independently before the
+        // ticket counts as merged.
+        let verifyRun = null;
+        try {
+          verifyRun = await spawnVerifier(ticket, wave);
+        } catch (eVer) {
+          emit("ticket " + ticket.ref + ": verifier launch rejected (" + eVer + ")");
+        }
+        const verdict = (verifyRun && verifyRun.ok) ? parseVerification(verifyRun.output) : "UNVERDICTED";
+        ld.verification = verdict;
+        verifications.push({
+          ref: ticket.ref,
+          verdict: verdict,
+          excerpt: String((verifyRun && verifyRun.output) || "").slice(0, 400)
+        });
+        if (verdict !== "OK") {
+          escalate(ticket.ref, "independent verification did not pass (" + verdict + ")",
+                   "the work is merged into " + integrationBranch + " but its acceptance criteria are unverified. " +
+                   "Lead decision needed: targeted fix, or accept the gap explicitly.");
+          ld.state = "escalated";
+          escalated.push(ticket.ref);
+          continue;
+        }
         ld.state = "merged";
         merged.push(ticket.ref);
         progressThisWave = progressThisWave + 1;
-        emit("ticket " + ticket.ref + ": merged into " + integrationBranch);
+        emit("ticket " + ticket.ref + ": merged into " + integrationBranch + " and independently verified");
       } else {
         escalate(ticket.ref, "merge failed after retry", mergeErr ||
                  ((mergeRun && mergeRun.error) || "unknown"));
@@ -1018,7 +1285,8 @@ if (merged.length) {
         "re-run until green, committing any fix. Return the test runner's summary line."
       ].join("\n"),
       timeoutMs: MERGE_TIMEOUT_MS,
-      gate: gateObj(FULL_GATE)
+      gate: gateObj(FULL_GATE),
+      control: childControl()
     });
   } catch (eV) {
     emit("implement-spec: final-verify rejected (" + eV + ")");
@@ -1088,13 +1356,15 @@ if (merged.length) {
         worktree: true,
         baseRef: baseRef,
         timeoutMs: IMPL_TIMEOUT_MS,
-        gate: gateObj(FULL_GATE)
+        gate: gateObj(FULL_GATE),
+        control: childControl()
       });
     } catch (eFx) {
       emit("implement-spec: fix-review-findings rejected (" + eFx + ")");
     }
 
     if (fixRun && fixRun.ok) {
+      const fixHint = patchHint(fixRun);
       try {
         fixMergerRun = await runs.run("merge-review-fixes", {
           label: "Commit and merge review fixes into " + integrationBranch,
@@ -1102,9 +1372,9 @@ if (merged.length) {
           task: [
             "Merge the review-fix implementer's captured patch into " + integrationBranch + ".",
             "",
-            "The fixer ran in a managed worktree; its patch is in its handoff",
-            "manifest. Candidate manifest/artifact paths:",
-            ((fixRun.artifactPaths || []).join(" ") || "(inspect handoffs/ under the session artifact dir)"),
+            "The fixer ran in a managed worktree; its patch was captured in that",
+            "run's own directory. Where it is: " + fixHint.text,
+            "  ls " + (fixHint.dir || "<run dir>/worktree-diffs/step-0/"),
             "",
             "Steps:",
             "1. Confirm the main checkout is on " + integrationBranch + " and clean.",
@@ -1114,7 +1384,8 @@ if (merged.length) {
             "5. Return: merge status, commit hash, gate result."
           ].join("\n"),
           timeoutMs: MERGE_TIMEOUT_MS,
-          gate: gateObj(FULL_GATE)
+          gate: gateObj(FULL_GATE),
+          control: childControl()
         });
       } catch (eM) {
         emit("implement-spec: merge-review-fixes rejected (" + eM + ")");
@@ -1133,7 +1404,11 @@ if (merged.length) {
   // completed, and there are either no blockers or blockers fixed AND merged.
   // Never open a PR from a pre-fix commit, or from an unknown review state.
   const fixesClean = (!blockedAxes.length || (fixRun && fixRun.ok && fixMergerRun && fixMergerRun.ok)) && !reviewsIncomplete;
-  if (!skipPR && fixesClean) {
+  // An escalated ticket is a ticket whose acceptance is unverified. Its code
+  // may already be on the branch, but the run is not complete, so it does
+  // not open a request that claims otherwise.
+  const runComplete = escalated.length === 0;
+  if (!skipPR && fixesClean && runComplete) {
     try {
       prRun = await runs.run("pr", {
         label: "Open pull/merge request",
@@ -1144,18 +1419,22 @@ if (merged.length) {
             : "Open this repo's pull/merge request for the integrated work, using the\n" +
               "command recorded in docs/agents/verification.md and the issue tracker doc.",
           "Branch: " + integrationBranch + " -> " + BASE_BRANCH + ", covering tickets " +
-            merged.join(", ") + " (spec: " + specPath + ").",
+            merged.join(", ") + " (spec: " + specRef + ").",
           "The tickets at " + ticketsRef + " hold the per-ticket answers.",
+          "The head branch must exist on the remote before a request can be",
+          "opened — push it first (git push -u origin <branch>) if it is not there.",
           "If this repo has no request surface, commit the integration branch and say so."
         ].join("\n"),
-        timeoutMs: MERGE_TIMEOUT_MS
+        timeoutMs: MERGE_TIMEOUT_MS,
+        control: childControl()
       });
     } catch (eP) {
       emit("implement-spec: pr run rejected (" + eP + ")");
     }
   } else if (!skipPR) {
     emit("implement-spec: PR suppressed — " +
-         (reviewsIncomplete ? "review incomplete" : "review fixes not cleanly merged") +
+         (!runComplete ? "one or more tickets are escalated and unverified"
+                       : (reviewsIncomplete ? "review incomplete" : "review fixes not cleanly merged")) +
          "; lead decision needed");
   }
 }
@@ -1176,6 +1455,7 @@ return {
   ledger: ledger,
   reviews: reviews,
   reviewsIncomplete: reviewsIncomplete,
+  verifications: verifications,
   fixApplied: !!(fixRun && fixRun.ok),
   fixMerged: !!(fixMergerRun && fixMergerRun.ok),
   prCreated: !!(prRun && prRun.ok),

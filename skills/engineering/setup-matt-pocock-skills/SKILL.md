@@ -25,7 +25,7 @@ Look at the current repo to understand its starting state. Read whatever exists;
 - `AGENTS.md` and `CLAUDE.md` at the repo root: does either exist? Is there already an `## Agent skills` section in either?
 - `GLOSSARY.md` and `GLOSSARY-MAP.md` at the repo root
 - `docs/adr/` and any `src/*/docs/adr/` directories
-- `docs/agents/`: does this skill's prior output already exist?
+- `docs/agents/`: does this skill's prior output already exist? Is the directory git-ignored (`git check-ignore -v docs/agents/issue-tracker.md`)? It must not be: the tracked `AGENTS.md` points at these files, and the subagents read them from their own worktrees, where a gitignored file does not exist.
 - `.scratch/`: a sign that a local-markdown issue tracker convention is already in use
 - The repo's own check commands: `package.json` scripts, `Makefile` targets, `justfile`, `pyproject.toml`/`pytest` config, and the CI workflow (`.github/workflows/*`, `.gitlab-ci.yml`). Prefer CI: it is what the maintainers actually gate on. Look for a *fast* tier as well as the full suite (a `test-fast`-style target, a unit-only directory, a job that skips the slow tests)
 - The base branch: `git symbolic-ref refs/remotes/origin/HEAD`; if that fails, the remote's HEAD or the repo's only long-lived branch
@@ -132,6 +132,13 @@ Then write the docs files using the seed templates in this skill folder as a sta
 - [domain.md](./domain.md): domain doc consumer rules + layout
 
 For "other" issue trackers, write `docs/agents/issue-tracker.md` from scratch using the user's description.
+
+**Make sure the files you just wrote are not git-ignored.** They are part of the repo's agent contract, not local scratch:
+
+- the tracked `AGENTS.md` (or `CLAUDE.md`) points at them, so a clone without them has agent instructions that point nowhere;
+- the subagent roles read `docs/agents/issue-tracker.md` and `docs/agents/verification.md` from their own worktree, and a gitignored file is not in a worktree — the child gets a tracker it cannot reach.
+
+Check with `git check-ignore -v docs/agents/<file>`. If it is ignored, remove that rule from `.gitignore` (or narrow it to the specific local files that should stay untracked) and tell the user what you changed and why. Do this for `docs/agents/` only — other local agent config (`.agents/`, `.pi/`, a local skills lock) may legitimately stay ignored.
 
 ### 5. Done
 

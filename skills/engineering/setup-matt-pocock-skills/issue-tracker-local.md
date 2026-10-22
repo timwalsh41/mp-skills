@@ -1,5 +1,9 @@
 # Issue tracker: Local Markdown
 
+
+<!-- This file belongs in the repo: the tracked AGENTS.md points at it, and the
+     subagents read it from their worktrees. Do not git-ignore docs/agents/. -->
+
 Issues and specs for this repo live as markdown files in `.scratch/`.
 
 ## Conventions

@@ -1,5 +1,9 @@
 # Triage Labels
 
+
+<!-- This file belongs in the repo: the tracked AGENTS.md points at it, and the
+     subagents read it from their worktrees. Do not git-ignore docs/agents/. -->
+
 The skills speak in terms of five canonical triage roles. This file maps those roles to the actual label strings used in this repo's issue tracker.
 
 | Label in mattpocock/skills | Label in our tracker | Meaning                                  |

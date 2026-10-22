@@ -20,10 +20,10 @@ Launch the orchestration workflow. Every value below comes from the step above:
 
 ```js
 subagent({
-  workflow: "./.agents/skills/implement-spec/orchestrate.js",
+  workflow: "~/.pi/agent/skills/implement-spec/orchestrate.js",
   async: true,
   args: {
-    specPath: ".scratch/<feature-slug>/spec.md",
+    specRef: ".scratch/<feature-slug>/spec.md",
     ticketsRef: "<the tracker's target for this feature's tickets>",
     integrationBranch: "<feature-slug>-integration",
     fullGate: "<the repo's full-suite command>",
@@ -35,7 +35,12 @@ subagent({
 })
 ```
 
-`specPath`, `ticketsRef`, `integrationBranch` and `fullGate` are **required**: the script returns a structured error naming the missing arg instead of launching children. `narrowGate` defaults to `fullGate`.
+The script lives next to this `SKILL.md` — launch it from wherever it is actually installed (`~/.pi/agent/skills/implement-spec/orchestrate.js` when the skills are installed for the agent, a repo-local `.agents/skills/implement-spec/orchestrate.js` copy when the repo vendors it).
+
+`specRef`, `ticketsRef`, `integrationBranch` and `fullGate` are **required**: the script returns a structured error naming the missing arg instead of launching children. `narrowGate` defaults to `fullGate`.
+
+- `specRef` is the spec **as a reference**, not necessarily a file: either a path in the repo (`.scratch/<feature-slug>/spec.md`) or the tracker ticket/epic that holds it (`"JRB-001 (epic)"`). The script only passes it to children as a pointer, so a tracker-held spec works — the children read it from the tracker, and nothing has to be committed for a worktree to see it. `specPath` is accepted as an alias.
+- Pass numbers as JSON **numbers**. The script coerces a quoted number, but a quoted number is a different number to the harness.
 
 Adjust with `args` when the defaults don't match this run:
 
@@ -44,8 +49,9 @@ Adjust with `args` when the defaults don't match this run:
   cannot pass yet does not falsely fail every other ticket mid-run. Default is `null`: every ticket gates on the full suite.
 - `gateTimeoutMs` (default 15 min) — harness gate caps are shorter than most real suites; set this above the suite's runtime, from `docs/agents/verification.md`.
 - `baseBranch` (default `main`) — the branch the review axes diff against and the PR targets.
-- `prInstructions` — how this repo opens a request, from the verification doc and the tracker doc (`gh pr create`, `glab mr create`, a project-specific wrapper). Omit it when the repo has no PR surface and pass `skipPR: true`.
+- `prInstructions` — how this repo opens a request, from the verification doc and the tracker doc (`gh pr create`, `glab mr create`, a project-specific wrapper). Omit it when the repo has no PR surface and pass `skipPR: true`. Say in it how the head branch reaches the remote — the request cannot be opened until the branch is pushed.
 - `standardsDocs` — the standards-source paths the standards axis should read.
+- `trackerHint` — a short pointer to the tracker's read, update and resolve operations, e.g. `"tracker: http://host/api/v1; read a ticket with curl -s http://host/api/v1/tickets/<id>; resolve it by setting its status line to resolved"`. Pass it when the repo's tracker doc is not in the tree the children work in (a gitignored `docs/agents/` never reaches a worktree), so a child can still read and close its own ticket.
 - `singleRetestCommand` — how to re-run one failing test, for the flake
   quarantine step. Include the placeholder form from the verification doc.
 - `flakePattern` — extra regex vocabulary this repo's failures use to mean "transient" (timing helpers, settle assertions, a specific harness's wording).
@@ -54,16 +60,19 @@ Adjust with `args` when the defaults don't match this run:
 
 After launching, **yield and wait for the workflow receipt** — do not implement tickets yourself, poll, or interleave ad-hoc fixes. If a child fails, the workflow's remediation ladder handles it (below); relaunch the same workflow (same script + args reuses finished children) rather than falling back to doing the work inline. Background completion wakes you natively.
 
-For each complete implementation, manually launch a verification run with the `verifier` agent for an independent check that all acceptance criteria are satisfied.  
+Do **not** run a verification pass yourself: after each ticket's work is merged, the workflow spawns a `verifier` child that re-derives that ticket's acceptance criteria from the merged code and records the evidence in the ticket. A ticket only counts as merged when that independent check passes.
 
 ## What the workflow enforces (do not bypass)
 
+- **A configuration error is not a ticket failure**: every numeric and boolean arg is coerced and validated before the first child launches, and a launch the harness rejects aborts the run with a structured error. A malformed arg used to be laundered through the remediation ladder into a bogus fixer, a bogus escalation, and a dead run — one quoted gate timeout killed every ticket in the run while looking like a broken implementation.
 - **Worktree isolation**: every implementer, fixer, and the review-fix pass run with `worktree: true` and `baseRef: refs/heads/<integrationBranch>`, a managed git worktree. The main checkout is never switched off the integration branch.
 - **Verification gating**: every implementer/fixer/merger carries a `gate`. The gate runs on the host after the child completes, in that child's tree; a run is not `ok` unless the gate passes. Child claims alone never count as verified.
+- **Independent verification of each ticket**: after a ticket's work is merged and the gate is green on the integration branch, a `verifier` child re-derives that ticket's acceptance criteria from the merged code. A missing verdict is not a pass: the ticket is escalated and the run does not open a request.
 - **The tracker is the source of truth**: ticket state is re-read from the tracker every wave (the discovery cache is dropped whenever a wave merges, because a child may have resolved a ticket); subagents read and update tickets through `docs/agents/issue-tracker.md`. The script never trusts a child's self-report of resolution, and a ticket is only marked merged after its merger run verifies green on the integration branch.
 - **Sparse context**: children get ticket references, not inlined spec text.
 - **The target is the target**: the scout is told to report only the target's tickets, and discovery reports whether `refs/heads/<integrationBranch>` resolves before wave 1. A nonexistent target or branch ends the run with a structured error — it never falls back to "some nearby tickets/branch", which is how a placeholder in `args` can otherwise produce a confident review of unrelated work. If you want that check on a run whose scout reports no preflight, the script warns and continues; the merger still refuses a missing branch.
 - **A review without a verdict is incomplete, not a pass**: each axis must end with `Review verdict: BLOCK` or `Review verdict: OK`. A missing line — or an axis that failed to run — suppresses the PR and escalates to you, because an unknown review state is not evidence of a clean one.
+- **An escalated ticket means the run is not complete**, so no request is opened over it.
 
 ## The remediation ladder (what happens when a child fails)
 
@@ -76,6 +85,8 @@ The workflow does not abandon a ticket on first failure. Per ticket:
 - **Merge failure** → one idempotent merger retry, then escalation.
 - **After `maxRemediations`** → the ticket is **escalated, not abandoned**: the script emits a structured `ESCALATION:` line (run id, failure class, evidence paths) and stops spawning for that ticket. Dependents wait for the lead's decision instead of being silently poisoned.
 
+A **configuration error** is not on this ladder: the run stops immediately with a structured error and no ticket is blamed.
+
 When you (the lead) receive an `ESCALATION:`, decide deliberately:
 
 1. **Resume/revive** the named child run (`subagent({ action: "resume", id })`) —  this keeps its session context and worktree. Prefer this for timeouts.
@@ -84,5 +95,5 @@ When you (the lead) receive an `ESCALATION:`, decide deliberately:
 
 ## Steering rules 
 
-- **Never steer a child that may be running a test suite.** A 60s-quiet "needs attention" notice usually means the child is mid-suite, not stuck. Steer pauses/interrupts the run. Check `status`/transcript first; for timed-out children use `resume`, never `steer`.
-- The inactivity watchdog fires on *silence*, and suite-running children are silent by design. When in doubt, look at the transcript before acting.
+- **Never steer a child that may be running a test suite.** A "needs attention" notice usually means the child is mid-suite, not stuck. Steer pauses/interrupts the run. Check `status`/transcript first; for timed-out children use `resume`, never `steer`.
+- The inactivity watchdog fires on *silence*, and suite-running children are silent by design. The children this workflow spawns carry a silence window longer than their gate and do not push control notices at all, so a gate-running child no longer wakes you to be told it is quiet. When in doubt, look at the transcript before acting.

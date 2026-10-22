@@ -1,5 +1,9 @@
 # Domain Docs
 
+
+<!-- This file belongs in the repo: the tracked AGENTS.md points at it, and the
+     subagents read it from their worktrees. Do not git-ignore docs/agents/. -->
+
 How the engineering skills should consume this repo's domain documentation when exploring the codebase.
 
 ## Before exploring, read these
