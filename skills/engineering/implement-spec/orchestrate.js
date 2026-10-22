@@ -899,8 +899,13 @@ let ticketGraphCache = null;
 // An unreadable ticket silently drops out of this wave's frontier, so report
 // it instead of dropping it.
 function scoutLints(result) {
+  // Only the JSON document counts. A scout that adds a note after the JSON
+  // ("no UNREADABLE entries are appended") must not be read as reporting one.
   const text = String((result && result.output) || "");
-  const unreadable = text.match(/UNREADABLE:\s*\S+/g) || [];
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  const json = (start >= 0 && end > start) ? text.slice(start, end + 1) : text;
+  const unreadable = json.match(/UNREADABLE:\s*\S+/g) || [];
   unreadable.forEach(function(u) {
     emit("ticket-graph: " + u + ": ticket unreadable this wave");
   });

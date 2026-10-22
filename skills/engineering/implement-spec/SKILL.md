@@ -39,6 +39,8 @@ The script lives next to this `SKILL.md` — launch it from wherever it is actua
 
 `specRef`, `ticketsRef`, `integrationBranch` and `fullGate` are **required**: the script returns a structured error naming the missing arg instead of launching children. `narrowGate` defaults to `fullGate`.
 
+The harness accepts at most 16 `args` fields, and the list below is the full set — drop the ones this run does not need.
+
 - `specRef` is the spec **as a reference**, not necessarily a file: either a path in the repo (`.scratch/<feature-slug>/spec.md`) or the tracker ticket/epic that holds it (`"JRB-001 (epic)"`). The script only passes it to children as a pointer, so a tracker-held spec works — the children read it from the tracker, and nothing has to be committed for a worktree to see it. `specPath` is accepted as an alias.
 - Pass numbers as JSON **numbers**. The script coerces a quoted number, but a quoted number is a different number to the harness.
 
