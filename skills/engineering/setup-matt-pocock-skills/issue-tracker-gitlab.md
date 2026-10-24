@@ -38,6 +38,19 @@ Create a GitLab issue.
 
 Run `glab issue view <number> --comments`.
 
+## When a skill says "groom a ticket"
+
+Used by `/groom`. A groomed GitLab issue is one carrying the four implementation fields as structured sections in its description and the `ready-for-agent` triage label (GitLab issues have no custom fields on the free tier, and `ready-for-agent` is the triage role for "fully specified, ready for an agent").
+
+- **The groomed fields**, as sections in the description:
+  - `## Approach`
+  - `## Files to Change`
+  - `## Test Plan`
+  - `## Validation Steps`
+  Append them with `glab issue update <number> --description "..."` (or read, edit, and write back).
+- **Mark groomed**: `glab issue update <number> --label ready-for-agent`. A bare `#42` is unambiguously an issue here.
+- **Scope**: grooming writes the description sections and the `ready-for-agent` label. It does **not** close the issue or add other triage labels; that is `/triage`'s job.
+
 ## Wayfinding operations
 
 Used by `/wayfinder`. The **map** is a single issue with **child** issues as tickets.

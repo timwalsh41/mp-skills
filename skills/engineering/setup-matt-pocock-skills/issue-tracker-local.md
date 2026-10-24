@@ -22,6 +22,18 @@ Create a new file under `.scratch/<feature-slug>/` (creating the directory if ne
 
 Read the file at the referenced path. The user will normally pass the path or the issue number directly.
 
+## When a skill says "groom a ticket"
+
+Used by `/groom`. A groomed local ticket carries the four implementation fields in its file body and a `Status: ready-for-agent` line near the top (this repo records triage state as a `Status:` line; see `triage-labels.md` for the role strings).
+
+- **The groomed fields**, as sections in the issue file:
+  - `## Approach`
+  - `## Files to Change`
+  - `## Test Plan`
+  - `## Validation Steps`
+- **Mark groomed**: set `Status: ready-for-agent` near the top of the file.
+- **Scope**: grooming writes the file sections and the ready-for-agent status. It does **not** close the ticket or add other roles; that is `/triage`'s job.
+
 ## Wayfinding operations
 
 Used by `/wayfinder`. The **map** is a file with one **child** file per ticket.

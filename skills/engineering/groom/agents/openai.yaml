@@ -1,0 +1,5 @@
+interface:
+  display_name: "Groom"
+  short_description: "Groom a raw ticket by grilling to fill the fields"
+policy:
+  allow_implicit_invocation: false
