@@ -9,4 +9,5 @@ Jackrabbit maps onto the standard workflow as follows:
     - When implementing tickets as part of the `/implement` or `/implement-spec` skill, change the ticket status from `Groomed` to `In Progress`, filling out the integration/feature branch name
     - Tickets should be transitioned from `In Progress` to `In Review` when ready for user Review
         - Typicall this would be when a PR is created, and the PR link should be added during the state transition
-    - Transition the ticket from `In Review` to `Complete` once the feature/integration branch is merged to main, via PR or direct merge 
+    - Transition the ticket from `In Review` to `Complete` once the feature/integration branch is merged to main, via PR or direct merge
+- Use labels on tickets to represent triage status
