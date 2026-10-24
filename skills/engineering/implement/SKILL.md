@@ -4,7 +4,7 @@ description: "Implement a piece of work based on a spec or ticket."
 disable-model-invocation: true
 ---
 
-Orchestrate the implementation of the work described by the user in a ticket. Create a feature branch and create a dedicated worktree using `treehouse`.
+Orchestrate the implementation of the work described by the user in a ticket. Review the ticket itself, and invoke the **groom** skill if needed to fully groom. Create a feature branch and create a dedicated worktree using `treehouse`.
 
 Invoke the `implementer` subagent to make the relevant code changes. Provide as task input:
 - **Ticket** — the one ticket to execute, named by its reference and its target 
