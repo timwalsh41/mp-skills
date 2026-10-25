@@ -1,22 +1,35 @@
 ---
 name: implement
-description: "Implement a piece of work based on a spec or ticket."
+description: "Implement a single ticket via an orchestration workflow."
 disable-model-invocation: true
 ---
 
-Orchestrate the implementation of the work described by the user in a ticket. Review the ticket itself, and invoke the **groom** skill if needed to fully groom. Create a feature branch and create a dedicated worktree using `treehouse`.
+Orchestrate implementation of one ticket on a dedicated feature branch by launching an orchestration script. The script delegates to subagents — **implementer** (worktree-isolated), **reviewer-quality** + **reviewer-standards** (parallel), **verifier** (independent), and **pr-writer**. **Do not implement the ticket yourself in this context** — the script handles all code, review, verification, and PR through isolated children.
 
-Invoke the `implementer` subagent to make the relevant code changes. Provide as task input:
-- **Ticket** — the one ticket to execute, named by its reference and its target 
-- **Spec path** — is a standard input to this subagent, in this case this is an independent ticket so no spec is provided
-- **Integration branch / worktree base**
-- **Gate command** — this repo's verification command
-- **Ticket vocabulary** — how this this repo's tracker marks "done", where the answer goes, and the acceptance-criterion form
+## Steps
 
-Invoke two code reviewer subagents, `reviewer-quality` and `reviewer-standards`, simultaneously to review along those two complementary axes. Provide as input to the quality reviewer the fixed reference point and the diff to review, e.g. `git diff <fixed point>...HEAD`, and explicitly state that there is no separate spec. Provide as input to the standards reviewer the same fixed point and diff, as well as the coding standards document for this repo (e.g. `CODING_STANDARDS.md` or `CONTRIBUTING.md`) 
+1. **Read the ticket** (see `docs/agents/issue-tracker.md`). Groom first if needed.
+2. **Create the feature branch.**
+3. **Resolve** from `docs/agents/verification.md` and `docs/agents/issue-tracker.md`: the gate command, base branch, and PR command.
+4. **Launch the orchestrator** and yield — background completion wakes you natively:
 
-If either reviewer flags blocking concerns, then trigger a new `implementer` subagent to resolve it, providing again the appropriate inputs and direction.
+```js
+subagent({ workflow: "~/.pi/agent/skills/implement/orchestrate.js", async: true, args: {
+  ticketRef, gate, integrationBranch,   // required
+  baseBranch, repoPath,                  // optional (default "main", detect)
+  gateTimeoutMs, maxRemediations,        // optional (default 15min, 2)
+  skipPR, prInstructions,                // optional (default false, repo default)
+  standardsDocs, trackerHint,            // optional
+  singleRetestCommand, agents            // optional
+}})
+```
 
-Once review is resolved, trigger a `verifier` agent to perform final verification. Provide as input the ticket and the target branch. Use an `implementer` subagent as needed to resolve verification failures.
+Numeric args must be JSON numbers. Full arg documentation is in `orchestrate.js`.
 
-Once complete, report back to the user and await further instruction. Offer to merge changes to main, raise a PR to main, and tear down the worktree. If the user requests a PR, use the `pr-writer` subagent, providing as input the feature branch and destination branch, the PR creation process details, the ticket reference, and evidence (gate/test results and review outcome).
+## What the workflow enforces
+
+- **Worktree isolation** — the implementer's managed worktree is the only tree touched.
+- **Gate enforcement** — every child carries a gate that runs on the host; claims alone don't count.
+- **Review verdict contract** — missing `Review verdict:` lines are incomplete, not pass; the PR is suppressed.
+- **Independent verification** — a verifier child re-derives acceptance criteria from merged code.
+- **No PR without clean reviews + verification.**

@@ -4,6 +4,12 @@
 // statement body with top-level await and NO fs/shell/require/tools — every
 // action on the world goes through child agents via runs.run / runs.all.
 //
+// Some helpers below (numArg, boolArg, gateObj, childControl, checkoutHint,
+// reviewAxisTask, parseReviewVerdict, parseVerification, classifyFailure) are
+// shared with implement/orchestrate.js — the /implement workflow inlines its
+// own copies, because the Pi workflow sandbox has no import/require mechanism.
+// If Pi adds module support to the workflow sandbox, these should be extracted
+// into a single importable module to avoid drift.
 // Contract with the invoking lead agent:
 //   subagent({ workflow: "./.agents/skills/implement-spec/orchestrate.js",
 //              args: { ... }, async: true })
