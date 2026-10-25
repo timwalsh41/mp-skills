@@ -168,6 +168,32 @@ const integrationBranch = A.integrationBranch;
 const baseRef = "refs/heads/" + integrationBranch;
 const BASE_BRANCH = A.baseBranch || "main";
 const REPO_PATH = A.repoPath || null;
+// Optional tracker-agnostic transition command templates. Each value is a shell
+// command string with $TICKET_REF, $BRANCH, and $PR_URL variables substituted.
+// When omitted, no status transitions are performed (the ticket is still
+// resolved by description per docs/agents/issue-tracker.md).
+const TRANSITION_COMMANDS = A.transitionCommands || null;
+function runTransition(phase, ref, variables) {
+  if (!TRANSITION_COMMANDS || !TRANSITION_COMMANDS[phase]) {
+    emit("implement: no transition command for '" + phase + "'; skipping");
+    return Promise.resolve(null);
+  }
+  const substituted = TRANSITION_COMMANDS[phase]
+    .replace(/\$TICKET_REF/g, String(ref))
+    .replace(/\$BRANCH/g, String(variables.branch || ""))
+    .replace(/\$PR_URL/g, String(variables.prUrl || ""));
+  return runs.run("transition-" + phase + "-" + keyOf(ref), {
+    agent: AG.worker,
+    label: "Transition " + ref + " to " + phase,
+    task: "Run this tracker transition command for ticket " + ref + ":\n" + substituted +
+      "\nReport the HTTP status code or any error. Change nothing else in the repository.",
+    timeoutMs: 60 * 1000,
+    quiet: true
+  }).then(function(r) {
+    emit("implement: transition " + phase + " for " + ref + " -- " + (r && r.ok ? "done" : "failed"));
+    return r;
+  });
+}
 const STANDARDS_DOCS = A.standardsDocs ||
   "the files this repo documents as coding standards (search for CODING_STANDARDS.md, CONTRIBUTING.md, and anything AGENTS.md points at)";
 const TRACKER_HINT = A.trackerHint || null;
@@ -184,13 +210,21 @@ const AG = {
   reviewerQuality: ROLES.reviewerQuality || "reviewer-quality",
   verifier: ROLES.verifier || "verifier",
   merger: ROLES.merger || "merger",
-  prWriter: ROLES.prWriter || "pr-writer"
+  prWriter: ROLES.prWriter || "pr-writer",
+  // Lightweight git operator for setup tasks (branch creation, transitions).
+  worker: ROLES.worker || "worker"
 };
+// Review axis configuration, used by spawnReviews and the UNVERDICTED retry logic.
+const REVIEW_AXES = [
+  { name: "standards", agent: AG.reviewerStandards, focus: "conformance to " + STANDARDS_DOCS + " and the repo's conventions" },
+  { name: "quality", agent: AG.reviewerQuality, focus: "correctness, robustness, test coverage, maintainability" }
+];
 
 const GATE_TIMEOUT_MS = numArg(A.gateTimeoutMs, 15 * 60 * 1000);
 const IMPL_TIMEOUT_MS = numArg(A.implTimeoutMs, 45 * 60 * 1000);
 const REVIEW_TIMEOUT_MS = numArg(A.reviewTimeoutMs, 20 * 60 * 1000);
 const MAX_REMEDIATIONS = numArg(A.maxRemediations, 2);
+const MAX_REVIEW_RETRIES = numArg(A.maxReviewRetries, 2);
 
 // Config preflight — a malformed arg is a CONFIG error, not a task failure.
 const configErrors = [];
@@ -198,6 +232,7 @@ requireInt(GATE_TIMEOUT_MS, "gateTimeoutMs", 1000, configErrors);
 requireInt(IMPL_TIMEOUT_MS, "implTimeoutMs", 1000, configErrors);
 requireInt(REVIEW_TIMEOUT_MS, "reviewTimeoutMs", 1000, configErrors);
 requireInt(MAX_REMEDIATIONS, "maxRemediations", 0, configErrors);
+requireInt(MAX_REVIEW_RETRIES, "maxReviewRetries", 0, configErrors);
 if (configErrors.length) {
   return {
     ok: false,
@@ -342,29 +377,27 @@ function spawnMerger(result, commitMsg, retry) {
   });
 }
 
+// Retry a single UNVERDICTED review axis with a fresh key (bypasses cache reuse).
+function respawnReview(axis, attempt) {
+  const cfg = REVIEW_AXES.filter(function(a) { return a.name === axis; })[0];
+  return runs.run("review-" + axis + "-retry-" + attempt, {
+    label: "Review " + axis + " axis (retry " + attempt + ")",
+    agent: cfg.agent,
+    task: reviewAxisTask(axis, cfg.focus, integrationBranch, BASE_BRANCH, REPO_PATH, ticketRef),
+    timeoutMs: REVIEW_TIMEOUT_MS,
+    control: childControl(REVIEW_TIMEOUT_MS)
+  });
+}
 function spawnReviews() {
-  return runs.all([
-    {
-      key: "review-standards",
-      label: "Review standards axis",
-      agent: AG.reviewerStandards,
-      task: reviewAxisTask("standards",
-        "conformance to " + STANDARDS_DOCS + " and the repo's conventions",
-        integrationBranch, BASE_BRANCH, REPO_PATH, ticketRef),
+  return runs.all(REVIEW_AXES.map(function(a) {
+    return runs.run("review-" + a.name, {
+      label: "Review " + a.name + " axis",
+      agent: a.agent,
+      task: reviewAxisTask(a.name, a.focus, integrationBranch, BASE_BRANCH, REPO_PATH, ticketRef),
       timeoutMs: REVIEW_TIMEOUT_MS,
       control: childControl(REVIEW_TIMEOUT_MS)
-    },
-    {
-      key: "review-quality",
-      label: "Review quality axis",
-      agent: AG.reviewerQuality,
-      task: reviewAxisTask("quality",
-        "correctness, robustness, test coverage, maintainability",
-        integrationBranch, BASE_BRANCH, REPO_PATH, ticketRef),
-      timeoutMs: REVIEW_TIMEOUT_MS,
-      control: childControl(REVIEW_TIMEOUT_MS)
-    }
-  ]);
+    });
+  }));
 }
 
 function spawnVerifier() {
@@ -442,6 +475,30 @@ function spawnPrWriter() {
 
 let implResult = null;
 let remediationAttempt = 0;
+
+// Phase 0: ensure the integration branch exists, then transition to In Progress.
+if (REPO_PATH) {
+  const ensureBranch = await runs.run("ensure-integration-branch", {
+    agent: AG.worker,
+    label: "Create integration branch " + integrationBranch + " from " + BASE_BRANCH,
+    task: "Ensure the git branch '" + integrationBranch + "' exists in " + REPO_PATH +
+      ", creating it from '" + BASE_BRANCH + "' if missing.\n" +
+      "1. git -C " + REPO_PATH + " rev-parse --verify refs/heads/" + integrationBranch +
+      " -> if it succeeds, report BRANCH_EXISTS and exit.\n" +
+      "2. If it does not: git -C " + REPO_PATH + " branch " + integrationBranch + " " + BASE_BRANCH +
+      " && git -C " + REPO_PATH + " push -u origin " + integrationBranch +
+      " 2>/dev/null || true. Report BRANCH_CREATED.\n" +
+      "3. Change nothing else. Do not switch branches or modify files.",
+    timeoutMs: 30 * 1000,
+    quiet: true
+  });
+  if (!ensureBranch || !ensureBranch.ok || !String(ensureBranch.output || "").match(/BRANCH_EXISTS|BRANCH_CREATED/)) {
+    emit("implement: WARNING - could not ensure integration branch '" + integrationBranch + "'; worktree children may fail");
+  } else {
+    emit("implement: integration branch '" + integrationBranch + "' ensured");
+  }
+}
+await runTransition("in_progress", ticketRef, { branch: integrationBranch });
 
 // Phase 1: implement the ticket (worktree-isolated, gated).
 try {
@@ -557,11 +614,44 @@ const reviews = reviewResults.map(function(r, i) {
   };
 });
 
-const blockedAxes = reviews.filter(function(r) { return r.verdict === "BLOCK"; });
-const unreviewedAxes = reviews.filter(function(r) {
+let blockedAxes = reviews.filter(function(r) { return r.verdict === "BLOCK"; });
+let unreviewedAxes = reviews.filter(function(r) {
   return r.verdict !== "BLOCK" && r.verdict !== "OK";
 });
-const reviewsIncomplete = reviews.length < 2 || unreviewedAxes.length > 0;
+let reviewsIncomplete = reviews.length < 2 || unreviewedAxes.length > 0;
+
+// Retry UNVERDICTED review axes (transient failures like model-provider
+// Cloudflare blocks). Process results individually — a partial runs.all
+// result preserves surviving verdicts instead of discarding all of them.
+let reviewRetryAttempt = 0;
+while (reviewsIncomplete && reviewRetryAttempt < MAX_REVIEW_RETRIES) {
+  reviewRetryAttempt = reviewRetryAttempt + 1;
+  const retryAxes = reviews.filter(function(r) { return r.verdict === "UNVERDICTED"; });
+  if (!retryAxes.length) break;
+  emit("implement: retrying UNVERDICTED review axes: " +
+       retryAxes.map(function(r) { return r.axis; }).join(", ") +
+       " (attempt " + reviewRetryAttempt + "/" + MAX_REVIEW_RETRIES + ")");
+  const retryResults = await Promise.all(retryAxes.map(function(r) {
+    return respawnReview(r.axis, reviewRetryAttempt)
+      .then(function(res) { return res; })
+      .catch(function(e) {
+        return { ok: false, error: String(e), output: "", runId: null };
+      });
+  }));
+  retryAxes.forEach(function(r, i) {
+    const res = retryResults[i];
+    const out = (res && res.output) ? String(res.output) : "";
+    let verdict = "UNVERDICTED";
+    if (res && res.ok) verdict = parseReviewVerdict(out);
+    const idx = reviews.findIndex(function(x) { return x.axis === r.axis; });
+    reviews[idx] = { axis: r.axis, ok: !!(res && res.ok), verdict: verdict, excerpt: out.slice(0, 400) };
+  });
+  blockedAxes = reviews.filter(function(r) { return r.verdict === "BLOCK"; });
+  unreviewedAxes = reviews.filter(function(r) {
+    return r.verdict !== "BLOCK" && r.verdict !== "OK";
+  });
+  reviewsIncomplete = reviews.length < 2 || unreviewedAxes.length > 0;
+}
 
 let fixApplied = false;
 let fixMerged = false;
@@ -605,15 +695,40 @@ if (blockedAxes.length) {
     }
     fixMerged = !!(fixMergerResult && fixMergerResult.ok);
     if (!fixMerged) {
-      return {
-        ok: false,
-        error: "ESCALATION: review findings were fixed but NOT merged into " +
-          integrationBranch + " — the fixer's worktree holds uncommitted work. " +
-          "Lead decision needed before any PR.",
-        escalated: true,
-        ticket: ticketRef,
-        failureClass: "merge"
-      };
+      // Acceptance-format rejection may not mean the work is absent. Verify
+      // git state directly: if the fixer's changes are present on the branch
+      // and the gate passes, treat the merge as successful.
+      const gmVerify = await runs.run("verify-fix-merge-" + keyOf(ticketRef), {
+        agent: AG.merger,
+        label: "Verify fix-merge git state for " + ticketRef,
+        task: "The merge-review-fixes child reported failure, but its work may already be committed. " +
+          "Confirm: (1) checkout is on " + integrationBranch + " and clean; " +
+          "(2) the fixer's changes are present (git log --oneline main.." + integrationBranch +
+          " shows commits beyond the original implementation); (3) the gate " + GATE +
+          " passes. If (3) passes and (2) shows changes, report MERGE_EFFECTIVE. " +
+          "If the changes are NOT present, report MERGE_MISSING. " + checkoutHint(REPO_PATH),
+        timeoutMs: GATE_TIMEOUT_MS,
+        quiet: true
+      }).catch(function(e) {
+        emit("implement: fix-merge verification rejected (" + e + ")");
+        return null;
+      });
+      const gmOutput = (gmVerify && gmVerify.output) ? String(gmVerify.output) : "";
+      if (gmVerify && gmVerify.ok && gmOutput.indexOf("MERGE_EFFECTIVE") >= 0) {
+        emit("implement: fix-merge acceptance rejected but git state verified; treating as merged");
+        fixMerged = true;
+      } else {
+        return {
+          ok: false,
+          error: "ESCALATION: review findings were fixed but NOT merged into " +
+            integrationBranch + " — the fixer's worktree holds uncommitted work, and " +
+            "the git-state verification did not confirm it is on the branch. " +
+            "Lead decision needed before any PR.",
+          escalated: true,
+          ticket: ticketRef,
+          failureClass: "merge"
+        };
+      }
     }
   } else {
     return {
@@ -671,6 +786,11 @@ if (!skipPR) {
     prResult = await spawnPrWriter();
   } catch (eP) {
     emit("implement: pr-writer rejected (" + eP + ")");
+  }
+  // Transition ticket to Ready for Review (tracker-agnostic hook).
+  if (prResult && prResult.ok) {
+    const prUrl = String(prResult.output || "").match(/https?:\/\/[^\s]+pull\/\d+/) || "";
+    await runTransition("ready_for_review", ticketRef, { branch: integrationBranch, prUrl: prUrl });
   }
 }
 

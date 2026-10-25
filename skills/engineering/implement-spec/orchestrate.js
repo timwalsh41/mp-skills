@@ -180,6 +180,32 @@ const STANDARDS_DOCS = A.standardsDocs ||
 const RETEST_COMMAND = A.singleRetestCommand || null;
 const TRACKER_HINT = A.trackerHint || null;
 const REPO_PATH = A.repoPath || null;
+// Optional tracker-agnostic transition command templates. Each value is a shell
+// command string with $TICKET_REF, $BRANCH, and $PR_URL variables substituted.
+// When omitted, no status transitions are performed (the ticket is still
+// resolved by description per docs/agents/issue-tracker.md).
+const TRANSITION_COMMANDS = A.transitionCommands || null;
+function runTransition(phase, ref, variables) {
+  if (!TRANSITION_COMMANDS || !TRANSITION_COMMANDS[phase]) {
+    emit("implement-spec: no transition command for '" + phase + "'; skipping");
+    return Promise.resolve(null);
+  }
+  const substituted = TRANSITION_COMMANDS[phase]
+    .replace(/\$TICKET_REF/g, String(ref))
+    .replace(/\$BRANCH/g, String(variables.branch || ""))
+    .replace(/\$PR_URL/g, String(variables.prUrl || ""));
+  return runs.run("transition-" + phase + "-" + keyOf(ref), {
+    agent: AG.worker,
+    label: "Transition " + ref + " to " + phase,
+    task: "Run this tracker transition command for ticket " + ref + ":\n" + substituted +
+      "\nReport the HTTP status code or any error. Change nothing else in the repository.",
+    timeoutMs: 60 * 1000,
+    quiet: true
+  }).then(function(r) {
+    emit("implement-spec: transition " + phase + " for " + ref + " -- " + (r && r.ok ? "done" : "failed"));
+    return r;
+  });
+}
 
 // Default Markdown-body conventions for the completion instructions handed to
 // children. The tracker doc (docs/agents/issue-tracker.md) is the authority;
@@ -201,8 +227,16 @@ const AG = {
   reviewerStandards: ROLES.reviewerStandards || "reviewer-standards",
   reviewerSpec: ROLES.reviewerSpec || "reviewer-spec",
   reviewerQuality: ROLES.reviewerQuality || "reviewer-quality",
-  verifier: ROLES.verifier || "verifier"
+  verifier: ROLES.verifier || "verifier",
+  // Lightweight git operator for setup tasks (branch creation, transitions).
+  worker: ROLES.worker || "worker"
 };
+// Review axis configuration, used by spawnReviews and the UNVERDICTED retry logic.
+const REVIEW_AXES = [
+  { name: "standards", agent: AG.reviewerStandards, focus: "conformance to " + STANDARDS_DOCS + ", plus the repo's conventions" },
+  { name: "spec", agent: AG.reviewerSpec, focus: "does the integrated work satisfy the spec and ticket acceptance criteria" },
+  { name: "quality", agent: AG.reviewerQuality, focus: "correctness, robustness, test coverage, maintainability" }
+];
 
 const IMPL_TIMEOUT_MS = numArg(A.implTimeoutMs, 45 * 60 * 1000);
 const MERGE_TIMEOUT_MS = numArg(A.mergeTimeoutMs, 20 * 60 * 1000);
@@ -211,6 +245,7 @@ const MERGE_TIMEOUT_MS = numArg(A.mergeTimeoutMs, 20 * 60 * 1000);
 // children get the launch object, never a bare command string.
 const GATE_TIMEOUT_MS = numArg(A.gateTimeoutMs, 15 * 60 * 1000);
 const MAX_REMEDIATIONS = numArg(A.maxRemediations, 2);
+const MAX_REVIEW_RETRIES = numArg(A.maxReviewRetries, 2);
 
 // Gate commands are args-only
 const NARROW_GATE = A.narrowGate || FULL_GATE;
@@ -298,6 +333,7 @@ requireInt(GATE_TIMEOUT_MS, "gateTimeoutMs", 1000);
 requireInt(IMPL_TIMEOUT_MS, "implTimeoutMs", 1000);
 requireInt(MERGE_TIMEOUT_MS, "mergeTimeoutMs", 1000);
 requireInt(MAX_REMEDIATIONS, "maxRemediations", 0);
+requireInt(MAX_REVIEW_RETRIES, "maxReviewRetries", 0);
 if (fullGateTickets !== null && fullGateTickets !== undefined) {
   if (!Array.isArray(fullGateTickets)) {
     configErrors.push("fullGateTickets must be an array of ticket refs");
@@ -351,7 +387,7 @@ emit("implement-spec: spec=" + specRef + " tickets=" + ticketsRef +
 // gate command's own stdout must be the JSON document, and discovery has no
 // natural command to emit it; instead the script parses the child's returned
 // output text (statusesFromGraph) and fails loudly if it cannot.
-function readTicketGraph() {
+function readTicketGraph(fresh) {
   const task = [
     "Enumerate this run's tickets from the configured issue tracker.",
     "The tracker target for this run: " + ticketsRef,
@@ -389,7 +425,7 @@ function readTicketGraph() {
     '{"tickets":[{"ref":"07","title":"...","resolved":false,"blockedBy":[],"onBranch":false}],',
     ' "preflight":{"trackerConfigured":true,"integrationBranchExists":true,"integrationBranch":"' + integrationBranch + '"}}'
   ].join("\n");
-  return runs.run("ticket-graph", {
+  return runs.run(fresh ? "ticket-graph-forced" : "ticket-graph", {
     label: "Read ticket graph from " + ticketsRef,
     agent: AG.scout,
     task: task,
@@ -779,60 +815,56 @@ function parseVerification(output) {
   return "UNVERDICTED";
 }
 
+// Review axis task template — extracted so the retry logic can re-launch
+// individual failed axes with a fresh key (bypassing runs.run cache reuse).
+function reviewAxisTask(axis, focus) {
+  const task = [
+    "You are the " + axis + " reviewer for the implement-spec workflow.",
+    "Review the work integrated on branch " + integrationBranch + " (git log/diff",
+    "against " + BASE_BRANCH + " as needed). Focus: " + focus,
+    "Spec: " + specRef + "  Tickets: " + ticketsRef,
+    ""
+  ];
+  task.push.apply(task, checkoutHint());
+  task.push(
+    "",
+    "Review ONLY that target. First confirm it exists: if the branch named",
+    "above does not resolve, or the spec or ticket reference does not",
+    "resolve (a path that is not there, a ticket the tracker does not have),",
+    "do NOT pick a nearby branch, another feature's tickets, or the current",
+    "checkout and review that instead — a confident report about the wrong",
+    "work is worse than no report. In that case answer with one line:",
+    "'Review verdict: MISSING_TARGET' plus what was absent, and stop.",
+    "",
+    "Report concrete findings with file:line references. Otherwise end with",
+    "exactly one line: 'Review verdict: BLOCK' if there are must-fix defects,",
+    "or 'Review verdict: OK' if there are none. No other final line is a",
+    "verdict; the orchestrator treats a missing one as an unfinished review."
+  );
+  return task.join("\n");
+}
 // Three-axis review over the integrated branch, run in parallel.
 function spawnReviews(wave) {
-  const axisTask = function(axis, focus) {
-    const task = [
-      "You are the " + axis + " reviewer for the implement-spec workflow.",
-      "Review the work integrated on branch " + integrationBranch + " (git log/diff",
-      "against " + BASE_BRANCH + " as needed). Focus: " + focus,
-      "Spec: " + specRef + "  Tickets: " + ticketsRef,
-      ""
-    ];
-    task.push.apply(task, checkoutHint());
-    task.push(
-      "",
-      "Review ONLY that target. First confirm it exists: if the branch named",
-      "above does not resolve, or the spec or ticket reference does not",
-      "resolve (a path that is not there, a ticket the tracker does not have),",
-      "do NOT pick a nearby branch, another feature's tickets, or the current",
-      "checkout and review that instead — a confident report about the wrong",
-      "work is worse than no report. In that case answer with one line:",
-      "'Review verdict: MISSING_TARGET' plus what was absent, and stop.",
-      "",
-      "Report concrete findings with file:line references. Otherwise end with",
-      "exactly one line: 'Review verdict: BLOCK' if there are must-fix defects,",
-      "or 'Review verdict: OK' if there are none. No other final line is a",
-      "verdict; the orchestrator treats a missing one as an unfinished review."
-    );
-    return task.join("\n");
-  };
-  return runs.all([
-    {
-      key: "review-standards-" + wave,
-      label: "Review standards axis",
-      agent: AG.reviewerStandards,
-      task: axisTask("standards", "conformance to " + STANDARDS_DOCS + ", plus the repo's conventions"),
+  return runs.all(REVIEW_AXES.map(function(a) {
+    return runs.run("review-" + a.name + "-" + wave, {
+      label: "Review " + a.name + " axis",
+      agent: a.agent,
+      task: reviewAxisTask(a.name, a.focus),
       timeoutMs: MERGE_TIMEOUT_MS,
       control: childControl()
-    },
-    {
-      key: "review-spec-" + wave,
-      label: "Review spec axis",
-      agent: AG.reviewerSpec,
-      task: axisTask("spec", "does the integrated work satisfy the spec and ticket acceptance criteria"),
-      timeoutMs: MERGE_TIMEOUT_MS,
-      control: childControl()
-    },
-    {
-      key: "review-quality-" + wave,
-      label: "Review quality axis",
-      agent: AG.reviewerQuality,
-      task: axisTask("quality", "correctness, robustness, test coverage, maintainability"),
-      timeoutMs: MERGE_TIMEOUT_MS,
-      control: childControl()
-    }
-  ]);
+    });
+  }));
+}
+// Retry a single UNVERDICTED review axis with a fresh key (avoids cache reuse).
+function respawnReview(axis, attempt) {
+  const cfg = REVIEW_AXES.filter(function(a) { return a.name === axis; })[0];
+  return runs.run("review-" + axis + "-retry-" + attempt, {
+    label: "Review " + axis + " axis (retry " + attempt + ")",
+    agent: cfg.agent,
+    task: reviewAxisTask(axis, cfg.focus),
+    timeoutMs: MERGE_TIMEOUT_MS,
+    control: childControl()
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -933,7 +965,7 @@ function getTicketGraph(forceDiscovery) {
     emit("ticket graph: reused cached discovery (ticketsRef unchanged since last read)");
     return Promise.resolve(ticketGraphCache);
   }
-  return readTicketGraph().then(function(result) {
+  return readTicketGraph(forceDiscovery).then(function(result) {
     scoutLints(result);
     ticketGraphCache = result;
     return result;
@@ -992,14 +1024,36 @@ if (preflight && preflight.trackerConfigured === false) {
   };
 }
 if (preflight && preflight.integrationBranchExists === false) {
-  return {
-    ok: false,
-    error: "integration branch '" + integrationBranch + "' does not resolve (" + baseRef + "). " +
-      "Branch it from " + BASE_BRANCH + " first, or pass the name this repo actually uses " +
-      "(docs/agents/verification.md records the convention).",
-    preflight: preflight,
-    discoveredTickets: tickets.length
-  };
+  // The branch doesn't exist yet. Create it from BASE_BRANCH before any
+  // worktree child launches — they all branch from baseRef and would fail
+  // without it. The script can't invoke git directly, so we spawn a lightweight
+  // child in the main checkout.
+  emit("implement-spec: integration branch '" + integrationBranch + "' does not resolve; creating from " + BASE_BRANCH);
+  const ensureRun = await runs.run("ensure-integration-branch", {
+    agent: AG.worker,
+    label: "Create integration branch " + integrationBranch + " from " + BASE_BRANCH,
+    task: "Ensure the git branch '" + integrationBranch + "' exists in " + REPO_PATH +
+      ", creating it from '" + BASE_BRANCH + "' if it does not.\n" +
+      "1. git -C " + REPO_PATH + " rev-parse --verify refs/heads/" + integrationBranch +
+      " -> if it succeeds, report BRANCH_EXISTS and exit.\n" +
+      "2. If it fails: git -C " + REPO_PATH + " branch " + integrationBranch + " " + BASE_BRANCH +
+      " && git -C " + REPO_PATH + " push -u origin " + integrationBranch + ". Report BRANCH_CREATED.\n" +
+      "3. Change nothing else. Do not switch branches or modify files.",
+    timeoutMs: 30 * 1000,
+    quiet: true
+  });
+  if (!ensureRun || !ensureRun.ok || !ensureRun.output ||
+      ensureRun.output.indexOf("BRANCH_CREATED") < 0 && ensureRun.output.indexOf("BRANCH_EXISTS") < 0) {
+    return {
+      ok: false,
+      error: "implement-spec: could not create integration branch '" + integrationBranch + "' from " +
+        BASE_BRANCH + ". " + (ensureRun && ensureRun.error ? String(ensureRun.error).slice(0, 200) : ""),
+      preflight: preflight,
+      discoveredTickets: tickets.length
+    };
+  }
+  emit("implement-spec: integration branch '" + integrationBranch + "' ensured (" +
+       String((ensureRun.output || "").match(/BRANCH_EXISTS|BRANCH_CREATED/) || ["UNKNOWN"])[0] + ")");
 }
 if (!preflight) {
   emit("implement-spec: discovery reported no preflight; cannot confirm " + baseRef +
@@ -1108,6 +1162,10 @@ if (verifyOnly) {
     const batch = frontier.slice(0, maxParallel);
     emit("wave " + wave + ": implementing tickets " +
          batch.map(function(t) { return t.ref; }).join(", "));
+    // Transition frontier tickets to In Progress (tracker-agnostic hook).
+    for (const t of batch) {
+      await runTransition("in_progress", t.ref, { branch: integrationBranch });
+    }
 
     // Fan out implementers. If runs.all rejects (any single child failure),
     // fall back to SERIAL spawns so one failure cannot lose its siblings'
@@ -1471,12 +1529,50 @@ if (merged.length) {
       excerpt: out.slice(0, 400)
     };
   });
-  const blockedAxes = reviews.filter(function(r) { return r.verdict === "BLOCK"; });
+  let blockedAxes = reviews.filter(function(r) { return r.verdict === "BLOCK"; });
   // Incomplete review = fewer than three axes came back, or any axis returned
   // without a verdict, or refused because its target was missing. That is not a
   // green light; it is an unknown.
-  const unreviewedAxes = reviews.filter(function(r) { return r.verdict !== "BLOCK" && r.verdict !== "OK"; });
+  let unreviewedAxes = reviews.filter(function(r) { return r.verdict !== "BLOCK" && r.verdict !== "OK"; });
   reviewsIncomplete = reviews.length < 3 || unreviewedAxes.length > 0;
+
+  // Retry UNVERDICTED review axes (transient failures like model-provider
+  // Cloudflare blocks). Process results individually — a partial runs.all
+  // result preserves surviving verdicts instead of discarding all of them.
+  let reviewRetryAttempt = 0;
+  while (reviewsIncomplete && reviewRetryAttempt < MAX_REVIEW_RETRIES) {
+    reviewRetryAttempt = reviewRetryAttempt + 1;
+    const retryAxes = reviews.filter(function(r) { return r.verdict === "UNVERDICTED"; });
+    if (!retryAxes.length) break;
+    emit("implement-spec: retrying UNVERDICTED review axes: " +
+         retryAxes.map(function(r) { return r.axis; }).join(", ") +
+         " (attempt " + reviewRetryAttempt + "/" + MAX_REVIEW_RETRIES + ")");
+    const retryResults = await Promise.all(retryAxes.map(function(r) {
+      return respawnReview(r.axis, reviewRetryAttempt)
+        .then(function(res) { return res; })
+        .catch(function(e) {
+          return { ok: false, error: String(e), output: "", runId: null };
+        });
+    }));
+    retryAxes.forEach(function(r, i) {
+      const res = retryResults[i];
+      const out = (res && res.output) ? String(res.output) : "";
+      let verdict = "UNVERDICTED";
+      if (res && res.ok) {
+        if (out.indexOf("Review verdict: BLOCK") >= 0) verdict = "BLOCK";
+        else if (out.indexOf("Review verdict: OK") >= 0) verdict = "OK";
+        else if (out.indexOf("Review verdict: MISSING_TARGET") >= 0) verdict = "MISSING_TARGET";
+      }
+      const idx = reviews.findIndex(function(x) { return x.axis === r.axis; });
+      reviews[idx] = { axis: r.axis, ok: !!(res && res.ok), verdict: verdict, excerpt: out.slice(0, 400) };
+    });
+    blockedAxes = reviews.filter(function(r) { return r.verdict === "BLOCK"; });
+    unreviewedAxes = reviews.filter(function(r) {
+      return r.verdict !== "BLOCK" && r.verdict !== "OK";
+    });
+    reviewsIncomplete = reviews.length < 3 || unreviewedAxes.length > 0;
+  }
+
   if (reviewsIncomplete) {
     const detail = unreviewedAxes.map(function(r) { return r.axis + ":" + r.verdict; });
     emit("ESCALATION: review is INCOMPLETE" +
@@ -1546,9 +1642,36 @@ if (merged.length) {
         emit("implement-spec: merge-review-fixes rejected (" + eM + ")");
       }
       if (!fixMergerRun || !fixMergerRun.ok) {
-        emit("ESCALATION: review fixes were produced but NOT merged into " +
-             integrationBranch + " — the fixer's worktree holds uncommitted work. " +
-             "Lead decision needed before any PR.");
+        // Acceptance-format rejection does not mean the work is absent.
+        // The fixer's changes may already be on the branch. Verify git state
+        // directly: if the expected changes are present and the gate passes,
+        // treat the merge as successful rather than escalating.
+        const gmVerify = await runs.run("verify-fix-merge-" + keyOf(ticket.ref), {
+          agent: AG.merger,
+          label: "Verify fix-merge git state for " + ticket.ref,
+          task: "The merge-review-fixes child reported failure, but its work may already be committed. " +
+            "Confirm: (1) checkout is on " + integrationBranch + " and clean; " +
+            "(2) the fixer's changes are present (git log --oneline main.." + integrationBranch +
+            " shows commits beyond the original implementation); (3) the gate " + FULL_GATE +
+            " passes. If (3) passes and (2) shows changes, report MERGE_EFFECTIVE. " +
+            "If the changes are NOT present, report MERGE_MISSING. " + checkoutHint(),
+          timeoutMs: MERGE_TIMEOUT_MS,
+          gate: gateObj(FULL_GATE),
+          control: childControl()
+        }).catch(function(e) {
+          emit("implement-spec: fix-merge verification rejected (" + e + ")");
+          return null;
+        });
+        const gmOutput = (gmVerify && gmVerify.output) ? String(gmVerify.output) : "";
+        if (gmVerify && gmVerify.ok && gmOutput.indexOf("MERGE_EFFECTIVE") >= 0) {
+          emit("implement-spec: fix-merge acceptance rejected but git state verified; treating as merged");
+          fixMergerRun = { ok: true, output: gmOutput };
+        } else {
+          emit("ESCALATION: review fixes were produced but NOT merged into " +
+               integrationBranch + " — the fixer's worktree may hold uncommitted work, and " +
+               "the git-state verification did not confirm it is on the branch. " +
+               "Lead decision needed before any PR.");
+        }
       }
     } else {
       emit("ESCALATION: review fix pass failed or was rejected — lead decision needed before any PR.");
@@ -1591,6 +1714,14 @@ if (merged.length) {
       });
     } catch (eP) {
       emit("implement-spec: pr run rejected (" + eP + ")");
+    }
+    // Transition tickets to Ready for Review (tracker-agnostic hook).
+    if (prRun && prRun.ok) {
+      const prUrlMatch = String(prRun.output || "").match(/https?:\/\/[^\s]+pull\/\d+/);
+      const prUrl = prUrlMatch ? prUrlMatch[0] : "";
+      for (const ref of merged) {
+        await runTransition("ready_for_review", ref, { branch: integrationBranch, prUrl: prUrl });
+      }
     }
   } else if (!skipPR) {
     emit("implement-spec: PR suppressed — " +

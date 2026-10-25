@@ -30,12 +30,14 @@ subagent({
     narrowGate: "<the repo's fast subset>",
     baseBranch: "<the repo's base branch>",
     maxParallel: 4,
-    maxWaves: 6
+    maxWaves: 6,
+    maxReviewRetries: 2,
+    transitionCommands: { in_progress: "...", ready_for_review: "...", complete: "..." }
   }
 })
 ```
 
-The script lives next to this `SKILL.md` — launch it from wherever it is actually installed (`~/.pi/agent/skills/implement-spec/orchestrate.js` when the skills are installed for the agent, a repo-local `.agents/skills/implement-spec/orchestrate.js` copy when the repo vendors it).
+The script lives next to this `SKILL.md` — launch it from wherever it is actually installed
 
 `specRef`, `ticketsRef`, `integrationBranch` and `fullGate` are **required**: the script returns a structured error naming the missing arg instead of launching children. `narrowGate` defaults to `fullGate`.
 
@@ -60,7 +62,9 @@ Adjust with `args` when the defaults don't match this run:
 - `singleRetestCommand` — how this repo runs ONE narrow slice of tests. It is handed
   to the verifier child (as its targeted-test command) and to the flake
   quarantine recheck. Include the placeholder form from the verification doc.
-- `flakePattern` — extra regex vocabulary this repo's failures use to mean "transient" (timing helpers, settle assertions, a specific harness's wording).
+- `maxReviewRetries` (default 2) — how many times to retry a review axis that returned no verdict (UNVERDICTED), e.g. due to a transient model-provider block like Cloudflare. Surviving verdicts from a partial `runs.all` fan-out are preserved; only the failed axes are retried.
+- `transitionCommands` (optional) — a map of shell command templates keyed by lifecycle phase: `{ in_progress, ready_for_review, complete }`. Each template may reference `$TICKET_REF`, `$BRANCH`, and `$PR_URL`, which are substituted before execution via a lightweight `worker` child. Omit to skip tracker status transitions (the ticket is still resolved by editing its description, per the tracker convention). This keeps the workflow tracker-agnostic — Jira, GitHub Issues, and Jackrabbit each supply their own commands.
+- `flakePattern — extra regex vocabulary this repo's failures use to mean "transient" (timing helpers, settle assertions, a specific harness's wording).
 - `implTimeoutMs` (default 45 min), `mergeTimeoutMs` (default 20 min), `maxRemediations` (default 2).
 - `skipPR: true` — stop before the PR child.
 
@@ -76,9 +80,12 @@ Do **not** run a verification pass yourself: after each ticket's work is merged,
 - **Independent verification of each ticket**: after a ticket's work is merged and the gate is green on the integration branch, a `verifier` child re-derives that ticket's acceptance criteria from the merged code. A missing verdict is not a pass: the ticket is escalated and the run does not open a request.
 - **The tracker is the source of truth**: ticket state is re-read from the tracker every wave (the discovery cache is dropped whenever a wave merges, because a child may have resolved a ticket); subagents read and update tickets through `docs/agents/issue-tracker.md`. The script never trusts a child's self-report of resolution, and a ticket is only marked merged after its merger run verifies green on the integration branch. "Resolved in the tracker" is not enough on its own: an implementer resolves the ticket *before* its patch is merged, so a ticket the tracker calls done whose work is not on the integration branch is implemented again rather than absorbed.
 - **Sparse context**: children get ticket references, not inlined spec text.
-- **The target is the target**: the scout is told to report only the target's tickets, and discovery reports whether `refs/heads/<integrationBranch>` resolves before wave 1. A nonexistent target or branch ends the run with a structured error — it never falls back to "some nearby tickets/branch", which is how a placeholder in `args` can otherwise produce a confident review of unrelated work. If you want that check on a run whose scout reports no preflight, the script warns and continues; the merger still refuses a missing branch. A child in the *wrong directory* is not a missing target: the children that work in the main checkout are given `repoPath` and told to confirm it (`git rev-parse --show-toplevel`) before they report anything missing.
+- **The target is the target**: the scout is told to report only the target's tickets, and discovery reports whether `refs/heads/<integrationBranch>` resolves before wave 1. The workflow **auto-creates** the integration branch from `baseBranch` if it does not yet exist (via a lightweight `worker` child in the main checkout), so the lead does not need to pre-create it. A nonexistent *target* still ends the run with a structured error — it never falls back to "some nearby tickets/branch", which is how a placeholder in `args` can otherwise produce a confident review of unrelated work. A child in the *wrong directory* is not a missing target: the children that work in the main checkout are given `repoPath` and told to confirm it (`git rev-parse --show-toplevel`) before they report anything missing.
 - **A review without a verdict is incomplete, not a pass**: each axis must end with `Review verdict: BLOCK` or `Review verdict: OK`. A missing line — or an axis that failed to run — suppresses the PR and escalates to you, because an unknown review state is not evidence of a clean one.
 - **An escalated ticket means the run is not complete**, so no request is opened over it.
+- **UNVERDICTED reviews are retried** — a review axis that completes without a verdict (e.g. from a transient model-provider block like Cloudflare) is retried up to `maxReviewRetries` times; surviving verdicts from a partial `runs.all` fan-out are preserved rather than discarded.
+- **Fix-merger acceptance fallback** — if the fix-merge child's acceptance is rejected but its git state is verified (changes present on the integration branch + gate green), the merge is treated as successful rather than escalating.
+- **Tracker-agnostic transitions** — `transitionCommands` opts into lifecycle status transitions (`in_progress` before implementation, `ready_for_review` after PR creation); omit to rely on description-based resolution only.
 
 ## The remediation ladder (what happens when a child fails)
 
