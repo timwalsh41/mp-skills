@@ -24,7 +24,7 @@ const opts = {
   agent: args.agent || "implementer",
   task: args.task,
   worktree: true,
-  timeoutMs: args.timeoutMs || 45 * 60 * 1000,
+  timeoutMs: args.timeoutMs || 75 * 60 * 1000,
   gate: { command: gate, timeoutMs: args.gateTimeoutMs || 15 * 60 * 1000 }
 };
 if (args.baseRef) opts.baseRef = args.baseRef;

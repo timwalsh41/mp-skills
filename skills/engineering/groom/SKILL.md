@@ -1,7 +1,7 @@
 ---
 name: groom
 description: Groom a raw ticket into a ready-for-work state by grilling to fill the groomed fields, then applying them and moving it to Groomed.
-disable-model-invocation: true
+disable-model-invocation: false
 ---
 
 # Groom
@@ -12,7 +12,7 @@ Bring a single raw ticket to a workable state, in place. Where `/to-tickets` tur
 
 ## Preconditions
 
-The issue tracker must be configured. The repo's tracker conventions live in `docs/agents/issue-tracker.md`; read it (a sub-agent should, too). If it is missing, tell the user to run `/setup-matt-pocock-skills`.
+The issue tracker must be configured. The repo's tracker conventions live in `docs/agents/issue-tracker.md`. If it is missing, tell the user to run `/setup-matt-pocock-skills`.
 
 Read its **When a skill says "groom a ticket"** section to learn, for this repo's tracker: the groomed fields to fill, the status that marks a ticket groomed, and any labels a groomed ticket should receive. If that section is absent, report the gap and stop. The field names, the groomed status, and the "this ticket is ready for an agent" marker all vary by tracker, so they come from the doc, not from this skill.
 
@@ -32,7 +32,7 @@ Call the Skill tool with "grilling". Scope the interview to this one ticket and 
 
 ### 4. Apply the grooming
 
-Write the groomed fields and move the ticket to the groomed status, exactly as `docs/agents/issue-tracker.md` prescribes for this tracker. On Jackrabbit that is `approach`/`files_to_change`/`test_plan`/`validation_steps` plus the `Open → Groomed` transition; on GitHub, GitLab, or local markdown that is the four body sections plus the `ready-for-agent` marker.
+Write the groomed fields and move the ticket to the groomed status, exactly as `docs/agents/issue-tracker.md` prescribes for this tracker.
 
 Grooming changes **status and groomed fields only**. It does **not** close the ticket, and it does **not** touch triage labels (that is `/triage`'s job), unless the tracker doc's grooming section explicitly says to.
 

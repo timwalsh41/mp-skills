@@ -19,7 +19,7 @@
 //   baseBranch          default "main"
 //   repoPath            absolute path of the checkout (prevents wrong-dir false positives)
 //   gateTimeoutMs       default 15 min
-//   implTimeoutMs       default 45 min
+//   implTimeoutMs       default 75 min
 //   reviewTimeoutMs     default 20 min
 //   maxRemediations     default 2
 //   skipPR              default false
@@ -221,7 +221,7 @@ const REVIEW_AXES = [
 ];
 
 const GATE_TIMEOUT_MS = numArg(A.gateTimeoutMs, 15 * 60 * 1000);
-const IMPL_TIMEOUT_MS = numArg(A.implTimeoutMs, 45 * 60 * 1000);
+const IMPL_TIMEOUT_MS = numArg(A.implTimeoutMs, 75 * 60 * 1000);
 const REVIEW_TIMEOUT_MS = numArg(A.reviewTimeoutMs, 20 * 60 * 1000);
 const MAX_REMEDIATIONS = numArg(A.maxRemediations, 2);
 const MAX_REVIEW_RETRIES = numArg(A.maxReviewRetries, 2);
@@ -244,6 +244,7 @@ if (configErrors.length) {
 
 emit("implement: ticket=" + ticketRef + " integration=" + integrationBranch +
      " base=" + BASE_BRANCH + " gateTimeoutMs=" + GATE_TIMEOUT_MS +
+     " implTimeoutMs=" + IMPL_TIMEOUT_MS +
      " maxRemediations=" + MAX_REMEDIATIONS +
      (skipPR ? " skipPR" : ""));
 
@@ -259,12 +260,23 @@ function patchLocation(result) {
   const asyncDir = paths.find(function(p) {
     return typeof p === "string" && p.indexOf("async-subagent-runs") >= 0;
   }) || null;
+  if (!asyncDir) {
+    // Timeout/failure case: runId and artifactPaths may be missing from the
+    // result (e.g. a timeout that threw before the harness captured them).
+    // Point the fixer to a directory search instead of a dead "unknown/" path.
+    return {
+      runId: runId,
+      dir: null,
+      text: "run-directory/worktree-diffs/step-0/  (the *.patch file)" +
+        "\n  If runId is 'unknown' (the child failed before the harness captured it):" +
+        "\n    ls -dt ${TMPDIR:-/tmp}/pi-subagents-*/async-subagent-runs/*/worktree-diffs/step-0/*.patch | head -5" +
+        "\n    identify the patch by its contents (it should touch the ticket's files)."
+    };
+  }
   return {
     runId: runId,
-    dir: asyncDir ? asyncDir + "/worktree-diffs/step-0/" : null,
-    text: asyncDir
-      ? asyncDir + "/worktree-diffs/step-0/  (the *.patch file in that directory)"
-      : "run-directory/worktree-diffs/step-0/  (the *.patch file)"
+    dir: asyncDir + "/worktree-diffs/step-0/",
+    text: asyncDir + "/worktree-diffs/step-0/  (the *.patch file in that directory)"
   };
 }
 
@@ -281,6 +293,9 @@ function spawnImplementer() {
   task.push(
     "Rules:",
     "- Implement only this ticket: " + ticketRef,
+    "- If the ticket description lacks a `**Status:**` line and `- [ ]` acceptance",
+    "    criteria, groom it first (PATCH the description to add them, deriving",
+    "    criteria from the ticket's approach/test_plan) before implementing.",
     "- Check off every acceptance criterion (`- [ ]`) as you satisfy it.",
     "- Set `**" + STATUS_FIELD + ":** resolved` when all criteria are checked.",
     "- Append a short implementation summary under '" + ANSWER_HEADING + "'.",
@@ -316,7 +331,7 @@ function spawnFixer(priorResult, wave) {
     "",
     "Steps:",
     "1. Find the previous run's captured patch (*.patch file in the directory above).",
-    "2. Apply it to YOUR worktree: git apply --index <patch>",
+    "2. Apply it to YOUR worktree: git apply --whitespace=fix --index <patch>",
     "   (your worktree already branches from " + integrationBranch + ").",
     "3. Run the gate: " + GATE,
     "4. Fix the failures, re-run the gate until green.",
@@ -360,7 +375,7 @@ function spawnMerger(result, commitMsg, retry) {
     "Steps:",
     "1. Confirm the main checkout is on " + integrationBranch + " and clean (git status).",
     "   If dirty or on another branch, STOP and report.",
-    "2. Find and apply the captured patch: git apply --index <patch>",
+    "2. Find and apply the captured patch: git apply --whitespace=fix --index <patch>",
     "3. Commit: git commit -m \"" + commitMsg + "\"",
     "4. Re-run the gate yourself: " + GATE,
     "5. Return: merge status, commit hash, gate result.",
@@ -496,6 +511,26 @@ if (REPO_PATH) {
     emit("implement: WARNING - could not ensure integration branch '" + integrationBranch + "'; worktree children may fail");
   } else {
     emit("implement: integration branch '" + integrationBranch + "' ensured");
+  }
+}
+
+// Phase 0.5: validate the ticket is groomed (has **Status:** and - [ ]).
+if (REPO_PATH && TRACKER_HINT) {
+  const groomCheck = await runs.run("groom-check-" + keyOf(ticketRef), {
+    agent: AG.worker,
+    label: "Validate ticket " + ticketRef + " is groomed",
+    task: "Read ticket " + ticketRef + " from " + TRACKER_HINT + ".\n" +
+      "Check if its description has a `**Status:**` line and at least one `- [ ]` acceptance criterion.\n" +
+      "Report GROOMED_OK if both are present, or GROOM_NEEDED if either is missing.\n" +
+      "Do NOT modify the ticket or any files.",
+    timeoutMs: 60 * 1000,
+    quiet: true
+  });
+  if (groomCheck && groomCheck.ok && String(groomCheck.output || "").indexOf("GROOM_NEEDED") >= 0) {
+    emit("implement: WARNING - ticket " + ticketRef + " is NOT groomed " +
+         "(missing **Status:** or - [ ]). Groom it before relaunching.");
+  } else if (groomCheck && groomCheck.ok) {
+    emit("implement: ticket " + ticketRef + " is groomed");
   }
 }
 await runTransition("in_progress", ticketRef, { branch: integrationBranch });
@@ -787,11 +822,30 @@ if (!skipPR) {
   } catch (eP) {
     emit("implement: pr-writer rejected (" + eP + ")");
   }
-  // Transition ticket to Ready for Review (tracker-agnostic hook).
+  // Transition ticket to Ready for Review and Complete (tracker-agnostic hook).
   if (prResult && prResult.ok) {
     const prUrl = String(prResult.output || "").match(/https?:\/\/[^\s]+pull\/\d+/) || "";
     await runTransition("ready_for_review", ticketRef, { branch: integrationBranch, prUrl: prUrl });
+    await runTransition("complete", ticketRef, { branch: integrationBranch, prUrl: prUrl });
   }
+}
+
+// Cleanup: remove child worktrees that persist after completion.
+if (REPO_PATH) {
+  await runs.run("cleanup-worktrees-" + keyOf(ticketRef), {
+    agent: AG.worker,
+    label: "Clean up child worktrees for " + ticketRef,
+    task: "Remove managed git worktrees under " + REPO_PATH + " that belong to " +
+      "completed child runs (paths containing 'pi-worktree-').\n" +
+      "1. git -C " + REPO_PATH + " worktree list --porcelain  - list all worktrees.\n" +
+      "2. For each worktree path containing 'pi-worktree-', run:\n" +
+      "   git -C " + REPO_PATH + " worktree remove --force <path> 2>/dev/null || true\n" +
+      "3. git -C " + REPO_PATH + " worktree prune.\n" +
+      "Do NOT switch branches or modify the main checkout.\n" +
+      "Report WORKTREES_CLEANED with the count removed.",
+    timeoutMs: 30 * 1000,
+    quiet: true
+  }).catch(function(e) { emit("implement: worktree cleanup error: " + e); });
 }
 
 emit("implement: " + ticketRef + " complete — merged on " + integrationBranch +
