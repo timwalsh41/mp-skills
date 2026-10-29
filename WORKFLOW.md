@@ -1,6 +1,6 @@
 # implement-spec orchestration workflow
 
-The control flow of `skills/engineering/implement-spec/orchestrate.js`, the script the `implement-spec` skill launches to turn a spec and its ticket graph into a verified, reviewed, merged pull request. The script runs inside the pi subagent workflow sandbox, a plain JS body with top-level `await` and no `fs`, `shell`, or `require`, so every action on the world goes through child agents launched with `runs.run` / `runs.all`.
+The control flow of `skills/engineering/implement-spec/orchestrate.js`, the script the `implement-spec` skill launches to turn a spec and its ticket graph into a verified, reviewed integration branch and pull request. The script runs inside the pi subagent workflow sandbox, a plain JS body with top-level `await` and no `fs`, `shell`, or `require`, so every action on the world goes through child agents launched with `runs.run` / `runs.all`.
 
 ## What the diagram does not say
 
@@ -9,10 +9,14 @@ The control flow of `skills/engineering/implement-spec/orchestrate.js`, the scri
 - **Worktree isolation has one exception.** Implementers, fixers, and the review-fix pass run with `worktree: true` and `baseRef = refs/heads/<integrationBranch>`, and the main checkout never leaves the integration branch. The final verify runs in the main checkout instead, not a fresh worktree.
 - **Gates run on the host and are the only proof.** Every gated child (implementer, fixer, merger, final verify) carries a `gate` object the harness runs in the child's working tree; a child's own "done" never counts. Tickets gate on the full suite unless `fullGateTickets` narrows the rest to `narrowGate`, so a slow tier bundled into one ticket cannot fail every other ticket mid-run.
 - **A green gate is not a satisfied ticket.** After a ticket's work is merged and re-gated on the integration branch, a `verifier` child re-derives that ticket's acceptance criteria from the merged code and records the evidence in the ticket. Only then does the ticket count as merged; a missing verdict is not a pass, and the ticket is escalated like any other failure.
-- **The tracker is the source of truth.** Ticket state is re-read from the tracker each wave, never a child's self-report, and the discovery cache is dropped whenever a wave merges anything because a merge implies a child may have updated ticket state. A ticket already resolved is absorbed into `merged` without being implemented, which is also how `verifyOnly` resumes a partial run.
+- **The tracker is the source of truth.** Issue state is re-read from the tracker each wave, never a child's self-report, and the discovery cache is dropped whenever a wave merges anything. A ticket commit already on the integration branch is independently verified even when the issue remains In Progress or Ready for Review, which lets `verifyOnly` resume without reimplementing it.
 - **Escalation is not abandonment.** A ticket that exhausts `maxRemediations` (default 2) stops being spawned and emits a structured `ESCALATION:` line; its dependents wait for the lead's decision rather than being poisoned. The lead resumes the named run, spawns a targeted fixer, or parks the ticket and re-plans. An escalated ticket also suppresses the request: a run with an unverified ticket in it is not a finished run.
 - **The children are quiet on purpose.** Every child this workflow spawns carries a control override whose silence window is longer than its gate, and control notices are not pushed for them. A child running a test suite is silent by design, and the harness's 60-second "needs attention" notice used to wake the lead once per ticket per wave to say nothing.
-- **Two caveats the diagram only hints at.** A failed final verify is logged but does not suppress the PR, so a PR opened over a red integration branch is unreviewed work. The timeout tier-1 revive cannot carry a gate, so the revived child self-verifies and the merge gate re-checks.
+- **Lifecycle transitions are tracker-driven by default.** The workflow reads `docs/agents/issue-tracker.md` for the actions: In Progress before implementation, Ready for Review after PR creation, and Complete only in post-merge finalization after the documented merge check succeeds. `transitionCommands` is an override, not a requirement.
+- **PR eligibility is strict.** The final full-suite gate must pass, every in-scope issue must be merged and independently verified, and reviews must be complete and clean or fixed. An explicit user waiver can bypass review blockers only, opens a draft where supported, and returns a non-green result.
+- **Request result is explicit.** The PR writer returns `PR_CREATED: <url>` or `NO_PR_SURFACE`; Ready for Review is applied only for a created request.
+- **Worktrees are retained for recovery.** Incomplete, escalated, request-failed, and waived runs keep their worktrees for user-directed resumption. Cleanup happens only after a fully completed run.
+- **The timeout tier-1 revive cannot carry a gate**, so the revived child self-verifies and the merge gate re-checks.
 
 ```mermaid
 flowchart TD
@@ -39,7 +43,7 @@ flowchart TD
 
     %% ===== VERIFY-ONLY SHORTCUT =====
     Index --> VerifyOnly{"verifyOnly?"}
-    VerifyOnly -- "yes" --> Seed["Seed merged from tickets<br/>already marked resolved;<br/>skip all implementation waves"]
+    VerifyOnly -- "yes" --> Seed["Seed from issue commits<br/>already on integration branch;<br/>verify without reimplementation"]
     Seed --> CloseGate
     VerifyOnly -- "no" --> Loop
 
@@ -113,8 +117,10 @@ flowchart TD
     %% ===== CLOSING SEQUENCE =====
     CloseGate{"any tickets merged?"}
     CloseGate -- "no" --> Result
-    CloseGate -- "yes" --> FinalV["Final verify: full-suite gate<br/>on integration branch<br/>(merger agent, NOT worktree-isolated;<br/>failure is logged only)"]
-    FinalV --> ReviewFanOut{"spawnReviews via runs.all:<br/>standards + spec + quality<br/>(parallel)"}
+    CloseGate -- "yes" --> FinalV["Final verify: full-suite gate<br/>on integration branch<br/>(merger agent, NOT worktree-isolated)"]
+    FinalV --> FinalGateQ{"full-suite gate passed?"}
+    FinalGateQ -- "no" --> Suppress(["PR suppressed:<br/>final gate failed"])
+    FinalGateQ -- "yes" --> ReviewFanOut{"spawnReviews via runs.all:<br/>standards + spec + quality<br/>(parallel)"}
     ReviewFanOut -- "rejects" --> NoReviews["reviews = [];<br/>proceed without reviews"]
     NoReviews --> IncompleteQ
     ReviewFanOut -- "ok" --> Parse["Parse each axis for<br/>Review verdict: line"]
@@ -128,23 +134,31 @@ flowchart TD
 
     IncompleteQ{"any axis without a verdict,<br/>or fewer than 3 axes?"}
     IncompleteQ -- "yes" --> Suppress(["PR suppressed:<br/>review incomplete"])
-    IncompleteQ -- "no" --> RunCompleteQ{"any ticket escalated<br/>and unverified?"}
+    IncompleteQ -- "no" --> RunCompleteQ{"any issue unresolved<br/>or escalated?"}
     RunCompleteQ -- "yes" --> Suppress
     RunCompleteQ -- "no" --> PRGate{"skipPR?"}
     PRGate -- "yes" --> BranchOnly(["End: integration branch only"])
     PRGate -- "no" --> PR["spawnPR (prWriter):<br/>PR_INSTRUCTIONS,<br/>integration branch to baseBranch"]
-    PR --> Result
+    PR --> RequestCreatedQ{"PR_CREATED:<url>?"}
+    RequestCreatedQ -- "yes" --> ReadyStatus["transition issues to<br/>Ready for Review"] --> Result
+    RequestCreatedQ -- "NO_PR_SURFACE" --> BranchOnly
+    RequestCreatedQ -- "missing / PR_FAILED" --> PRFailed["PR not created;<br/>retain worktrees"] --> Result
     EscFix --> Result
     Suppress --> Result
     BranchOnly --> Result
 
-    Result(["Return result object:<br/>ok, waves, merged, escalated,<br/>unresolved, reviews, reviewsIncomplete,<br/>verifications, fixApplied, fixMerged, prCreated"])
+    Result(["Return result object:<br/>ok, waves, merged, escalated,<br/>unresolved, finalVerifyPassed, reviews,<br/>prWaived, prFailed, readyTransitionFailures,<br/>prCreated, prSurfaceUnavailable"])
+
+    %% ===== POST-MERGE FINALIZATION =====
+    Finalize(["After user reports merge:<br/>rerun with finalizeMergedPR"]) --> ConfirmMerge{"Tracker docs confirm<br/>the merge?"}
+    ConfirmMerge -- "no" --> NoComplete(["Leave issues unchanged;<br/>report merge unconfirmed"])
+    ConfirmMerge -- "yes" --> CompleteStatus["transition in-scope issues<br/>to Complete"]
 
     %% ===== STYLES =====
     classDef esc fill:#fdd,stroke:#b00,stroke-width:1px,color:#800;
     classDef gate fill:#eef,stroke:#007,stroke-width:1px,color:#125;
     classDef cache fill:#ffe6b3,stroke:#b88,stroke-width:1px,color:#753;
-    class EscExhausted,EscRemediation,EscMerge,EscFix,EscVerify,Suppress,ArgErr,ConfigErr,ConfigAbort,NoTickets,BranchErr esc;
+    class EscExhausted,EscRemediation,EscMerge,EscFix,EscVerify,Suppress,NoComplete,PRFailed,ArgErr,ConfigErr,ConfigAbort,NoTickets,BranchErr esc;
     class Merge,MergeRetry,FixMerge,FinalV gate;
     class Scan,DropCache cache;
 ```

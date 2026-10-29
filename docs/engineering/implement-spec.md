@@ -1,6 +1,6 @@
 ## What it does
 
-`implement-spec` takes a [spec](https://www.aihero.dev/ai-coding-dictionary/spec) and its [tickets](https://www.aihero.dev/ai-coding-dictionary/ticket) and lands the whole thing in one run. The orchestrating [agent](https://www.aihero.dev/ai-coding-dictionary/agent) hands each ticket to an implementer [subagent](https://www.aihero.dev/ai-coding-dictionary/subagent) working in its own git worktree, merges each finished branch into a single **integration branch**, runs [code-review](https://aihero.dev/skills-code-review) over the result, and resolves the tickets.
+`implement-spec` takes a [spec](https://www.aihero.dev/ai-coding-dictionary/spec) and its [tickets](https://www.aihero.dev/ai-coding-dictionary/ticket) and builds the whole issue graph on one **integration branch**. The orchestrating [agent](https://www.aihero.dev/ai-coding-dictionary/agent) assigns each ready ticket to an implementer [subagent](https://www.aihero.dev/ai-coding-dictionary/subagent) in its own git worktree, then merges and independently verifies each result before the spec-wide review and PR gate.
 
 It reads the tickets as a **task graph**, not a list. Blocking edges decide what can start, so at any moment there is a **frontier** of tickets whose blockers have all landed, and every ticket on the frontier runs at once. That is the difference from working the tickets one by one. The graph's shape sets the pace, not the tickets' order on the tracker.
 
@@ -17,7 +17,7 @@ You invoke this by typing `/implement-spec`, and the agent won't reach for it on
 
 ## Prerequisites
 
-- **An issue tracker.** The skill reads the tickets from, and resolves them on, the tracker [setup-matt-pocock-skills](https://aihero.dev/skills-setup-matt-pocock-skills) configured. If none has been configured, it stops and tells you to run that first rather than guessing.
+- **An issue tracker.** The skill reads issues from the tracker configured by [setup-matt-pocock-skills](https://aihero.dev/skills-setup-matt-pocock-skills). `docs/agents/issue-tracker.md` describes how to groom, update, transition, and complete issues. If no tracker has been configured, the skill stops rather than guessing.
 - **Tickets with blocking edges**, as [to-tickets](https://aihero.dev/skills-to-tickets) writes them. Without edges the graph is flat and every ticket starts at once.
 - **A [harness](https://www.aihero.dev/ai-coding-dictionary/harness) that runs subagents in the background and gives each one a git worktree.** The skill exists to run tickets at the same time, so on a harness that runs subagents one at a time, it is only a slower `implement`.
 
@@ -29,7 +29,7 @@ Everything lands on one branch. Each implementer:
 2. builds its ticket with [tdd](https://aihero.dev/skills-tdd), red-green one slice at a time,
 3. merges the integration branch tip into its own branch before reporting done, so landing it is a fast-forward.
 
-The tracker decides whether a pull request exists at all. If your tracker closes work through PRs, or you ask for one, the skill opens a draft PR after the first merge and marks it ready at the end. Otherwise the run stops on the integration branch with every ticket resolved the way your tracker closes work, which works fully offline against a local markdown tracker.
+Lifecycle transitions default to the target repo's `docs/agents/issue-tracker.md`: issues move to In Progress before implementation and Ready for Review after a PR is created. Complete is deferred until a separate post-merge finalization confirms that the PR or integration branch was merged. The PR gate requires the final full-suite check to pass, every in-scope issue to be on the integration branch and independently verified, and complete reviews. `skipPR` stops at the branch. A user can waive completed review blockers with an explicit reason; that creates a draft PR where supported and is reported as non-green, without waiving a failed test gate or unfinished issue.
 
 Implementers talk to the orchestrator through [context pointers](https://www.aihero.dev/ai-coding-dictionary/context-pointer) (the spec, the ticket, shared exploration notes, earlier commits) rather than pasted summaries. This keeps each subagent's prompt small and leaves room in the orchestrator's window for the graph.
 
@@ -39,9 +39,13 @@ Implementers talk to the orchestrator through [context pointers](https://www.aih
 
 This is the question the skill exists to answer. Before it shipped, people kept building their own versions, and one user described the need: they wanted "subagents implement the tickets" instead of having "to individually create new session and tell them to implement a ticket one by one, when a spec may contain over 5 tickets." With `implement` you are the dispatcher: one [session](https://www.aihero.dev/ai-coding-dictionary/session) per ticket, clearing in between, and keeping track yourself of which tickets are unblocked. `implement-spec` hands that job to one orchestrating session. The price is that you no longer read each ticket's work as it lands; you review the integration branch at the end. To start a run, clear the context and type `/implement-spec` with a pointer to the spec (an issue number or a file path). For a small change with no real graph, skip it and use `implement` directly.
 
+**Why isn't an issue Complete as soon as its implementation is merged to the integration branch?**
+
+Integration-branch commits are not the final merge to the base branch. Issues stay In Progress until the PR is created, then Ready for Review. After the PR or integration branch reaches its documented completion point, rerun the workflow in `finalizeMergedPR` mode. It confirms the merge before asking the issue tracker to mark the issues Complete.
+
 **Does it need GitHub? I want it to stop at the branch.**
 
-No, not any more. One user who liked the in-progress version had exactly this complaint: "it creates a PR at the end, which requires an online repository like GitHub. I wish it could do the same work offline and stop at the branch where all the work is merged." The run now ends on the integration branch. A PR opens only when the configured tracker closes work through PRs or you ask for one, so on a local markdown tracker the run ends with every ticket resolved and the work merged on the branch.
+No, not any more. One user who liked the in-progress version had exactly this complaint: "it creates a PR at the end, which requires an online repository like GitHub. I wish it could do the same work offline and stop at the branch where all the work is merged." The run can stop at the integration branch with `skipPR: true`, so GitHub is not required. The issue remains in the lifecycle state documented by the repo until the branch is merged and a post-merge finalization confirms completion.
 
 **Its review and fix loop ran for hours, or kept "fixing" tickets that hadn't been built yet.**
 
@@ -73,7 +77,8 @@ A worktree holds only what git tracks. Tests that read gitignored fixtures, loca
 - A ticket starts as soon as its last blocker lands on the integration branch, not when the whole run ends.
 - Every ticket's trace shows `tdd` running, with a failing test before the code.
 - Merges into the integration branch are fast-forwards, not conflict resolutions.
-- The run ends on one branch with every ticket resolved, and a PR only if your tracker wanted one.
+- The integration branch contains every in-scope issue and passes the final full-suite gate before any PR opens.
+- Issues move to Ready for Review only after PR creation, and to Complete only after merge confirmation.
 
 ## Where it fits
 

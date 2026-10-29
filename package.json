@@ -9,6 +9,7 @@
   },
   "license": "MIT",
   "scripts": {
+    "test:workflows": "node --test tests/workflow-entry.test.mjs",
     "changeset": "changeset",
     "version": "changeset version && node scripts/sync-plugin-version.mjs",
     "check-plugin-version": "node scripts/sync-plugin-version.mjs --check"

@@ -18,6 +18,10 @@
 // Optional args:
 //   baseBranch          default "main"
 //   repoPath            absolute path of the checkout (prevents wrong-dir false positives)
+//   finalizeMergedPR    run the merge-confirmation and Complete-transition phase only
+//   prUrl / mergeRef    evidence locator required by finalizeMergedPR
+//   prWaiverReason      explicit user waiver of completed review blockers only
+//   transitionCommands optional tracker-command overrides; default is issue-tracker docs
 //   gateTimeoutMs       default 15 min
 //   implTimeoutMs       default 75 min
 //   reviewTimeoutMs     default 20 min
@@ -36,7 +40,10 @@
 //   - Every child carries a verification gate that runs on the host.
 //   - A review without a verdict line is INCOMPLETE, not a pass: PR suppressed.
 //   - Independent verification of acceptance criteria required before PR.
-//   - No PR unless reviews pass AND verification passes.
+//   - No PR unless reviews and verification pass, except an explicit review waiver
+//     that opens a draft and returns a non-green result.
+//   - Lifecycle transitions follow docs/agents/issue-tracker.md by default; Complete
+//     is only available through the merge-confirmation phase.
 
 // ---------------------------------------------------------------------------
 // Shared helpers — copied from implement-spec/orchestrate.js.
@@ -149,49 +156,87 @@ function classifyFailure(result, flakeRe) {
 // ---------------------------------------------------------------------------
 const A = args || {};
 
+const finalizeMergedPR = boolArg(A.finalizeMergedPR);
 const missingArgs = [];
 if (!A.ticketRef) missingArgs.push("ticketRef");
-if (!A.gate) missingArgs.push("gate");
+if (!finalizeMergedPR && !A.gate) missingArgs.push("gate");
 if (!A.integrationBranch) missingArgs.push("integrationBranch");
+if (finalizeMergedPR && !(A.prUrl || A.mergeRef)) missingArgs.push("prUrl or mergeRef for post-merge confirmation");
 if (missingArgs.length) {
   return {
     ok: false,
     error: "implement is missing required args: " + missingArgs.join(", ") +
       ". Resolve them from docs/agents/verification.md (gate, base branch) and " +
-      "docs/agents/issue-tracker.md (ticket reference) and relaunch."
+      "docs/agents/issue-tracker.md (ticket reference and lifecycle workflow) and relaunch."
   };
 }
 
 const ticketRef = String(A.ticketRef);
-const GATE = A.gate;
+const GATE = A.gate || null;
 const integrationBranch = A.integrationBranch;
 const baseRef = "refs/heads/" + integrationBranch;
 const BASE_BRANCH = A.baseBranch || "main";
 const REPO_PATH = A.repoPath || null;
-// Optional tracker-agnostic transition command templates. Each value is a shell
-// command string with $TICKET_REF, $BRANCH, and $PR_URL variables substituted.
-// When omitted, no status transitions are performed (the ticket is still
-// resolved by description per docs/agents/issue-tracker.md).
+// Explicit commands remain an override. By default, each lifecycle action is
+// resolved from the target repository's docs/agents/issue-tracker.md.
 const TRANSITION_COMMANDS = A.transitionCommands || null;
 function runTransition(phase, ref, variables) {
-  if (!TRANSITION_COMMANDS || !TRANSITION_COMMANDS[phase]) {
-    emit("implement: no transition command for '" + phase + "'; skipping");
-    return Promise.resolve(null);
-  }
-  const substituted = TRANSITION_COMMANDS[phase]
-    .replace(/\$TICKET_REF/g, String(ref))
-    .replace(/\$BRANCH/g, String(variables.branch || ""))
-    .replace(/\$PR_URL/g, String(variables.prUrl || ""));
+  const command = TRANSITION_COMMANDS && TRANSITION_COMMANDS[phase];
+  const task = command
+    ? "Run this tracker transition command for ticket " + ref + ":\n" +
+      command
+        .replace(/\$TICKET_REF/g, String(ref))
+        .replace(/\$BRANCH/g, String(variables.branch || ""))
+        .replace(/\$PR_URL/g, String(variables.prUrl || ""))
+    : [
+        "Read docs/agents/issue-tracker.md in " + (REPO_PATH || "the target repository") +
+          " and follow its lifecycle workflow for this issue.",
+        "If tracker-specific operations are absent from the current worktree, use this pointer:",
+        TRACKER_HINT || "No tracker hint was supplied; inspect the configured issue tracker documentation.",
+        "Phase: " + phase,
+        "Issue: " + ref,
+        "Branch: " + String(variables.branch || ""),
+        "PR URL: " + String(variables.prUrl || ""),
+        "Use the documented transition only. If the tracker explicitly has no such lifecycle transition, report TRANSITION_UNSUPPORTED without changing state.",
+        "Otherwise report exactly TRANSITION_APPLIED, TRANSITION_ALREADY_SET, or TRANSITION_FAILED, with the resulting status and any error.",
+        "Do not modify code, other issues, or repository files."
+      ].join("\n");
   return runs.run("transition-" + phase + "-" + keyOf(ref), {
     agent: AG.worker,
     label: "Transition " + ref + " to " + phase,
-    task: "Run this tracker transition command for ticket " + ref + ":\n" + substituted +
-      "\nReport the HTTP status code or any error. Change nothing else in the repository.",
+    task: task + "\nReport the HTTP status code or error. Change nothing else.",
     timeoutMs: 60 * 1000,
     quiet: true
   }).then(function(r) {
-    emit("implement: transition " + phase + " for " + ref + " -- " + (r && r.ok ? "done" : "failed"));
-    return r;
+    const output = String((r && r.output) || "");
+    const unsupported = output.indexOf("TRANSITION_UNSUPPORTED") >= 0;
+    const ok = !!(r && r.ok) && (unsupported || !/TRANSITION_FAILED|TRACKER_DOC_MISSING|TRANSITION_UNCLEAR/.test(output));
+    emit("implement: transition " + phase + " for " + ref + " -- " + (unsupported ? "unsupported by tracker" : (ok ? "done" : "failed")));
+    return { ok: ok, output: output, unsupported: unsupported };
+  });
+}
+function parsePrWriterResult(result) {
+  const output = String((result && result.output) || "");
+  const match = output.match(/(?:^|\n)PR_CREATED:\s*(https?:\/\/[^\s]+)/);
+  return {
+    url: match ? match[1] : null,
+    noPrSurface: /(?:^|\n)NO_PR_SURFACE(?:\n|$)/.test(output)
+  };
+}
+function confirmMerged(ref, mergeRef) {
+  return runs.run("confirm-merge-" + keyOf(ref), {
+    agent: AG.worker,
+    label: "Confirm merge for " + ref,
+    task: [
+      "Read docs/agents/issue-tracker.md and docs/agents/verification.md in " + (REPO_PATH || "the target repository") + ".",
+      "Confirm using the documented merge/request process that this issue's work has reached its completion point.",
+      "Issue: " + ref,
+      "Integration branch: " + integrationBranch,
+      "Merge or PR reference: " + mergeRef,
+      "Do not change issue status. Report exactly MERGED_CONFIRMED or MERGE_NOT_CONFIRMED, with evidence."
+    ].join("\n"),
+    timeoutMs: 60 * 1000,
+    quiet: true
   });
 }
 const STANDARDS_DOCS = A.standardsDocs ||
@@ -199,9 +244,8 @@ const STANDARDS_DOCS = A.standardsDocs ||
 const TRACKER_HINT = A.trackerHint || null;
 const RETEST_COMMAND = A.singleRetestCommand || null;
 const PR_INSTRUCTIONS = A.prInstructions || null;
+const PR_WAIVER_REASON = typeof A.prWaiverReason === "string" ? A.prWaiverReason.trim() : "";
 const skipPR = boolArg(A.skipPR);
-const STATUS_FIELD = "Status";
-const ANSWER_HEADING = "## Answer";
 
 const ROLES = A.agents || {};
 const AG = {
@@ -248,6 +292,29 @@ emit("implement: ticket=" + ticketRef + " integration=" + integrationBranch +
      " maxRemediations=" + MAX_REMEDIATIONS +
      (skipPR ? " skipPR" : ""));
 
+if (finalizeMergedPR) {
+  const mergeRef = String(A.prUrl || A.mergeRef);
+  const confirmation = await confirmMerged(ticketRef, mergeRef);
+  if (!confirmation || !confirmation.ok || !/MERGED_CONFIRMED/.test(String(confirmation.output || ""))) {
+    return {
+      ok: false,
+      ticket: ticketRef,
+      finalized: false,
+      error: "The issue tracker did not confirm that the merge is complete. No Complete transition was attempted.",
+      mergeEvidence: String((confirmation && confirmation.output) || "")
+    };
+  }
+  const completion = await runTransition("complete", ticketRef, { branch: integrationBranch, prUrl: A.prUrl || A.mergeRef });
+  return {
+    ok: !!(completion && completion.ok),
+    ticket: ticketRef,
+    finalized: !!(completion && completion.ok),
+    statusTransitionUnsupported: !!(completion && completion.unsupported),
+    transition: completion,
+    error: completion && completion.ok ? null : "Merge was confirmed, but the issue could not be transitioned to Complete."
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Child spawners
 // ---------------------------------------------------------------------------
@@ -291,14 +358,12 @@ function spawnImplementer() {
     task.push("Tracker (this repo's convention — your worktree may not carry the tracker doc):", TRACKER_HINT, "");
   }
   task.push(
+    "Read docs/agents/issue-tracker.md first. It is the source of truth for ticket fields, acceptance evidence, and lifecycle status.",
     "Rules:",
     "- Implement only this ticket: " + ticketRef,
-    "- If the ticket description lacks a `**Status:**` line and `- [ ]` acceptance",
-    "    criteria, groom it first (PATCH the description to add them, deriving",
-    "    criteria from the ticket's approach/test_plan) before implementing.",
-    "- Check off every acceptance criterion (`- [ ]`) as you satisfy it.",
-    "- Set `**" + STATUS_FIELD + ":** resolved` when all criteria are checked.",
-    "- Append a short implementation summary under '" + ANSWER_HEADING + "'.",
+    "- The orchestrator confirmed this ticket is groomed. If it is not ready, stop and report GROOM_NEEDED instead of implementing or changing lifecycle status.",
+    "- Record acceptance evidence and an implementation summary according to docs/agents/issue-tracker.md.",
+    "- Do not change lifecycle status; the orchestrator owns In Progress and Ready for Review transitions, and Complete is post-merge only.",
     "- Write/update tests for every criterion (unit/integration/E2E per the spec).",
     "- Your worktree branches from " + integrationBranch + "; do NOT create branches, worktrees, or spawn subagents.",
     "- Do NOT commit — leave your changes uncommitted; the orchestrator's merger captures and commits them.",
@@ -354,7 +419,7 @@ function spawnFixer(priorResult, wave) {
   });
 }
 
-function spawnMerger(result, commitMsg, retry) {
+function spawnMerger(result, retry) {
   const loc = patchLocation(result);
   const label = "merge-" + (retry ? retry + "-" : "") + keyOf(ticketRef);
   const task = [
@@ -376,9 +441,13 @@ function spawnMerger(result, commitMsg, retry) {
     "1. Confirm the main checkout is on " + integrationBranch + " and clean (git status).",
     "   If dirty or on another branch, STOP and report.",
     "2. Find and apply the captured patch: git apply --whitespace=fix --index <patch>",
-    "3. Commit: git commit -m \"" + commitMsg + "\"",
-    "4. Re-run the gate yourself: " + GATE,
-    "5. Return: merge status, commit hash, gate result.",
+    "3. Read the ticket and diff, then create a Conventional Commit subject using the appropriate type and a concise change summary. Include `Issue: " + ticketRef + "` as a commit-body trailer. Do not use a generic 'Implement ticket' subject.",
+    "4. Commit using that subject and trailer, then validate both:",
+    "   git log -1 --format=%s | grep -Eq '^[a-z][a-z0-9-]*(\\([a-z0-9._/-]+\\))?!?: .+'",
+    "   git show -s --format=%B HEAD | grep -Fx 'Issue: " + ticketRef + "'",
+    "   If either check fails, amend only the message and re-check.",
+    "5. Re-run the gate yourself: " + GATE,
+    "6. Return: merge status, commit hash, gate result.",
     "",
     "If the patch cannot be found or applied, report FAILURE clearly and change nothing."
   );
@@ -442,8 +511,8 @@ function spawnVerifier() {
     "evidence: inspect the code and, where meaningful, run the targeted test.",
     "Report each as satisfied/not with evidence (file:line, test name, command, result).",
     "",
-    "Record your findings under '" + ANSWER_HEADING + "' in the ticket. Do NOT toggle",
-    "acceptance checkboxes or change the ticket's status. Do NOT edit code, commit,",
+    "Record verification evidence according to docs/agents/issue-tracker.md. Do not",
+    "change lifecycle status or alter acceptance outcomes. Do NOT edit code, commit,",
     "or spawn subagents.",
     "",
     "The LAST line of your final response MUST be exactly:",
@@ -459,7 +528,7 @@ function spawnVerifier() {
   });
 }
 
-function spawnPrWriter() {
+function spawnPrWriter(waiverReason, blockedReviews) {
   const task = [
     PR_INSTRUCTIONS
       ? PR_INSTRUCTIONS
@@ -467,13 +536,23 @@ function spawnPrWriter() {
         ", using the command recorded in docs/agents/verification.md.",
     ""
   ];
+  if (waiverReason) {
+    task.push(
+      "This PR is explicitly waived by the user, not green-gated.",
+      "Open it as a draft, if this repo's request surface supports drafts, and include the waiver reason and unresolved review findings in the body.",
+      "Waiver reason: " + waiverReason,
+      "Unresolved review findings: " + JSON.stringify(blockedReviews || [])
+    );
+  }
   task.push.apply(task, checkoutHint(REPO_PATH));
   task.push(
     "",
+    "Read docs/agents/issue-tracker.md for ticket and lifecycle behavior, and docs/agents/verification.md for the request surface.",
     "Branch: " + integrationBranch + " -> " + BASE_BRANCH + ", covering " + ticketRef + ".",
     "The ticket at " + ticketRef + " holds the acceptance answer.",
     "Push the head branch first (git push -u origin " + integrationBranch + ")",
-    "if it is not on the remote."
+    "if it is not on the remote.",
+    "Return exactly `PR_CREATED: <url>` on its own line if a PR was opened. If the repo docs say there is no PR surface, return `NO_PR_SURFACE` and leave the work on the integration branch. Report failure clearly if a PR was expected but could not be opened."
   );
   return runs.run("pr", {
     label: "Open pull request for " + ticketRef,
@@ -514,26 +593,39 @@ if (REPO_PATH) {
   }
 }
 
-// Phase 0.5: validate the ticket is groomed (has **Status:** and - [ ]).
-if (REPO_PATH && TRACKER_HINT) {
-  const groomCheck = await runs.run("groom-check-" + keyOf(ticketRef), {
+// Grooming preflight is a gate, not a warning. The lead can groom through the
+// repository's documented issue-tracker workflow and then relaunch.
+const groomCheck = await runs.run("groom-check-" + keyOf(ticketRef), {
     agent: AG.worker,
     label: "Validate ticket " + ticketRef + " is groomed",
-    task: "Read ticket " + ticketRef + " from " + TRACKER_HINT + ".\n" +
-      "Check if its description has a `**Status:**` line and at least one `- [ ]` acceptance criterion.\n" +
-      "Report GROOMED_OK if both are present, or GROOM_NEEDED if either is missing.\n" +
-      "Do NOT modify the ticket or any files.",
+    task: "Read docs/agents/issue-tracker.md and inspect ticket " + ticketRef +
+      " using the documented tracker workflow. " + (TRACKER_HINT || "") + "\n" +
+      "Check whether the ticket is ready for implementation, including the documented grooming fields and acceptance criteria.\n" +
+      "Report GROOMED_OK if ready, or GROOM_NEEDED if the lead must groom it. Do not change the issue or repository.",
     timeoutMs: 60 * 1000,
     quiet: true
   });
-  if (groomCheck && groomCheck.ok && String(groomCheck.output || "").indexOf("GROOM_NEEDED") >= 0) {
-    emit("implement: WARNING - ticket " + ticketRef + " is NOT groomed " +
-         "(missing **Status:** or - [ ]). Groom it before relaunching.");
-  } else if (groomCheck && groomCheck.ok) {
-    emit("implement: ticket " + ticketRef + " is groomed");
-  }
+if (!groomCheck || !groomCheck.ok) {
+  return { ok: false, ticket: ticketRef, error: "Could not verify grooming for " + ticketRef + ". No implementation started." };
 }
-await runTransition("in_progress", ticketRef, { branch: integrationBranch });
+if (String(groomCheck.output || "").indexOf("GROOM_NEEDED") >= 0) {
+  return {
+    ok: false,
+    ticket: ticketRef,
+    groomingRequired: true,
+    error: "Ticket " + ticketRef + " is not groomed. Follow docs/agents/issue-tracker.md or /groom, then relaunch. No implementation started."
+  };
+}
+emit("implement: ticket " + ticketRef + " is groomed");
+const inProgressTransition = await runTransition("in_progress", ticketRef, { branch: integrationBranch });
+if (!inProgressTransition || !inProgressTransition.ok) {
+  return {
+    ok: false,
+    ticket: ticketRef,
+    error: "Could not transition " + ticketRef + " to In Progress. No implementation started.",
+    transition: inProgressTransition
+  };
+}
 
 // Phase 1: implement the ticket (worktree-isolated, gated).
 try {
@@ -595,7 +687,7 @@ while (!implResult || !implResult.ok) {
 // onto the integration branch via a merger child.
 let mergeResult = null;
 try {
-  mergeResult = await spawnMerger(implResult, "Implement ticket " + ticketRef);
+  mergeResult = await spawnMerger(implResult);
 } catch (e) {
   if (isConfigError(e)) {
     return {
@@ -609,7 +701,7 @@ try {
 if (!mergeResult || !mergeResult.ok) {
   // One idempotent retry — a transient lock or race on the checkout.
   try {
-    mergeResult = await spawnMerger(implResult, "Implement ticket " + ticketRef, 2);
+    mergeResult = await spawnMerger(implResult, 2);
   } catch (e2) {
     emit("implement: merger retry rejected (" + e2 + ")");
   }
@@ -645,7 +737,7 @@ const reviews = reviewResults.map(function(r, i) {
     axis: axes[i] || ("axis" + i),
     ok: !!(r && r.ok),
     verdict: verdict,
-    excerpt: out.slice(0, 400)
+    excerpt: out.slice(0, 4000)
   };
 });
 
@@ -679,7 +771,7 @@ while (reviewsIncomplete && reviewRetryAttempt < MAX_REVIEW_RETRIES) {
     let verdict = "UNVERDICTED";
     if (res && res.ok) verdict = parseReviewVerdict(out);
     const idx = reviews.findIndex(function(x) { return x.axis === r.axis; });
-    reviews[idx] = { axis: r.axis, ok: !!(res && res.ok), verdict: verdict, excerpt: out.slice(0, 400) };
+    reviews[idx] = { axis: r.axis, ok: !!(res && res.ok), verdict: verdict, excerpt: out.slice(0, 4000) };
   });
   blockedAxes = reviews.filter(function(r) { return r.verdict === "BLOCK"; });
   unreviewedAxes = reviews.filter(function(r) {
@@ -691,7 +783,7 @@ while (reviewsIncomplete && reviewRetryAttempt < MAX_REVIEW_RETRIES) {
 let fixApplied = false;
 let fixMerged = false;
 
-if (blockedAxes.length) {
+if (blockedAxes.length && !(PR_WAIVER_REASON && !skipPR)) {
   // Fix pass: worktree-isolated, repairs review findings.
   const fixBrief = [
     "Reviewers BLOCKED the work on " + integrationBranch + ".",
@@ -724,7 +816,7 @@ if (blockedAxes.length) {
     fixApplied = true;
     let fixMergerResult = null;
     try {
-      fixMergerResult = await spawnMerger(fixResult, "Address review findings", "fix");
+      fixMergerResult = await spawnMerger(fixResult, "fix");
     } catch (eM) {
       emit("implement: merge-review-fixes rejected (" + eM + ")");
     }
@@ -802,11 +894,11 @@ if (verificationVerdict !== "OK") {
 
 // Phase 4: open the PR only when the tree is in a known-good state.
 const reviewsOk = !reviewsIncomplete && blockedAxes.length === 0;
-if (!reviewsOk) {
+const waivedReviewBlock = !skipPR && !reviewsOk && !reviewsIncomplete && blockedAxes.length > 0 && !!PR_WAIVER_REASON;
+if (!reviewsOk && !waivedReviewBlock) {
   return {
     ok: false,
-    error: "ESCALATION: review is incomplete or blocked for " + ticketRef +
-      " — PR suppressed. " +
+    error: "ESCALATION: review is incomplete or blocked for " + ticketRef + ". PR suppressed. " +
       (reviewsIncomplete ? "An axis returned no 'Review verdict:' line (treated as INCOMPLETE, not a pass)." : ""),
     escalated: true,
     ticket: ticketRef,
@@ -816,22 +908,38 @@ if (!reviewsOk) {
 }
 
 let prResult = null;
+let readyTransition = null;
+let prUrl = null;
+let prSurfaceUnavailable = false;
 if (!skipPR) {
   try {
-    prResult = await spawnPrWriter();
+    prResult = await spawnPrWriter(waivedReviewBlock ? PR_WAIVER_REASON : "", blockedAxes);
+    const requestResult = parsePrWriterResult(prResult);
+    prUrl = requestResult.url;
+    prSurfaceUnavailable = requestResult.noPrSurface;
   } catch (eP) {
     emit("implement: pr-writer rejected (" + eP + ")");
   }
-  // Transition ticket to Ready for Review and Complete (tracker-agnostic hook).
-  if (prResult && prResult.ok) {
-    const prUrl = String(prResult.output || "").match(/https?:\/\/[^\s]+pull\/\d+/) || "";
-    await runTransition("ready_for_review", ticketRef, { branch: integrationBranch, prUrl: prUrl });
-    await runTransition("complete", ticketRef, { branch: integrationBranch, prUrl: prUrl });
+  if (prResult && prResult.ok && prUrl && !waivedReviewBlock) {
+    readyTransition = await runTransition("ready_for_review", ticketRef, { branch: integrationBranch, prUrl: prUrl });
+    if (!readyTransition || !readyTransition.ok) {
+      return {
+        ok: false,
+        prCreated: true,
+        ticket: ticketRef,
+        prUrl: prUrl,
+        error: "PR was created, but the issue could not be transitioned to Ready for Review.",
+        transition: readyTransition
+      };
+    }
   }
 }
 
-// Cleanup: remove child worktrees that persist after completion.
-if (REPO_PATH) {
+const prFailed = !skipPR && !(prResult && prResult.ok && (prUrl || prSurfaceUnavailable));
+const workflowComplete = !waivedReviewBlock && !prFailed;
+
+// Preserve worktrees after an incomplete or waived run so the lead can resume them.
+if (REPO_PATH && workflowComplete) {
   await runs.run("cleanup-worktrees-" + keyOf(ticketRef), {
     agent: AG.worker,
     label: "Clean up child worktrees for " + ticketRef,
@@ -848,11 +956,11 @@ if (REPO_PATH) {
   }).catch(function(e) { emit("implement: worktree cleanup error: " + e); });
 }
 
-emit("implement: " + ticketRef + " complete — merged on " + integrationBranch +
-     ", reviews OK, verified, " + (skipPR ? "SKIP PR" : (prResult && prResult.ok ? "PR created" : "PR FAILED")));
+emit("implement: " + ticketRef + " verified on " + integrationBranch +
+     ", " + (skipPR ? "PR skipped" : (prUrl ? (waivedReviewBlock ? "PR opened under an explicit waiver" : "PR created; awaiting merge") : (prSurfaceUnavailable ? "no PR surface; branch complete" : "PR failed"))));
 
 return {
-  ok: true,
+  ok: workflowComplete,
   ticket: ticketRef,
   integrationBranch: integrationBranch,
   baseBranch: BASE_BRANCH,
@@ -862,7 +970,13 @@ return {
   verification: verificationVerdict,
   fixApplied: fixApplied,
   fixMerged: fixMerged,
-  prCreated: !!(prResult && prResult.ok),
+  prCreated: !!(prResult && prResult.ok && prUrl),
+  prSurfaceUnavailable: prSurfaceUnavailable,
+  prUrl: prUrl,
+  prWaived: waivedReviewBlock,
+  prWaiverReason: waivedReviewBlock ? PR_WAIVER_REASON : null,
+  prFailed: prFailed,
+  awaitingMerge: !!(prResult && prResult.ok && prUrl && !waivedReviewBlock),
   prOutput: prResult && prResult.output ? prResult.output.slice(0, 400) : null,
   runIds: {
     implementer: implResult && implResult.runId,

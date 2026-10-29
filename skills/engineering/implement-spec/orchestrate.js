@@ -34,10 +34,16 @@
 //   maxParallel        default 4     concurrent implementer worktrees
 //   maxWaves           default 6     frontier re-scan rounds
 //   skipPR             default false
+//   finalizeMergedPR   default false. Confirm the integration merge and apply
+//                      Complete transitions only; does not implement or open a PR.
+//   prUrl / mergeRef   evidence locator required by finalizeMergedPR
+//   prWaiverReason    explicit user waiver of completed review blockers only
+//   transitionCommands optional per-phase command overrides; default actions
+//                      are read from docs/agents/issue-tracker.md
 //   verifyOnly         default false. Skip implementation entirely and run
-//                      only the closing sequence (final verify, reviews, fix,
-//                      PR) over whatever the tickets already mark
-//                      resolved. Resume mode for mid-stream pickups.
+//                      the closing sequence over ticket work already on the
+//                      integration branch, regardless of whether the issue's
+//                      lifecycle status is Complete yet. Resume mode.
 //   fullGateTickets    default null = every ticket gates on the FULL suite.
 //                      When only some tickets own the slow tier (browser tests,
 //                      a service that must be running), pass e.g. [15]: those
@@ -66,12 +72,9 @@
 //                      verifier } for projects whose agent definitions use
 //                      other names
 //   trackerHint        optional. A short pointer to the tracker's read,
-//                      update and resolve operations, e.g. "tracker:
-//                      http://host/api/v1; read a ticket with curl ...;
-//                      resolve it by setting its status line to resolved".
-//                      Appended to the implementer's task, so a child whose
-//                      worktree does not carry the repo's tracker doc still
-//                      knows how to read its own ticket and close it.
+//                      update, grooming, and lifecycle operations. The issue
+//                      tracker doc remains the source of truth; this pointer
+//                      helps a child whose worktree does not carry that doc.
 //   repoPath           optional. The absolute path of the checkout this run
 //                      integrates into. Children that work in the MAIN
 //                      checkout (merger, verifier, final verify, review axes,
@@ -93,8 +96,9 @@
 //   - Every implementer/fixer/merger carries a verification gate that runs on
 //     the host in that child's tree; a run is not ok unless the gate passes.
 //     Child claims alone never count as verified.
-//   - Ticket state is re-read from the tracker every wave by a scout child;
-//     the script never trusts a child's self-report of resolution.
+//   - Issue state is re-read from the tracker every wave by a scout child;
+//     ticket commits already on the integration branch are verified regardless
+//     of whether the tracker lifecycle is still In Progress or Ready for Review.
 //   - A review axis that returns no 'Review verdict:' line is INCOMPLETE, not
 //     a pass: the PR is suppressed and the lead is escalated. (Silently
 //     reading a missing verdict as OK was how a crashed reviewer green-lit a
@@ -134,6 +138,7 @@ const specRef = A.specRef || A.specPath || null;
 const ticketsRef = A.ticketsRef || null;
 const integrationBranch = A.integrationBranch || null;
 const FULL_GATE = A.fullGate || null;
+const finalizeMergedPR = boolArg(A.finalizeMergedPR);
 
 // Args arrive exactly as the caller wrote them. A caller that quotes a
 // number ("900000") hands the harness a string, and the harness then rejects
@@ -158,7 +163,8 @@ const missingArgs = [];
 if (!specRef) missingArgs.push("specRef");
 if (!ticketsRef) missingArgs.push("ticketsRef");
 if (!integrationBranch) missingArgs.push("integrationBranch");
-if (!FULL_GATE) missingArgs.push("fullGate");
+if (!finalizeMergedPR && !FULL_GATE) missingArgs.push("fullGate");
+if (finalizeMergedPR && !(A.prUrl || A.mergeRef)) missingArgs.push("prUrl or mergeRef for post-merge confirmation");
 if (missingArgs.length) {
   return {
     ok: false,
@@ -175,44 +181,77 @@ const verifyOnly = boolArg(A.verifyOnly);
 const baseRef = "refs/heads/" + integrationBranch;
 const BASE_BRANCH = A.baseBranch || "main";
 const PR_INSTRUCTIONS = A.prInstructions || null;
+const PR_WAIVER_REASON = typeof A.prWaiverReason === "string" ? A.prWaiverReason.trim() : "";
 const STANDARDS_DOCS = A.standardsDocs ||
   "the files this repo documents as coding standards (search for CODING_STANDARDS.md, CONTRIBUTING.md, and anything AGENTS.md points at)";
 const RETEST_COMMAND = A.singleRetestCommand || null;
 const TRACKER_HINT = A.trackerHint || null;
 const REPO_PATH = A.repoPath || null;
-// Optional tracker-agnostic transition command templates. Each value is a shell
-// command string with $TICKET_REF, $BRANCH, and $PR_URL variables substituted.
-// When omitted, no status transitions are performed (the ticket is still
-// resolved by description per docs/agents/issue-tracker.md).
+// Explicit commands remain an override. By default, each lifecycle action is
+// resolved from the target repository's docs/agents/issue-tracker.md.
 const TRANSITION_COMMANDS = A.transitionCommands || null;
 function runTransition(phase, ref, variables) {
-  if (!TRANSITION_COMMANDS || !TRANSITION_COMMANDS[phase]) {
-    emit("implement-spec: no transition command for '" + phase + "'; skipping");
-    return Promise.resolve(null);
-  }
-  const substituted = TRANSITION_COMMANDS[phase]
-    .replace(/\$TICKET_REF/g, String(ref))
-    .replace(/\$BRANCH/g, String(variables.branch || ""))
-    .replace(/\$PR_URL/g, String(variables.prUrl || ""));
+  const command = TRANSITION_COMMANDS && TRANSITION_COMMANDS[phase];
+  const task = command
+    ? "Run this tracker transition command for issue " + ref + ":\n" +
+      command
+        .replace(/\$TICKET_REF/g, String(ref))
+        .replace(/\$BRANCH/g, String(variables.branch || ""))
+        .replace(/\$PR_URL/g, String(variables.prUrl || ""))
+    : [
+        "Read docs/agents/issue-tracker.md in " + (REPO_PATH || "the target repository") +
+          " and follow its lifecycle workflow for this issue.",
+        "If tracker-specific operations are absent from the current worktree, use this pointer:",
+        TRACKER_HINT || "No tracker hint was supplied; inspect the configured issue tracker documentation.",
+        "Phase: " + phase,
+        "Issue: " + ref,
+        "Branch: " + String(variables.branch || ""),
+        "PR URL: " + String(variables.prUrl || ""),
+        "Use the documented transition only. If the tracker explicitly has no such lifecycle transition, report TRANSITION_UNSUPPORTED without changing state.",
+        "Otherwise report exactly TRANSITION_APPLIED, TRANSITION_ALREADY_SET, or TRANSITION_FAILED, with the resulting status and any error.",
+        "Do not modify code, other issues, or repository files."
+      ].join("\n");
   return runs.run("transition-" + phase + "-" + keyOf(ref), {
     agent: AG.worker,
     label: "Transition " + ref + " to " + phase,
-    task: "Run this tracker transition command for ticket " + ref + ":\n" + substituted +
-      "\nReport the HTTP status code or any error. Change nothing else in the repository.",
+    task: task + "\nReport the HTTP status code or error. Change nothing else.",
     timeoutMs: 60 * 1000,
     quiet: true
   }).then(function(r) {
-    emit("implement-spec: transition " + phase + " for " + ref + " -- " + (r && r.ok ? "done" : "failed"));
-    return r;
+    const output = String((r && r.output) || "");
+    const unsupported = output.indexOf("TRANSITION_UNSUPPORTED") >= 0;
+    const ok = !!(r && r.ok) && (unsupported || !/TRANSITION_FAILED|TRACKER_DOC_MISSING|TRANSITION_UNCLEAR/.test(output));
+    emit("implement-spec: transition " + phase + " for " + ref + " -- " + (unsupported ? "unsupported by tracker" : (ok ? "done" : "failed")));
+    return { ok: ok, output: output, unsupported: unsupported };
+  });
+}
+function parsePrWriterResult(result) {
+  const output = String((result && result.output) || "");
+  const match = output.match(/(?:^|\n)PR_CREATED:\s*(https?:\/\/[^\s]+)/);
+  return {
+    url: match ? match[1] : null,
+    noPrSurface: /(?:^|\n)NO_PR_SURFACE(?:\n|$)/.test(output)
+  };
+}
+function confirmMerged(refs, mergeRef) {
+  return runs.run("confirm-merge", {
+    agent: AG.worker,
+    label: "Confirm merged issue work",
+    task: [
+      "Read docs/agents/issue-tracker.md and docs/agents/verification.md in " + (REPO_PATH || "the target repository") + ".",
+      "Confirm using the documented merge/request process that the merge reference is complete and includes the work for every listed issue. The integration branch may have been deleted after merge.",
+      "Issues: " + refs.join(", "),
+      "Integration branch: " + integrationBranch,
+      "Merge or PR reference: " + mergeRef,
+      "Do not change issue statuses. Report exactly MERGED_CONFIRMED or MERGE_NOT_CONFIRMED, with evidence."
+    ].join("\n"),
+    timeoutMs: 60 * 1000,
+    quiet: true
   });
 }
 
-// Default Markdown-body conventions for the completion instructions handed to
-// children. The tracker doc (docs/agents/issue-tracker.md) is the authority;
-// these only seed the task text for trackers whose tickets use a Markdown body.
-const STATUS_FIELD = "Status";
-const ANSWER_HEADING = "## Answer";
-const RESOLVED_STATUSES = ["resolved", "wontfix"];
+// Tracker-specific issue fields and lifecycle operations come from
+// docs/agents/issue-tracker.md, never from hard-coded Markdown assumptions.
 // A run key safe for any tracker's ticket reference (paths, #42, PROJ-123).
 function keyOf(ref) { return String(ref).replace(/[^a-zA-Z0-9._-]+/g, "_"); }
 
@@ -391,7 +430,7 @@ function readTicketGraph(fresh) {
   const task = [
     "Enumerate this run's tickets from the configured issue tracker.",
     "The tracker target for this run: " + ticketsRef,
-    "Use the tracker convention your role defines. Do NOT assume tickets are files.",
+    "Read docs/agents/issue-tracker.md and follow its tracker workflow. Do NOT assume tickets are files.",
     "Read ONLY that target. If it does not exist, or matches no tickets, return",
     'an empty tickets array. Never substitute a similar-looking target, another',
     "feature's tickets, or issues you found by searching: an empty answer is the",
@@ -400,19 +439,17 @@ function readTicketGraph(fresh) {
     "For EACH ticket output one object with:",
     "  ref: the ticket's reference in this tracker (e.g. 07, #42, PROJ-123),",
     "  title: the ticket title,",
+    "  type: the tracker's issue type/kind when available,",
     "  resolved: true when the tracker marks the ticket closed/done, else false,",
     "  blockedBy: the refs of every ticket this one is blocked by ([] if none),",
-    "  onBranch: true when the integration branch " + baseRef + " already carries",
-    "  this ticket's work. The workflow's own merge commits are written exactly",
-    "  as 'Implement ticket <ref>: <title>', so look for a commit on that branch",
-    "  whose message starts with 'Implement ticket " + "<ref>" + ":'. A commit that",
-    "  only changes the ticket's status line, or only mentions the ticket in",
-    "  passing, does NOT count — the work itself has to be on the branch. Report",
-    "  false when it is not. A ticket the tracker marks resolved but whose work",
-    "  is NOT on the branch is not done: the run has to implement it.",
-    "  groomed: true when the ticket's description has a `**Status:**` line and",
-    "  at least one `- [ ]` acceptance criterion, false otherwise.",
-    "Keep each object on ONE line. Compact JSON, no whitespace.",
+    "  onBranch: true when the integration branch " + baseRef + " carries",
+    "  this ticket's work. New commits include an exact `Issue: <ref>` body",
+    "  trailer; legacy commits may start with `Implement ticket <ref>:`. Search",
+    "  both forms. A status-only commit does not count. Report false when the",
+    "  work itself is absent from the branch.",
+    "  groomed: true when the issue meets the ready-for-implementation criteria",
+    "  in docs/agents/issue-tracker.md, false otherwise. Do not modify the issue.",
+    "Keep each object on ONE line. Compact JSON, no whitespace. Include type when available.",
     "If a ticket cannot be read at all, append 'UNREADABLE:<ref>' for it.",
     "",
     "Preflight, reported in the same JSON document:",
@@ -424,7 +461,7 @@ function readTicketGraph(fresh) {
     "",
     "Your FINAL response must begin with ONLY this JSON document (no prose",
     "before or inside it):",
-    '{"tickets":[{"ref":"07","title":"...","resolved":false,"blockedBy":[],"onBranch":false}],',
+    '{"tickets":[{"ref":"07","title":"...","resolved":false,"blockedBy":[],"onBranch":false,"groomed":true}],',
     ' "preflight":{"trackerConfigured":true,"integrationBranchExists":true,"integrationBranch":"' + integrationBranch + '"}}'
   ].join("\n");
   return runs.run(fresh ? "ticket-graph-forced" : "ticket-graph", {
@@ -501,7 +538,7 @@ function spawnImplementer(ticket, wave) {
   const task = [
     "Implement EXACTLY ONE ticket, end to end, using TDD (red-green-refactor).",
     "",
-    "Ticket (read it first, using the tracker convention your role defines): " + ticket.ref,
+    "Issue (read it first using docs/agents/issue-tracker.md): " + ticket.ref,
     "Full spec for background context only: " + specRef,
     ""
   ];
@@ -511,13 +548,9 @@ function spawnImplementer(ticket, wave) {
   task.push(
     "Rules:",
     "- Implement only this ticket. Other tickets belong to other workers.",
-    "- Pre-flight: if the ticket's description lacks a `**Status:**` line and `- [ ]`",
-    "  acceptance criteria, groom it first (PATCH the description to add them,",
-    "  deriving criteria from the ticket's approach/test_plan) before implementing.",
-    "- Check off every `- [ ]` acceptance criterion in the ticket as you",
-    "  satisfy it, and set `**" + STATUS_FIELD + ":** " + RESOLVED_STATUSES[0] + "` ONLY when all are checked.",
-    "- EDIT the existing '**" + STATUS_FIELD + ":**' line in place — never append a second one.",
-    "- Append a short implementation summary under '" + ANSWER_HEADING + "' in the ticket.",
+    "- The orchestrator dispatches only tickets confirmed ready by the grooming preflight. If this ticket is not ready, stop and report GROOM_NEEDED; do not implement or change lifecycle status.",
+    "- Record acceptance evidence and an implementation summary according to docs/agents/issue-tracker.md.",
+    "- Do not change lifecycle status; the orchestrator owns In Progress and Ready for Review transitions, and Complete is post-merge only.",
     "- Write/update tests for every criterion (unit/integration/E2E per spec).",
     "- Your tree already branches from " + integrationBranch + "; do NOT create",
     "  branches, worktrees, or spawn subagents.",
@@ -734,14 +767,18 @@ function spawnMerger(ticket, implResult, wave, worktreePath) {
     "Steps:",
     "1. Confirm the main checkout is on " + integrationBranch + " and clean",
     "   (git status). If it is dirty or on another branch, STOP and report.",
-    "2. If a commit implementing this ticket ALREADY exists on the integration",
-    "   branch (git log --grep 'ticket " + ticket.ref + "'), report that the",
-    "   merge was already done and exit successfully — do not merge twice.",
+    "2. If a commit with an exact `Issue: " + ticket.ref + "` body trailer or the",
+    "   legacy subject `Implement ticket " + ticket.ref + ":` already exists, report",
+    "   that the merge was already done and exit successfully; do not merge twice.",
     "3. Apply the implementer's changes (per the source above). If the patch is",
     "   empty or already applied, note that and continue.",
-    "4. Commit: git commit -m \"Implement ticket " + ticket.ref + ": " + ticket.title + "\"",
-    "5. Re-run the verification gate yourself as well: " + gate.command,
-    "6. Do NOT delete branches or run any worktree-manager commands.",
+    "4. Read the issue and diff, then create a Conventional Commit subject using the appropriate type and a concise change summary. Include `Issue: " + ticket.ref + "` as a commit-body trailer. Do not use a generic 'Implement ticket' subject.",
+    "5. Commit using that subject and trailer, then validate both:",
+    "   git log -1 --format=%s | grep -Eq '^[a-z][a-z0-9-]*(\\([a-z0-9._/-]+\\))?!?: .+'",
+    "   git show -s --format=%B HEAD | grep -Fx 'Issue: " + ticket.ref + "'",
+    "   If either check fails, amend only the message and re-check.",
+    "6. Re-run the verification gate yourself as well: " + gate.command,
+    "7. Do NOT delete branches or run any worktree-manager commands.",
     "",
     "If the patch cannot be found or applied, report FAILURE clearly and",
     "change nothing.",
@@ -803,11 +840,10 @@ function spawnVerifier(ticket, wave) {
     "assume: if the work is NOT there, that is a finding — report the criterion",
     "as not satisfied. Do not conclude anything about work you cannot see.",
     "",
-    "Record what you found in the ticket, under the answer heading '" + ANSWER_HEADING + "':",
-    "file paths, test names, commands run, and any gap. Treat the ticket as an",
-    "append-only audit record — you may expand the answer heading, but do NOT",
-    "toggle the implementer's acceptance checkboxes and do NOT change the ticket's",
-    "status. You report evidence; closing the ticket is someone else's decision.",
+    "Record verification evidence using docs/agents/issue-tracker.md, including",
+    "file paths, test names, commands run, and any gap. Do not change lifecycle",
+    "status or alter acceptance outcomes. You report evidence; lifecycle changes",
+    "are handled by the orchestrator at the documented phase boundaries.",
     "",
     "Rules:",
     "- Touch only this ticket. Do NOT edit code, do NOT commit, do NOT change",
@@ -1043,7 +1079,7 @@ if (preflight && preflight.trackerConfigured === false) {
     discoveredTickets: tickets.length
   };
 }
-if (preflight && preflight.integrationBranchExists === false) {
+if (preflight && preflight.integrationBranchExists === false && !finalizeMergedPR) {
   // The branch doesn't exist yet. Create it from BASE_BRANCH before any
   // worktree child launches — they all branch from baseRef and would fail
   // without it. The script can't invoke git directly, so we spawn a lightweight
@@ -1080,6 +1116,46 @@ if (!preflight) {
        " resolves before wave 1. Implementers will fail on baseRef if it does not exist.");
 }
 
+if (finalizeMergedPR) {
+  const refs = tickets.map(function(ticket) { return String(ticket.ref); }).filter(Boolean);
+  if (!preflight || preflight.trackerConfigured !== true || !refs.length) {
+    return {
+      ok: false,
+      finalized: false,
+      error: "Cannot finalize: the issue tracker could not read every in-scope issue. No Complete transitions were attempted.",
+      issues: refs
+    };
+  }
+  const confirmation = await confirmMerged(refs, String(A.prUrl || A.mergeRef));
+  if (!confirmation || !confirmation.ok || !/MERGED_CONFIRMED/.test(String(confirmation.output || ""))) {
+    return {
+      ok: false,
+      finalized: false,
+      error: "The issue tracker did not confirm that the merge is complete. No Complete transitions were attempted.",
+      mergeEvidence: String((confirmation && confirmation.output) || ""),
+      issues: refs
+    };
+  }
+  const transitionFailures = [];
+  const transitionUnsupported = [];
+  for (const ref of refs) {
+    const transition = await runTransition("complete", ref, {
+      branch: integrationBranch,
+      prUrl: A.prUrl || A.mergeRef
+    });
+    if (!transition || !transition.ok) transitionFailures.push(ref);
+    else if (transition.unsupported) transitionUnsupported.push(ref);
+  }
+  return {
+    ok: transitionFailures.length === 0,
+    finalized: transitionFailures.length === 0,
+    issues: refs,
+    transitionFailures: transitionFailures,
+    transitionUnsupported: transitionUnsupported,
+    error: transitionFailures.length ? "Merge was confirmed, but some issues could not be transitioned to Complete." : null
+  };
+}
+
 // Normalize + index. Script-side ledger of what has been merged.
 const byRef = {};
 const order = [];
@@ -1092,39 +1168,34 @@ for (const t of tickets) {
     title: t.title || ("ticket " + ref),
     resolved: !!t.resolved,
     blockedBy: Array.isArray(t.blockedBy) ? t.blockedBy.map(String) : [],
-    groomed: t.groomed !== undefined ? !!t.groomed : true
+    groomed: !!t.groomed
   };
 }
 emit("implement-spec: discovered " + order.length + " tickets: " + order.join(", "));
-// Pre-flight: warn about ungroomed tickets (missing **Status:** or - [ ]).
-// An ungroomed ticket has no acceptance criteria for the implementer to check
-// off or the verifier to re-derive.
+// Pre-flight: tickets not ready under the tracker doc stay out of the frontier.
 for (const ref of order) {
   if (byRef[ref] && byRef[ref].groomed === false) {
-    emit("implement-spec: WARNING - ticket " + ref + " is NOT groomed " +
-         "(description lacks **Status:** or - [ ]). The implementer will attempt " +
-         "to groom it in-place; or groom it manually first.");
+    emit("implement-spec: ticket " + ref + " is GROOM_NEEDED; it will not be dispatched until it meets docs/agents/issue-tracker.md readiness criteria.");
   }
 }
 
 const merged = [];        // ticket refs implemented AND merged
 const escalated = [];     // tickets given up to the lead after maxRemediations
 const verifications = []; // per-ticket independent verification verdicts
-const absorbedPending = []; // tickets the tracker calls done, awaiting verification
+const absorbedPending = []; // issues whose ticket commits are already on branch, awaiting verification
 const waveReports = [];
 let totalRemediations = 0;
 let waveCount = 0;        // survives the wave loop for the closing sequence
 
 if (verifyOnly) {
-  // Resume mode: no implementation. Treat whatever the tracker marks resolved
-  // as the merged set, then run only the closing sequence — but only when the
-  // integration branch actually carries the work (see onBranch below), and
-  // only once that work has been verified.
+  // Resume mode: no implementation. Treat ticket commits already on the
+  // integration branch as pending independent verification, regardless of
+  // whether the tracker has been closed yet.
   const st0 = statusesFromGraph(graphRun);
   for (const s of st0) {
     const ref = (s.ref === undefined || s.ref === null) ? "" : String(s.ref);
     if (!ref) continue;
-    if (s.resolved && s.onBranch) {
+    if (s.onBranch) {
       ledgerFor(ref).state = "merged";
       absorbedPending.push(ref);
     } else if (s.resolved) {
@@ -1134,7 +1205,7 @@ if (verifyOnly) {
       ledgerFor(ref).state = "unresolved";
     }
   }
-  emit("verifyOnly: " + merged.length + " tickets already resolved; skipping implementation waves");
+  emit("verifyOnly: " + absorbedPending.length + " issues already on the integration branch; skipping implementation waves");
 } else {
   let wave = 0;
   let stallGuard = 0;
@@ -1154,6 +1225,7 @@ if (verifyOnly) {
       if (ref) {
         resolvedByRef[ref] = !!s.resolved;
         onBranchByRef[ref] = !!s.onBranch;
+        if (byRef[ref]) byRef[ref].groomed = !!s.groomed;
       }
     }
 
@@ -1163,23 +1235,19 @@ if (verifyOnly) {
       const t = byRef[ref];
       const ld = ledgerFor(ref);
       if (ld.state === "merged" || ld.state === "escalated") continue;
+      if (onBranchByRef[ref]) {
+        // The ticket commit is already present, even if the tracker remains
+        // In Progress or Ready for Review. Verify it rather than reimplementing.
+        ld.state = "merged";
+        absorbedPending.push(ref);
+        continue;
+      }
+      if (!t.groomed) {
+        emit("ticket " + ref + ": GROOM_NEEDED; not dispatched until it is groomed per docs/agents/issue-tracker.md");
+        continue;
+      }
       if (resolvedByRef[ref]) {
-        // The tracker says the ticket is done, but the work has to be ON the
-        // integration branch too. An implementer resolves the ticket in the
-        // tracker BEFORE its patch is merged, so a failed merge leaves a
-        // ticket that looks done and whose code is nowhere on the branch. Only
-        // absorb it when the branch actually carries the work; otherwise it
-        // has to be implemented (the implementer will find the work already
-        // present and the merger will see the commit is already there).
-        if (onBranchByRef[ref]) {
-          // The tracker says done AND the branch carries the work — but that
-          // is still a claim, so it is verified below before the ticket counts
-          // as merged.
-          ld.state = "merged";
-          absorbedPending.push(ref);
-          continue;
-        }
-        emit("ticket " + ref + ": the tracker marks it resolved but the integration branch does not carry the work; it is not done");
+        emit("ticket " + ref + ": the tracker marks it resolved but the integration branch does not carry its commit; it will be implemented again");
       }
       const blockerOpen = t.blockedBy.some(function(b) {
         return ledgerFor(b).state !== "merged";
@@ -1193,9 +1261,22 @@ if (verifyOnly) {
     const batch = frontier.slice(0, maxParallel);
     emit("wave " + wave + ": implementing tickets " +
          batch.map(function(t) { return t.ref; }).join(", "));
-    // Transition frontier tickets to In Progress (tracker-agnostic hook).
+    // Transition frontier issues before implementation. A failed tracker update
+    // blocks the batch so code cannot advance while the tracker says otherwise.
+    const transitionFailures = [];
     for (const t of batch) {
-      await runTransition("in_progress", t.ref, { branch: integrationBranch });
+      const transition = await runTransition("in_progress", t.ref, { branch: integrationBranch });
+      if (!transition || !transition.ok) transitionFailures.push(t.ref);
+    }
+    if (transitionFailures.length) {
+      return {
+        ok: false,
+        integrationBranch: integrationBranch,
+        error: "Could not transition these issues to In Progress; no implementers were launched: " + transitionFailures.join(", "),
+        transitionFailures: transitionFailures,
+        merged: merged,
+        escalated: escalated
+      };
     }
 
     // Fan out implementers. If runs.all rejects (any single child failure),
@@ -1455,12 +1536,10 @@ if (verifyOnly) {
 }
 
 // ---------------------------------------------------------------------------
-// Absorption check — a ticket the tracker already calls done is only merged
-// once the work is confirmed to be ON the integration branch AND to satisfy
-// its acceptance criteria. "Resolved in the tracker" is a claim, not proof:
-// an implementer resolves its ticket before its patch is merged, so a failed
-// merge leaves a ticket that looks done and whose code is nowhere. The
-// verifier settles it against the branch, not against the ticket.
+// Absorption check: an issue commit already on the integration branch is
+// independently verified even if lifecycle status remains In Progress or
+// Ready for Review. Tracker closure without a matching branch commit is not
+// treated as implementation.
 // ---------------------------------------------------------------------------
 if (absorbedPending.length) {
   for (const ref of absorbedPending) {
@@ -1481,11 +1560,11 @@ if (absorbedPending.length) {
     });
     if (verdict === "OK") {
       merged.push(ref);
-      emit("ticket " + ref + ": already resolved in the tracker — the work is on " + integrationBranch + " and independently verified");
+      emit("ticket " + ref + ": work on " + integrationBranch + " is independently verified");
     } else {
-      escalate(ref, "the tracker marks it resolved but the work did not verify on " + integrationBranch + " (" + verdict + ")",
-               "the ticket was absorbed as done from the tracker; its acceptance criteria did not verify against the branch. " +
-               "Lead decision needed: implement it, or accept the gap explicitly.");
+      escalate(ref, "work already on " + integrationBranch + " did not verify (" + verdict + ")",
+               "the issue commit was present on the branch, but its acceptance criteria did not verify. " +
+               "Lead decision needed: targeted fix, or accept the gap explicitly.");
       ledgerFor(ref).state = "escalated";
       escalated.push(ref);
     }
@@ -1495,11 +1574,24 @@ if (absorbedPending.length) {
 // ---------------------------------------------------------------------------
 // Closing sequence — final verify, three-axis review, fix pass, PR.
 // ---------------------------------------------------------------------------
+const unresolved = order.filter(function(ref) {
+  return merged.indexOf(ref) < 0 && escalated.indexOf(ref) < 0;
+});
 let reviews = null;
 let reviewsIncomplete = false;
 let fixRun = null;
 let fixMergerRun = null;
 let prRun = null;
+let prEligible = false;
+let finalVerifyPassed = false;
+let prWaived = false;
+let reviewsAccepted = false;
+let runComplete = false;
+let readyTransitionFailures = [];
+let prCreated = false;
+let prUrl = null;
+let prSurfaceUnavailable = false;
+let prFailed = false;
 
 if (merged.length) {
   // Final verification: full suite (including e2e) on the integrated branch.
@@ -1516,7 +1608,8 @@ if (merged.length) {
     "substitute another branch or treat the current checkout as the target.",
     "Run the FULL test suite with: " + FULL_GATE,
     "If anything fails, investigate and fix directly (no subagents), then",
-    "re-run until green, committing any fix. Return the test runner's summary line."
+    "re-run until green. If you commit a fix, use a Conventional Commit subject and add `Issue: <ref>` trailers for affected issues from this run: " + merged.join(", ") + ".",
+    "Validate the subject with `git log -1 --format=%s | grep -Eq '^[a-z][a-z0-9-]*(\\([a-z0-9._/-]+\\))?!?: .+'` and verify each issue trailer in the commit body. Return the test runner's summary line."
   );
   try {
     verifyRun = await runs.run("final-verify", {
@@ -1530,8 +1623,9 @@ if (merged.length) {
   } catch (eV) {
     emit("implement-spec: final-verify rejected (" + eV + ")");
   }
-  if (!verifyRun || !verifyRun.ok) {
-    emit("implement-spec: final full-suite verification FAILED");
+  finalVerifyPassed = !!(verifyRun && verifyRun.ok);
+  if (!finalVerifyPassed) {
+    emit("implement-spec: final full-suite verification FAILED; PR eligibility is blocked");
   }
 
   let reviewResults = null;
@@ -1557,7 +1651,7 @@ if (merged.length) {
       axis: axes[i] || ("axis" + i),
       ok: !!(r && r.ok),
       verdict: verdict,
-      excerpt: out.slice(0, 400)
+      excerpt: out.slice(0, 4000)
     };
   });
   let blockedAxes = reviews.filter(function(r) { return r.verdict === "BLOCK"; });
@@ -1595,7 +1689,7 @@ if (merged.length) {
         else if (out.indexOf("Review verdict: MISSING_TARGET") >= 0) verdict = "MISSING_TARGET";
       }
       const idx = reviews.findIndex(function(x) { return x.axis === r.axis; });
-      reviews[idx] = { axis: r.axis, ok: !!(res && res.ok), verdict: verdict, excerpt: out.slice(0, 400) };
+      reviews[idx] = { axis: r.axis, ok: !!(res && res.ok), verdict: verdict, excerpt: out.slice(0, 4000) };
     });
     blockedAxes = reviews.filter(function(r) { return r.verdict === "BLOCK"; });
     unreviewedAxes = reviews.filter(function(r) {
@@ -1612,7 +1706,7 @@ if (merged.length) {
          ". An axis with no 'Review verdict:' line is not a pass. PR suppressed; Lead decision needed: re-run the review or accept the gap explicitly.");
   }
 
-  if (blockedAxes.length) {
+  if (blockedAxes.length && !(PR_WAIVER_REASON && !skipPR)) {
     // Fix pass: worktree-isolated so the main checkout stays clean, then a
     // dedicated merger commits the fixes BEFORE the PR
     const fixBrief = [
@@ -1656,9 +1750,11 @@ if (merged.length) {
         "Steps:",
         "1. Confirm the main checkout is on " + integrationBranch + " and clean.",
         "2. Locate and apply the captured patch (git apply --whitespace=fix --index <patch>).",
-        "3. Commit: git commit -m \"Address review findings\"",
-        "4. Re-run the full gate yourself: " + FULL_GATE,
-        "5. Return: merge status, commit hash, gate result."
+        "3. Commit with a Conventional Commit subject whose type matches the fixes, such as `fix: address review findings`, and include `Issue: <ref>` trailers for each affected issue in this run: " + merged.join(", ") + ".",
+        "4. Validate the subject with `git log -1 --format=%s | grep -Eq '^[a-z][a-z0-9-]*(\\([a-z0-9._/-]+\\))?!?: .+'` and validate the Issue trailers for the affected issues in this run: " + merged.join(", ") + ".",
+        "   If either check fails, amend only the message and re-check.",
+        "5. Re-run the full gate yourself: " + FULL_GATE,
+        "6. Return: merge status, commit hash, gate result."
       );
       try {
         fixMergerRun = await runs.run("merge-review-fixes", {
@@ -1672,6 +1768,7 @@ if (merged.length) {
       } catch (eM) {
         emit("implement-spec: merge-review-fixes rejected (" + eM + ")");
       }
+      if (fixMergerRun && fixMergerRun.ok) finalVerifyPassed = true;
       if (!fixMergerRun || !fixMergerRun.ok) {
         // Acceptance-format rejection does not mean the work is absent.
         // The fixer's changes may already be on the branch. Verify git state
@@ -1697,6 +1794,7 @@ if (merged.length) {
         if (gmVerify && gmVerify.ok && gmOutput.indexOf("MERGE_EFFECTIVE") >= 0) {
           emit("implement-spec: fix-merge acceptance rejected but git state verified; treating as merged");
           fixMergerRun = { ok: true, output: gmOutput };
+          finalVerifyPassed = true;
         } else {
           emit("ESCALATION: review fixes were produced but NOT merged into " +
                integrationBranch + " — the fixer's worktree may hold uncommitted work, and " +
@@ -1713,11 +1811,13 @@ if (merged.length) {
   // completed, and there are either no blockers or blockers fixed AND merged.
   // Never open a PR from a pre-fix commit, or from an unknown review state.
   const fixesClean = (!blockedAxes.length || (fixRun && fixRun.ok && fixMergerRun && fixMergerRun.ok)) && !reviewsIncomplete;
-  // An escalated ticket is a ticket whose acceptance is unverified. Its code
-  // may already be on the branch, but the run is not complete, so it does
-  // not open a request that claims otherwise.
-  const runComplete = escalated.length === 0;
-  if (!skipPR && fixesClean && runComplete) {
+  // A user may explicitly waive completed review blockers, but never a red
+  // final gate, incomplete review, or unfinished issue graph.
+  runComplete = escalated.length === 0 && unresolved.length === 0;
+  prWaived = !!(!skipPR && PR_WAIVER_REASON && blockedAxes.length && !reviewsIncomplete && finalVerifyPassed && runComplete && !fixesClean);
+  reviewsAccepted = fixesClean || prWaived;
+  prEligible = finalVerifyPassed && reviewsAccepted && runComplete;
+  if (!skipPR && prEligible) {
     const prTask = [
       PR_INSTRUCTIONS
         ? PR_INSTRUCTIONS
@@ -1730,11 +1830,21 @@ if (merged.length) {
       "",
       "Branch: " + integrationBranch + " -> " + BASE_BRANCH + ", covering tickets " +
         merged.join(", ") + " (spec: " + specRef + ").",
-      "The tickets at " + ticketsRef + " hold the per-ticket answers.",
+      "The issues at " + ticketsRef + " hold the per-issue answers.",
+      "Read docs/agents/issue-tracker.md for lifecycle behavior and docs/agents/verification.md for the request surface.",
       "The head branch must exist on the remote before a request can be",
       "opened — push it first (git push -u origin <branch>) if it is not there.",
-      "If this repo has no request surface, commit the integration branch and say so."
+      "If this repo has no request surface, leave the work on the integration branch and return exactly `NO_PR_SURFACE` on its own line.",
+      "If a PR was opened, return exactly `PR_CREATED: <url>` on its own line. Report failure clearly if a PR was expected but could not be opened."
     );
+    if (prWaived) {
+      prTask.push(
+        "This request is explicitly waived by the user, not green-gated.",
+        "Open it as a draft, if this repo's request surface supports drafts, and include the waiver reason plus unresolved review findings.",
+        "Waiver reason: " + PR_WAIVER_REASON,
+        "Unresolved review findings: " + JSON.stringify(blockedAxes)
+      );
+    }
     try {
       prRun = await runs.run("pr", {
         label: "Open pull/merge request",
@@ -1746,34 +1856,33 @@ if (merged.length) {
     } catch (eP) {
       emit("implement-spec: pr run rejected (" + eP + ")");
     }
-    // Transition tickets to Ready for Review (tracker-agnostic hook).
-    if (prRun && prRun.ok) {
-      const prUrlMatch = String(prRun.output || "").match(/https?:\/\/[^\s]+pull\/\d+/);
-      const prUrl = prUrlMatch ? prUrlMatch[0] : "";
+    const requestResult = parsePrWriterResult(prRun);
+    prUrl = requestResult.url;
+    prCreated = !!(prRun && prRun.ok && prUrl);
+    prSurfaceUnavailable = !!(prRun && prRun.ok && requestResult.noPrSurface);
+    prFailed = !skipPR && prEligible && !prCreated && !prSurfaceUnavailable;
+    // Ready for Review begins only after a normal PR is created. A waived PR
+    // stays a draft and does not advance the lifecycle status.
+    if (prRun && prRun.ok && prCreated && !prWaived) {
       for (const ref of merged) {
-        await runTransition("ready_for_review", ref, { branch: integrationBranch, prUrl: prUrl });
-      }
-      // Transition to Complete (tracker-agnostic hook).
-      for (const ref of merged) {
-        await runTransition("complete", ref, { branch: integrationBranch, prUrl: prUrl });
+        const transition = await runTransition("ready_for_review", ref, { branch: integrationBranch, prUrl: prUrl });
+        if (!transition || !transition.ok) readyTransitionFailures.push(ref);
       }
     }
   } else if (!skipPR) {
     emit("implement-spec: PR suppressed — " +
-         (!runComplete ? "one or more tickets are escalated and unverified"
-                       : (reviewsIncomplete ? "review incomplete" : "review fixes not cleanly merged")) +
+         (!finalVerifyPassed ? "final full-suite verification failed"
+           : (!runComplete ? "one or more in-scope issues are unresolved or escalated"
+             : (reviewsIncomplete ? "review incomplete" : "review blockers remain without an explicit waiver"))) +
          "; lead decision needed");
   }
 }
 
-const unresolved = order.filter(function(num) {
-  return merged.indexOf(num) < 0 && escalated.indexOf(num) < 0;
-});
+const workflowComplete = finalVerifyPassed && reviewsAccepted && runComplete && !prWaived && !prFailed &&
+  readyTransitionFailures.length === 0 && (skipPR || prCreated || prSurfaceUnavailable);
 
-// Cleanup: remove child worktrees that persist after completion.
-// Only after all waves, remediation, reviews, and PR are done — retained
-// worktrees are needed for timeout recovery (resume/continue-child).
-if (REPO_PATH) {
+// Preserve child worktrees after incomplete or waived runs so the lead can resume them.
+if (REPO_PATH && workflowComplete) {
   await runs.run("cleanup-worktrees", {
     agent: AG.worker,
     label: "Clean up child worktrees",
@@ -1791,7 +1900,7 @@ if (REPO_PATH) {
 }
 
 return {
-  ok: escalated.length === 0 && unresolved.length === 0 && !reviewsIncomplete,
+  ok: workflowComplete,
   integrationBranch: integrationBranch,
   waves: waveReports.length,
   merged: merged,
@@ -1805,6 +1914,13 @@ return {
   verifications: verifications,
   fixApplied: !!(fixRun && fixRun.ok),
   fixMerged: !!(fixMergerRun && fixMergerRun.ok),
-  prCreated: !!(prRun && prRun.ok),
+  prCreated: prCreated,
+  prSurfaceUnavailable: prSurfaceUnavailable,
+  prFailed: prFailed,
+  prUrl: prUrl,
+  prWaived: prWaived,
+  prWaiverReason: prWaived ? PR_WAIVER_REASON : null,
+  finalVerifyPassed: finalVerifyPassed,
+  readyTransitionFailures: readyTransitionFailures,
   prOutput: prRun && prRun.output ? prRun.output.slice(0, 400) : null
 };
