@@ -13,10 +13,14 @@ async function executeWorkflow(skill, args, options = {}) {
     run(key, config = {}) {
       const call = { key: String(key), ...config };
       calls.push(call);
-      return Promise.resolve(responseFor(call, { ...options, ticketGraph: args.ticketGraph }));
+      return Promise.resolve().then(() => responseFor(call, { ...options, ticketGraph: args.ticketGraph }));
     },
     all(promises) {
-      return Promise.all(promises);
+      return Promise.all(promises).then((results) => {
+        const failed = results.find((result) => !result?.ok);
+        if (failed) throw new Error(failed.error || "child run failed");
+        return results;
+      });
     },
   };
   const execute = new AsyncFunction("args", "runs", "emit", source);
@@ -47,13 +51,16 @@ function responseFor(call, options) {
       ? { ok: false, error: "review fix did not pass", output: "failed" }
       : { ok: true, output: "review fixes ready" };
   }
-  if (key === "final-verify") {
-    return options.finalVerifyPass === false
+  if (key === "final-verify" || key === "final-gate") {
+    return options.finalVerifyPass === false || options.finalGatePass === false
       ? { ok: false, error: "full suite failed", output: "FAILED" }
       : { ok: true, output: "full suite passed" };
   }
   if (key.startsWith("review-")) {
-    return { ok: true, output: "Review verdict: " + (options.reviewVerdict || "OK") + "\nFinding: simulated review finding" };
+    const configured = options.reviewByKey?.[key];
+    if (configured?.error) throw new Error(configured.error);
+    const verdict = typeof configured === "string" ? configured : options.reviewVerdict || "OK";
+    return { ok: true, output: "Review verdict: " + verdict + "\nFinding: simulated review finding" };
   }
   if (key === "pr") {
     if (options.prFail) return { ok: false, error: "request creation failed", output: "PR_FAILED" };
@@ -172,8 +179,8 @@ test("implement-spec suppresses PR when final verification fails, even with a wa
   assert.equal(result.prCreated, false);
   assert.ok(!calls.some((call) => call.key === "pr"));
   const finalVerify = calls.find((call) => call.key === "final-verify");
-  assert.match(finalVerify.task, /Conventional Commit/);
-  assert.match(finalVerify.task, /Issue: <ref>/);
+  assert.match(finalVerify.task, /Full gate: npm test/);
+  assert.match(finalVerify.task, /Do not edit/);
   assert.ok(!calls.some((call) => call.key.startsWith("cleanup")));
 });
 
@@ -316,4 +323,145 @@ test("a user waiver is explicit, drafts the PR, and never reports a green run", 
   assert.match(pr.task, /known test-coverage gap/);
   assert.ok(!calls.some((call) => call.key.includes("transition-ready_for_review")));
   assert.ok(!calls.some((call) => call.key.startsWith("cleanup")));
+});
+
+test("implement preserves a passing review when another axis fails and retries only that axis", async () => {
+  const { calls, result } = await executeWorkflow("implement", singleArgs(), {
+    reviewByKey: { "review-initial-quality": { error: "provider unavailable" } },
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.reviews.map(({ axis, verdict }) => [axis, verdict]), [
+    ["standards", "OK"],
+    ["quality", "OK"],
+  ]);
+  assert.ok(calls.some((call) => call.key === "review-initial-quality-retry-1"));
+  assert.ok(!calls.some((call) => call.key === "review-initial-standards-retry-1"));
+});
+
+test("implement re-reviews a merged review fix before verification and the final full gate", async () => {
+  const { calls, result } = await executeWorkflow("implement", singleArgs({
+    fullGate: "npm run test:full",
+    narrowGate: "npm run test:fast",
+  }), {
+    reviewByKey: {
+      "review-initial-standards": "BLOCK",
+      "review-post-fix-quality": { error: "temporary provider failure" },
+    },
+  });
+  const fixMerge = calls.findIndex((call) => call.key.startsWith("merge-fix-"));
+  const postFixReview = calls.findIndex((call) => call.key === "review-post-fix-standards");
+  const verify = calls.findIndex((call) => call.key === "verify");
+  const finalGate = calls.findIndex((call) => call.key === "final-gate");
+  const pr = calls.findIndex((call) => call.key === "pr");
+  assert.ok(fixMerge >= 0 && fixMerge < postFixReview);
+  assert.ok(postFixReview < verify && verify < finalGate && finalGate < pr);
+  assert.ok(calls.some((call) => call.key === "review-post-fix-quality-retry-1"));
+  assert.equal(result.fixMerged, true);
+  assert.equal(result.reviews.every((review) => review.verdict === "OK"), true);
+  assert.equal(result.fullGatePassed, true);
+  assert.equal(result.ok, true);
+  assert.equal(calls.find((call) => call.key.startsWith("impl-")).gate.command, "npm run test:fast");
+  assert.equal(calls.find((call) => call.key.startsWith("merge-")).gate.command, "npm run test:fast");
+  assert.equal(calls.find((call) => call.key === "final-gate").gate.command, "npm run test:full");
+});
+
+test("implement-spec retries only the reviewer whose initial run failed", async () => {
+  const { calls, result } = await executeWorkflow("implement-spec", specArgs(oneTicket), {
+    reviewByKey: { "review-initial-quality-1": { error: "provider unavailable" } },
+  });
+  assert.equal(result.ok, true);
+  assert.ok(calls.some((call) => call.key === "review-initial-quality-1-retry-1"));
+  assert.ok(!calls.some((call) => call.key === "review-initial-standards-1-retry-1"));
+  const implementer = calls.find((call) => call.label.startsWith("Implement ticket"));
+  const merger = calls.find((call) => call.label.startsWith("Merge ticket"));
+  assert.equal(implementer.gate.command, "npm run test:unit");
+  assert.equal(merger.gate.command, "npm run test:unit");
+  const finalGate = calls.find((call) => call.key === "final-verify");
+  assert.equal(finalGate.gate.command, "npm test");
+});
+
+test("implement-spec re-reviews and re-verifies a review fix before its final full gate", async () => {
+  const { calls, result } = await executeWorkflow("implement-spec", specArgs(oneTicket), {
+    reviewByKey: { "review-initial-quality-1": "BLOCK" },
+  });
+  const fixMerge = calls.findIndex((call) => call.key === "merge-review-fixes");
+  const postFixReview = calls.findIndex((call) => call.key === "review-post-fix-standards-1");
+  const postFixVerify = calls.findIndex((call) => call.key === "verify-post-fix-1-tJRB-012");
+  const finalGate = calls.findIndex((call) => call.key === "final-verify");
+  const pr = calls.findIndex((call) => call.key === "pr");
+  assert.ok(fixMerge >= 0 && fixMerge < postFixReview);
+  assert.ok(postFixReview < postFixVerify && postFixVerify < finalGate && finalGate < pr);
+  assert.equal(result.fixMerged, true);
+  assert.equal(result.finalVerifyPassed, true);
+  assert.equal(result.reviews.every((review) => review.verdict === "OK"), true);
+  assert.equal(result.prCreated, true);
+  const fixImplementer = calls.find((call) => call.key === "fix-review-findings");
+  const fixMerger = calls.find((call) => call.key === "merge-review-fixes");
+  assert.equal(fixImplementer.gate.command, "npm run test:unit");
+  assert.equal(fixMerger.gate.command, "npm run test:unit");
+});
+
+test("implement suppresses a PR when the final full gate fails", async () => {
+  const { calls, result } = await executeWorkflow("implement", singleArgs({
+    fullGate: "npm run test:full",
+    narrowGate: "npm run test:fast",
+  }), { finalGatePass: false });
+  assert.equal(result.ok, false);
+  assert.equal(result.fullGatePassed, false);
+  assert.ok(calls.some((call) => call.key === "final-gate"));
+  assert.ok(!calls.some((call) => call.key === "pr"));
+});
+
+test("implement does not open a PR when the one post-fix review still blocks", async () => {
+  const { calls, result } = await executeWorkflow("implement", singleArgs(), {
+    reviewByKey: {
+      "review-initial-standards": "BLOCK",
+      "review-post-fix-standards": "BLOCK",
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.ok(calls.some((call) => call.key === "review-post-fix-standards"));
+  assert.ok(!calls.some((call) => call.key === "final-gate"));
+  assert.ok(!calls.some((call) => call.key === "pr"));
+});
+
+test("implement-spec does not open a PR when the post-fix review still blocks", async () => {
+  const { calls, result } = await executeWorkflow("implement-spec", specArgs(oneTicket), {
+    reviewByKey: {
+      "review-initial-standards-1": "BLOCK",
+      "review-post-fix-standards-1": "BLOCK",
+    },
+  });
+  assert.equal(result.prCreated, false);
+  assert.ok(calls.some((call) => call.key === "review-post-fix-standards-1"));
+  assert.ok(!calls.some((call) => call.key === "final-verify"));
+  assert.ok(!calls.some((call) => call.key === "pr"));
+});
+
+test("implement-spec can opt selected tickets into full intermediate gates", async () => {
+  const { calls } = await executeWorkflow("implement-spec", specArgs(oneTicket, {
+    fullGateTickets: ["JRB-012"],
+  }));
+  const implementer = calls.find((call) => call.label.startsWith("Implement ticket"));
+  const merger = calls.find((call) => call.label.startsWith("Merge ticket"));
+  assert.equal(implementer.gate.command, "npm test");
+  assert.equal(merger.gate.command, "npm test");
+});
+
+test("both workflows tell agents to record evidence and check adjacent consumers", async () => {
+  const single = await executeWorkflow("implement", singleArgs());
+  const implementer = single.calls.find((call) => call.key.startsWith("impl-"));
+  const verifier = single.calls.find((call) => call.key === "verify");
+  const reviewer = single.calls.find((call) => call.key.startsWith("review-initial-quality"));
+  assert.match(implementer.task, /### Implementation/);
+  assert.match(verifier.task, /### Independent Verification/);
+  assert.match(reviewer.task, /other callers and rendering modes/);
+
+  const spec = await executeWorkflow("implement-spec", specArgs(oneTicket));
+  const specImplementer = spec.calls.find((call) => call.label.startsWith("Implement ticket"));
+  const specVerifier = spec.calls.find((call) => call.label.startsWith("Verify ticket"));
+  const specReviewer = spec.calls.find((call) => call.key.startsWith("review-initial-quality"));
+  assert.match(specImplementer.task, /### Implementation/);
+  assert.match(specVerifier.task, /### Independent Verification/);
+  assert.match(specReviewer.task, /cross-ticket interactions/);
 });

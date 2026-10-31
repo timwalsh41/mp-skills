@@ -22,7 +22,8 @@ subagent({
     specRef: "<spec path or tracker reference>",
     ticketsRef: "<tracker target for this spec's issues>",
     integrationBranch: "<feature-slug>-integration",
-    fullGate: "<full-suite command>",
+    fullGate: "<full verification command>",
+    narrowGate: "<fast verification command>",
     repoPath: "<absolute checkout path>"
   }
 })

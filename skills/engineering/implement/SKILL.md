@@ -9,12 +9,12 @@ Orchestrate implementation of one ticket on its integration branch. The workflow
 ## Steps
 
 1. Read the ticket and `docs/agents/issue-tracker.md`. Follow that document for grooming, ticket fields, status transitions, and resolution. If the ticket is not ready for implementation, groom it through the documented process before launching the workflow.
-2. Read `docs/agents/verification.md` for the full gate, base branch, and PR instructions. Resolve the ticket's branch and integration details from the ticket and repo guidance.
+2. Read `docs/agents/verification.md` for the full and fast gates, base branch, and PR instructions. Resolve the ticket's branch and integration details from the ticket and repo guidance.
 3. Launch the orchestrator and yield. It creates the integration branch when needed, runs the implementation and review workflow, and opens a PR by default when the gates pass. The branch and PR instructions come from the repo docs.
 
 ```js
 subagent({ workflow: "/home/pi/.pi/agent/skills/implement/orchestrate.js", async: true, args: {
-  ticketRef, gate, integrationBranch,
+  ticketRef, fullGate, narrowGate, integrationBranch,
   baseBranch, repoPath,
   gateTimeoutMs, implTimeoutMs,
   maxRemediations, maxReviewRetries,

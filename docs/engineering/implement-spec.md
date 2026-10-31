@@ -29,7 +29,7 @@ Everything lands on one branch. Each implementer:
 2. builds its ticket with [tdd](https://aihero.dev/skills-tdd), red-green one slice at a time,
 3. merges the integration branch tip into its own branch before reporting done, so landing it is a fast-forward.
 
-Lifecycle transitions default to the target repo's `docs/agents/issue-tracker.md`: issues move to In Progress before implementation and Ready for Review after a PR is created. Complete is deferred until a separate post-merge finalization confirms that the PR or integration branch was merged. The PR gate requires the final full-suite check to pass, every in-scope issue to be on the integration branch and independently verified, and complete reviews. `skipPR` stops at the branch. A user can waive completed review blockers with an explicit reason; that creates a draft PR where supported and is reported as non-green, without waiving a failed test gate or unfinished issue.
+Lifecycle transitions default to the target repo's `docs/agents/issue-tracker.md`: issues move to In Progress before implementation and Ready for Review after a PR is created. Complete is deferred until a separate post-merge finalization confirms the merge. Ticket work uses fast gates by default; after any review fix, reviews and affected ticket verifications run again on the updated branch, followed by the full gate on the final commit. `skipPR` stops at the branch. A user can waive completed review blockers with an explicit reason; that creates a draft PR where supported and is reported as non-green, without waiving a failed gate or unfinished issue.
 
 Implementers talk to the orchestrator through [context pointers](https://www.aihero.dev/ai-coding-dictionary/context-pointer) (the spec, the ticket, shared exploration notes, earlier commits) rather than pasted summaries. This keeps each subagent's prompt small and leaves room in the orchestrator's window for the graph.
 
@@ -49,7 +49,7 @@ No, not any more. One user who liked the in-progress version had exactly this co
 
 **Its review and fix loop ran for hours, or kept "fixing" tickets that hadn't been built yet.**
 
-Both happen when `code-review` runs anywhere other than the one point the skill gives it. It compares the code against the whole spec, so it only makes sense once every ticket has landed. If it runs mid-run, every unbuilt ticket reads as a failure. The agent then builds that ticket, and that triggers another review. At the end, the skill runs `code-review` once and sends every finding to one fix subagent, but it doesn't yet say when to stop after that fix. One user reported a five-ticket feature where "the review and fix loop took roughly four hours". If you see a second broad review start, tell it to run focused checks for the fixed findings and stop. Expect that first review to find real problems. The run's output is a draft that the review completes, not something to ship on its own.
+Broad review runs after all in-scope tickets land. If it finds blockers, the workflow runs one isolated fix pass, then re-reviews and re-verifies the updated branch before the final full gate. If findings remain or a review is incomplete, it suppresses the PR and escalates rather than repeating the broad review/fix loop. Expect the initial review to find real problems. The automated review is a gate, not a substitute for your PR review.
 
 **Does it drive tdd like implement does?**
 
@@ -77,7 +77,7 @@ A worktree holds only what git tracks. Tests that read gitignored fixtures, loca
 - A ticket starts as soon as its last blocker lands on the integration branch, not when the whole run ends.
 - Every ticket's trace shows `tdd` running, with a failing test before the code.
 - Merges into the integration branch are fast-forwards, not conflict resolutions.
-- The integration branch contains every in-scope issue and passes the final full-suite gate before any PR opens.
+- The integration branch contains every in-scope issue, has fresh reviews and verification after any review fix, and passes the full-suite gate on that final commit before any PR opens.
 - Issues move to Ready for Review only after PR creation, and to Complete only after merge confirmation.
 
 ## Where it fits

@@ -12,7 +12,7 @@ The target repo should describe its issue-tracker workflow in `docs/agents/issue
 
 ## The run
 
-The workflow creates or uses the configured integration branch, runs the implementation gate, obtains standards and quality reviews, and independently verifies the issue's acceptance criteria. It opens a PR by default only when those checks pass. `skipPR` opts out.
+The workflow uses fast gates during implementation, then runs standards and quality reviews, independent acceptance verification, and the full gate on the final reviewed commit. A review fix gets fresh reviews before PR eligibility. It opens a PR by default only when every gate passes; `skipPR` opts out.
 
 A user can explicitly waive completed review blockers with `prWaiverReason`. That produces a draft PR where the repo supports drafts, records the unresolved findings and reason, and is reported as non-green. It does not waive a failed test gate, incomplete review, or unmet acceptance criteria.
 
@@ -30,7 +30,7 @@ Yes. PR creation is the default after verification and reviews pass. Pass `skipP
 
 **What happens when a reviewer blocks the change?**
 
-The workflow does not open a normal PR. A review blocker can be waived only when the user explicitly provides a reason; the resulting request is a draft where supported and is reported as non-green. Test failures, incomplete reviews, and unmet acceptance criteria cannot be waived through this path.
+The workflow makes one isolated fix pass and reviews the updated commit again. If findings remain or a review is incomplete, it suppresses the PR rather than looping. A user can explicitly waive completed blockers for a non-green draft PR; failed gates, incomplete reviews, and unmet criteria cannot be waived.
 
 **Does `/implement` handle several dependent issues?**
 
@@ -40,6 +40,7 @@ No. It owns one issue at a time. Use [`implement-spec`](https://aihero.dev/skill
 
 - The run stops before coding when the issue fails the documented grooming preflight.
 - The issue moves to In Progress before implementation and Ready for Review only after a PR is created.
+- Any review fix is freshly reviewed, and the full gate passes on the final reviewed commit before a PR can open.
 - The PR is suppressed when verification fails or reviews are incomplete or blocked without an explicit waiver.
 - Complete is recorded only after the merge is independently confirmed.
 - A PR waiver is visible in the draft request and the workflow result remains non-green.

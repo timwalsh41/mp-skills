@@ -12,10 +12,11 @@
 //
 // Required args:
 //   ticketRef           the ticket to implement (e.g. "JRB-008")
-//   gate                this repo's verification command (from docs/agents/verification.md)
+//   fullGate            full verification command; legacy alias: gate
 //   integrationBranch   the feature branch name (e.g. "jrb-008-epic-grooming-exemption")
 //
 // Optional args:
+//   narrowGate          fast host-run gate for intermediate work (default: fullGate)
 //   baseBranch          default "main"
 //   repoPath            absolute path of the checkout (prevents wrong-dir false positives)
 //   finalizeMergedPR    run the merge-confirmation and Complete-transition phase only
@@ -119,6 +120,8 @@ function reviewAxisTask(axis, focus, integrationBranch, baseBranch, repoPath, ti
     "If the branch or ticket does not resolve, answer with one line:",
     "'Review verdict: MISSING_TARGET' plus what was absent, and stop. Do NOT",
     "review nearby or related work instead.",
+    "Trace changed shared files to their other callers and rendering modes; verify",
+    "adjacent workflows support the change end to end or hide unsupported input.",
     "",
     "Report concrete findings with file:line references. Otherwise end with",
     "exactly one line: 'Review verdict: BLOCK' (must-fix defects) or",
@@ -157,9 +160,11 @@ function classifyFailure(result, flakeRe) {
 const A = args || {};
 
 const finalizeMergedPR = boolArg(A.finalizeMergedPR);
+const FULL_GATE = A.fullGate || A.gate || null;
+const NARROW_GATE = A.narrowGate || FULL_GATE;
 const missingArgs = [];
 if (!A.ticketRef) missingArgs.push("ticketRef");
-if (!finalizeMergedPR && !A.gate) missingArgs.push("gate");
+if (!finalizeMergedPR && !FULL_GATE) missingArgs.push("fullGate");
 if (!A.integrationBranch) missingArgs.push("integrationBranch");
 if (finalizeMergedPR && !(A.prUrl || A.mergeRef)) missingArgs.push("prUrl or mergeRef for post-merge confirmation");
 if (missingArgs.length) {
@@ -172,7 +177,6 @@ if (missingArgs.length) {
 }
 
 const ticketRef = String(A.ticketRef);
-const GATE = A.gate || null;
 const integrationBranch = A.integrationBranch;
 const baseRef = "refs/heads/" + integrationBranch;
 const BASE_BRANCH = A.baseBranch || "main";
@@ -289,6 +293,8 @@ if (configErrors.length) {
 emit("implement: ticket=" + ticketRef + " integration=" + integrationBranch +
      " base=" + BASE_BRANCH + " gateTimeoutMs=" + GATE_TIMEOUT_MS +
      " implTimeoutMs=" + IMPL_TIMEOUT_MS +
+     " gates=[full: " + FULL_GATE + "]" +
+     (NARROW_GATE !== FULL_GATE ? " [narrow: " + NARROW_GATE + "]" : "") +
      " maxRemediations=" + MAX_REMEDIATIONS +
      (skipPR ? " skipPR" : ""));
 
@@ -362,13 +368,13 @@ function spawnImplementer() {
     "Rules:",
     "- Implement only this ticket: " + ticketRef,
     "- The orchestrator confirmed this ticket is groomed. If it is not ready, stop and report GROOM_NEEDED instead of implementing or changing lifecycle status.",
-    "- Record acceptance evidence and an implementation summary according to docs/agents/issue-tracker.md.",
+    "- Append the implementation report under `## Agent Execution Evidence` / `### Implementation` in the ticket description, following docs/agents/issue-tracker.md.",
     "- Do not change lifecycle status; the orchestrator owns In Progress and Ready for Review transitions, and Complete is post-merge only.",
-    "- Write/update tests for every criterion (unit/integration/E2E per the spec).",
+    "- Write/update tests for every criterion (unit/integration/E2E per the spec); trace shared files to other callers and protect adjacent workflows.",
     "- Your worktree branches from " + integrationBranch + "; do NOT create branches, worktrees, or spawn subagents.",
     "- Do NOT commit — leave your changes uncommitted; the orchestrator's merger captures and commits them.",
     "",
-    "The verification gate runs on the host after you finish: " + GATE
+    "The intermediate verification gate runs on the host after you finish: " + NARROW_GATE
   );
   return runs.run("impl-t" + keyOf(ticketRef), {
     label: "Implement " + ticketRef,
@@ -377,7 +383,7 @@ function spawnImplementer() {
     worktree: true,
     baseRef: baseRef,
     timeoutMs: IMPL_TIMEOUT_MS,
-    gate: gateObj(GATE, GATE_TIMEOUT_MS),
+    gate: gateObj(NARROW_GATE, GATE_TIMEOUT_MS),
     control: childControl(GATE_TIMEOUT_MS)
   });
 }
@@ -398,7 +404,7 @@ function spawnFixer(priorResult, wave) {
     "1. Find the previous run's captured patch (*.patch file in the directory above).",
     "2. Apply it to YOUR worktree: git apply --whitespace=fix --index <patch>",
     "   (your worktree already branches from " + integrationBranch + ").",
-    "3. Run the gate: " + GATE,
+    "3. Run the intermediate gate: " + NARROW_GATE,
     "4. Fix the failures, re-run the gate until green.",
     "5. Leave changes uncommitted — the orchestrator's merger captures and commits them.",
     "",
@@ -414,7 +420,7 @@ function spawnFixer(priorResult, wave) {
     worktree: true,
     baseRef: baseRef,
     timeoutMs: IMPL_TIMEOUT_MS,
-    gate: gateObj(GATE, GATE_TIMEOUT_MS),
+    gate: gateObj(NARROW_GATE, GATE_TIMEOUT_MS),
     control: childControl(GATE_TIMEOUT_MS)
   });
 }
@@ -446,7 +452,7 @@ function spawnMerger(result, retry) {
     "   git log -1 --format=%s | grep -Eq '^[a-z][a-z0-9-]*(\\([a-z0-9._/-]+\\))?!?: .+'",
     "   git show -s --format=%B HEAD | grep -Fx 'Issue: " + ticketRef + "'",
     "   If either check fails, amend only the message and re-check.",
-    "5. Re-run the gate yourself: " + GATE,
+    "5. Re-run the intermediate gate yourself: " + NARROW_GATE,
     "6. Return: merge status, commit hash, gate result.",
     "",
     "If the patch cannot be found or applied, report FAILURE clearly and change nothing."
@@ -456,32 +462,92 @@ function spawnMerger(result, retry) {
     agent: AG.merger,
     task: task.join("\n"),
     timeoutMs: REVIEW_TIMEOUT_MS,
-    gate: gateObj(GATE, GATE_TIMEOUT_MS),
+    gate: gateObj(NARROW_GATE, GATE_TIMEOUT_MS),
     control: childControl(GATE_TIMEOUT_MS)
   });
 }
 
-// Retry a single UNVERDICTED review axis with a fresh key (bypasses cache reuse).
-function respawnReview(axis, attempt) {
+function reviewRecord(axis, result) {
+  const output = String((result && result.output) || "");
+  return {
+    axis: axis,
+    ok: !!(result && result.ok),
+    verdict: result && result.ok ? parseReviewVerdict(output) : "UNVERDICTED",
+    excerpt: output.slice(0, 4000),
+    error: result && result.error ? String(result.error) : null
+  };
+}
+
+function respawnReview(stage, axis, attempt) {
   const cfg = REVIEW_AXES.filter(function(a) { return a.name === axis; })[0];
-  return runs.run("review-" + axis + "-retry-" + attempt, {
-    label: "Review " + axis + " axis (retry " + attempt + ")",
+  return runs.run("review-" + stage + "-" + axis + "-retry-" + attempt, {
+    label: "Review " + axis + " axis (" + stage + " retry " + attempt + ")",
     agent: cfg.agent,
     task: reviewAxisTask(axis, cfg.focus, integrationBranch, BASE_BRANCH, REPO_PATH, ticketRef),
     timeoutMs: REVIEW_TIMEOUT_MS,
     control: childControl(REVIEW_TIMEOUT_MS)
   });
 }
-function spawnReviews() {
-  return runs.all(REVIEW_AXES.map(function(a) {
-    return runs.run("review-" + a.name, {
-      label: "Review " + a.name + " axis",
-      agent: a.agent,
-      task: reviewAxisTask(a.name, a.focus, integrationBranch, BASE_BRANCH, REPO_PATH, ticketRef),
-      timeoutMs: REVIEW_TIMEOUT_MS,
-      control: childControl(REVIEW_TIMEOUT_MS)
+
+function spawnReviews(stage) {
+  return Promise.all(REVIEW_AXES.map(function(a) {
+    const key = "review-" + stage + "-" + a.name;
+    return Promise.resolve().then(function() {
+      return runs.run(key, {
+        label: "Review " + a.name + " axis (" + stage + ")",
+        agent: a.agent,
+        task: reviewAxisTask(a.name, a.focus, integrationBranch, BASE_BRANCH, REPO_PATH, ticketRef),
+        timeoutMs: REVIEW_TIMEOUT_MS,
+        control: childControl(REVIEW_TIMEOUT_MS)
+      });
+    }).then(function(result) {
+      return reviewRecord(a.name, result);
+    }).catch(function(error) {
+      return reviewRecord(a.name, { ok: false, error: String(error), output: "" });
     });
   }));
+}
+
+function retryUnverdicts(stage, reviews, attempt) {
+  const retryAxes = reviews.filter(function(review) { return review.verdict === "UNVERDICTED"; });
+  if (!retryAxes.length || attempt >= MAX_REVIEW_RETRIES) return Promise.resolve(reviews);
+  const nextAttempt = attempt + 1;
+  emit("implement: retrying UNVERDICTED review axes: " +
+       retryAxes.map(function(review) { return review.axis; }).join(", ") +
+       " (attempt " + nextAttempt + "/" + MAX_REVIEW_RETRIES + ")");
+  return Promise.all(retryAxes.map(function(review) {
+    return Promise.resolve().then(function() {
+      return respawnReview(stage, review.axis, nextAttempt);
+    }).then(function(result) {
+      return reviewRecord(review.axis, result);
+    }).catch(function(error) {
+      return reviewRecord(review.axis, { ok: false, error: String(error), output: "" });
+    });
+  })).then(function(retries) {
+    retries.forEach(function(retry) {
+      const index = reviews.findIndex(function(review) { return review.axis === retry.axis; });
+      reviews[index] = retry;
+    });
+    return retryUnverdicts(stage, reviews, nextAttempt);
+  });
+}
+
+function runReviewPhase(stage) {
+  return spawnReviews(stage).then(function(reviews) {
+    return retryUnverdicts(stage, reviews, 0);
+  });
+}
+
+function summarizeReviews(reviews) {
+  const blockedAxes = reviews.filter(function(review) { return review.verdict === "BLOCK"; });
+  const unreviewedAxes = reviews.filter(function(review) {
+    return review.verdict !== "BLOCK" && review.verdict !== "OK";
+  });
+  return {
+    blockedAxes: blockedAxes,
+    unreviewedAxes: unreviewedAxes,
+    reviewsIncomplete: reviews.length < REVIEW_AXES.length || unreviewedAxes.length > 0
+  };
 }
 
 function spawnVerifier() {
@@ -511,9 +577,9 @@ function spawnVerifier() {
     "evidence: inspect the code and, where meaningful, run the targeted test.",
     "Report each as satisfied/not with evidence (file:line, test name, command, result).",
     "",
-    "Record verification evidence according to docs/agents/issue-tracker.md. Do not",
-    "change lifecycle status or alter acceptance outcomes. Do NOT edit code, commit,",
-    "or spawn subagents.",
+    "Append verification evidence under `## Agent Execution Evidence` / `### Independent Verification` in the ticket description, following docs/agents/issue-tracker.md. Do not",
+    "change lifecycle status or acceptance outcomes. Do NOT edit code, commit,",
+    "or spawn subagents. Trace shared-file consumers and verify affected adjacent workflows too.",
     "",
     "The LAST line of your final response MUST be exactly:",
     "  Verification verdict: OK    — every criterion is satisfied, with evidence",
@@ -525,6 +591,24 @@ function spawnVerifier() {
     task: task.join("\n"),
     timeoutMs: REVIEW_TIMEOUT_MS,
     control: childControl(REVIEW_TIMEOUT_MS)
+  });
+}
+
+function spawnFinalGate() {
+  const task = [
+    "Run the final full verification gate on " + integrationBranch + ".",
+    "Do not edit, stage, commit, or otherwise change code. If the gate fails, report the failure and stop.",
+    "Full gate: " + FULL_GATE
+  ];
+  task.push.apply(task, checkoutHint(REPO_PATH));
+  const taskText = task.join("\n");
+  return runs.run("final-gate", {
+    label: "Run final full gate on " + integrationBranch,
+    agent: AG.merger,
+    task: taskText,
+    timeoutMs: GATE_TIMEOUT_MS + 120000,
+    gate: gateObj(FULL_GATE, GATE_TIMEOUT_MS),
+    control: childControl(GATE_TIMEOUT_MS)
   });
 }
 
@@ -719,67 +803,11 @@ if (!mergeResult || !mergeResult.ok) {
   };
 }
 
-// Phase 2: two-axis review (standards + quality), in parallel.
-let reviewResults = null;
-try {
-  reviewResults = await spawnReviews();
-} catch (e) {
-  emit("implement: review fan-out rejected (" + e + "); proceeding without reviews");
-  reviewResults = [];
-}
-const reviews = reviewResults.map(function(r, i) {
-  const axes = ["standards", "quality"];
-  const out = (r && r.output) ? String(r.output) : "";
-  let verdict;
-  if (!r || !r.ok) verdict = "UNVERDICTED";
-  else verdict = parseReviewVerdict(out);
-  return {
-    axis: axes[i] || ("axis" + i),
-    ok: !!(r && r.ok),
-    verdict: verdict,
-    excerpt: out.slice(0, 4000)
-  };
-});
-
-let blockedAxes = reviews.filter(function(r) { return r.verdict === "BLOCK"; });
-let unreviewedAxes = reviews.filter(function(r) {
-  return r.verdict !== "BLOCK" && r.verdict !== "OK";
-});
-let reviewsIncomplete = reviews.length < 2 || unreviewedAxes.length > 0;
-
-// Retry UNVERDICTED review axes (transient failures like model-provider
-// Cloudflare blocks). Process results individually — a partial runs.all
-// result preserves surviving verdicts instead of discarding all of them.
-let reviewRetryAttempt = 0;
-while (reviewsIncomplete && reviewRetryAttempt < MAX_REVIEW_RETRIES) {
-  reviewRetryAttempt = reviewRetryAttempt + 1;
-  const retryAxes = reviews.filter(function(r) { return r.verdict === "UNVERDICTED"; });
-  if (!retryAxes.length) break;
-  emit("implement: retrying UNVERDICTED review axes: " +
-       retryAxes.map(function(r) { return r.axis; }).join(", ") +
-       " (attempt " + reviewRetryAttempt + "/" + MAX_REVIEW_RETRIES + ")");
-  const retryResults = await Promise.all(retryAxes.map(function(r) {
-    return respawnReview(r.axis, reviewRetryAttempt)
-      .then(function(res) { return res; })
-      .catch(function(e) {
-        return { ok: false, error: String(e), output: "", runId: null };
-      });
-  }));
-  retryAxes.forEach(function(r, i) {
-    const res = retryResults[i];
-    const out = (res && res.output) ? String(res.output) : "";
-    let verdict = "UNVERDICTED";
-    if (res && res.ok) verdict = parseReviewVerdict(out);
-    const idx = reviews.findIndex(function(x) { return x.axis === r.axis; });
-    reviews[idx] = { axis: r.axis, ok: !!(res && res.ok), verdict: verdict, excerpt: out.slice(0, 4000) };
-  });
-  blockedAxes = reviews.filter(function(r) { return r.verdict === "BLOCK"; });
-  unreviewedAxes = reviews.filter(function(r) {
-    return r.verdict !== "BLOCK" && r.verdict !== "OK";
-  });
-  reviewsIncomplete = reviews.length < 2 || unreviewedAxes.length > 0;
-}
-
+// Phase 2: review both axes, preserving each result if another child fails.
+let reviews = await runReviewPhase("initial");
+let reviewSummary = summarizeReviews(reviews);
+let blockedAxes = reviewSummary.blockedAxes;
+let reviewsIncomplete = reviewSummary.reviewsIncomplete;
 let fixApplied = false;
 let fixMerged = false;
 
@@ -791,7 +819,7 @@ if (blockedAxes.length && !(PR_WAIVER_REASON && !skipPR)) {
     JSON.stringify(blockedAxes, null, 2),
     "",
     "Fix must-fix defects in YOUR managed worktree (already branched from",
-    integrationBranch + "), keep the gate green: " + GATE,
+    integrationBranch + "), keep the intermediate gate green: " + NARROW_GATE,
     "",
     "Leave changes uncommitted — the orchestrator's merger captures and commits them.",
     "Do NOT spawn subagents. End with the acceptance-report block."
@@ -805,7 +833,7 @@ if (blockedAxes.length && !(PR_WAIVER_REASON && !skipPR)) {
       worktree: true,
       baseRef: baseRef,
       timeoutMs: IMPL_TIMEOUT_MS,
-      gate: gateObj(GATE, GATE_TIMEOUT_MS),
+      gate: gateObj(NARROW_GATE, GATE_TIMEOUT_MS),
       control: childControl(GATE_TIMEOUT_MS)
     });
   } catch (eFx) {
@@ -831,10 +859,12 @@ if (blockedAxes.length && !(PR_WAIVER_REASON && !skipPR)) {
         task: "The merge-review-fixes child reported failure, but its work may already be committed. " +
           "Confirm: (1) checkout is on " + integrationBranch + " and clean; " +
           "(2) the fixer's changes are present (git log --oneline main.." + integrationBranch +
-          " shows commits beyond the original implementation); (3) the gate " + GATE +
+          " shows commits beyond the original implementation); (3) the intermediate gate " + NARROW_GATE +
           " passes. If (3) passes and (2) shows changes, report MERGE_EFFECTIVE. " +
           "If the changes are NOT present, report MERGE_MISSING. " + checkoutHint(REPO_PATH),
-        timeoutMs: GATE_TIMEOUT_MS,
+        timeoutMs: GATE_TIMEOUT_MS + 120000,
+        gate: gateObj(NARROW_GATE, GATE_TIMEOUT_MS),
+        control: childControl(GATE_TIMEOUT_MS),
         quiet: true
       }).catch(function(e) {
         emit("implement: fix-merge verification rejected (" + e + ")");
@@ -857,6 +887,10 @@ if (blockedAxes.length && !(PR_WAIVER_REASON && !skipPR)) {
         };
       }
     }
+    reviews = await runReviewPhase("post-fix");
+    reviewSummary = summarizeReviews(reviews);
+    blockedAxes = reviewSummary.blockedAxes;
+    reviewsIncomplete = reviewSummary.reviewsIncomplete;
   } else {
     return {
       ok: false,
@@ -866,6 +900,20 @@ if (blockedAxes.length && !(PR_WAIVER_REASON && !skipPR)) {
       failureClass: "review-fix"
     };
   }
+}
+
+const reviewsOk = !reviewsIncomplete && blockedAxes.length === 0;
+const waivedReviewBlock = !skipPR && !reviewsOk && !reviewsIncomplete && blockedAxes.length > 0 && !!PR_WAIVER_REASON;
+if (!reviewsOk && !waivedReviewBlock) {
+  return {
+    ok: false,
+    error: "ESCALATION: review is incomplete or blocked for " + ticketRef + ". PR suppressed. " +
+      (reviewsIncomplete ? "An axis returned no 'Review verdict:' line (treated as INCOMPLETE, not a pass)." : ""),
+    escalated: true,
+    ticket: ticketRef,
+    reviews: reviews,
+    reviewsIncomplete: reviewsIncomplete
+  };
 }
 
 // Phase 3: independent verification of the ticket's acceptance criteria.
@@ -892,18 +940,22 @@ if (verificationVerdict !== "OK") {
   };
 }
 
-// Phase 4: open the PR only when the tree is in a known-good state.
-const reviewsOk = !reviewsIncomplete && blockedAxes.length === 0;
-const waivedReviewBlock = !skipPR && !reviewsOk && !reviewsIncomplete && blockedAxes.length > 0 && !!PR_WAIVER_REASON;
-if (!reviewsOk && !waivedReviewBlock) {
+// Phase 4: full gate on the final reviewed commit, before the PR.
+let finalGateResult = null;
+try {
+  finalGateResult = await spawnFinalGate();
+} catch (eGate) {
+  emit("implement: final full gate rejected (" + eGate + ")");
+}
+const fullGatePassed = !!(finalGateResult && finalGateResult.ok);
+if (!fullGatePassed) {
   return {
     ok: false,
-    error: "ESCALATION: review is incomplete or blocked for " + ticketRef + ". PR suppressed. " +
-      (reviewsIncomplete ? "An axis returned no 'Review verdict:' line (treated as INCOMPLETE, not a pass)." : ""),
+    error: "ESCALATION: final full gate failed on " + integrationBranch + ". PR suppressed.",
     escalated: true,
     ticket: ticketRef,
-    reviews: reviews,
-    reviewsIncomplete: reviewsIncomplete
+    fullGatePassed: false,
+    finalGate: finalGateResult && finalGateResult.output ? String(finalGateResult.output).slice(0, 2000) : null
   };
 }
 
@@ -964,7 +1016,10 @@ return {
   ticket: ticketRef,
   integrationBranch: integrationBranch,
   baseBranch: BASE_BRANCH,
-  gate: GATE,
+  gate: FULL_GATE,
+  fullGate: FULL_GATE,
+  narrowGate: NARROW_GATE,
+  fullGatePassed: fullGatePassed,
   remediationAttempts: remediationAttempt,
   reviews: reviews,
   verification: verificationVerdict,
