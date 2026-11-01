@@ -30,70 +30,113 @@ async function executeWorkflow(skill, args, options = {}) {
 
 function responseFor(call, options) {
   const { key, label = "", task = "" } = call;
-  if (key === "ensure-integration-branch") return { ok: true, output: "BRANCH_EXISTS" };
+  if (key === "ensure-integration-branch") return { ok: true, runId: "r-ensure", output: "branch ensured" };
   if (key === "preflight-clean-tree") {
+    // The orchestrator decides the tree state from the host-run gate, so a
+    // dirty tree surfaces as a failed run, not as prose.
     return options.dirtyTree
-      ? { ok: false, error: "git status reported changes", output: "DIRTY_TREE\n?? leftover.py" }
-      : { ok: true, output: "CLEAN_TREE" };
+      ? { ok: false, error: "gate failed: DIRTY_TREE ?? leftover.py" }
+      : { ok: true, runId: "r-preflight", output: "clean" };
   }
   if (key.startsWith("groom-check-")) {
-    return { ok: true, output: options.groomed === false ? "GROOM_NEEDED" : "GROOMED_OK" };
+    return {
+      ok: true,
+      runId: "r-groom",
+      output: "groom check done",
+      structuredOutput: { groomed: options.groomed !== false, missing: options.groomed === false ? "approach,test plan" : "" },
+    };
   }
   if (key === "ticket-graph-forced" || key === "ticket-graph") {
-    return { ok: true, output: JSON.stringify(options.ticketGraph) };
+    return { ok: true, runId: "r-graph", output: JSON.stringify(options.ticketGraph) };
   }
   if (key === "confirm-merge" || key.startsWith("verify-merge-") || key.startsWith("confirm-merge-")) {
-    return { ok: true, output: options.mergeConfirmed === false ? "MERGE_NOT_CONFIRMED" : "MERGED_CONFIRMED" };
+    return {
+      ok: true,
+      runId: "r-confirm",
+      output: "merge confirmation checked",
+      structuredOutput: { confirmed: options.mergeConfirmed !== false, evidence: "tracker state" },
+    };
   }
   if (key.startsWith("transition-")) {
     const phase = key.split("-")[1];
-    return options.transitionFailPhase === phase
-      ? { ok: true, output: "TRANSITION_FAILED: simulated" }
-      : { ok: true, output: "TRANSITION_APPLIED" };
+    return {
+      ok: true,
+      runId: "r-transition",
+      output: "transition attempted",
+      structuredOutput: { outcome: options.transitionFailPhase === phase ? "TRANSITION_FAILED" : "TRANSITION_APPLIED", resultingStatus: "In Progress" },
+    };
   }
   if (key === "fix-review-findings") {
     return options.reviewFixPass === false
       ? { ok: false, error: "review fix did not pass", output: "failed" }
-      : { ok: true, output: "review fixes ready" };
+      : { ok: true, runId: "r-fix-review", output: "review fixes ready" };
+  }
+  if (key === "merge-review-fixes" && options.fixMergeFail) {
+    return { ok: false, error: "merge rejected: simulated", output: "failed" };
   }
   if (key.startsWith("fix-t") || /^fix-\d+-t/.test(key)) {
     return options.fixFail
       ? { ok: false, error: options.fixFail, output: "failed" }
-      : { ok: true, output: "fix applied" };
+      : { ok: true, runId: "r-fix", output: "fix applied" };
   }
   if (key === "final-verify" || key === "final-gate") {
     return options.finalVerifyPass === false || options.finalGatePass === false
       ? { ok: false, error: "full suite failed", output: "FAILED" }
-      : { ok: true, output: "full suite passed" };
+      : { ok: true, runId: "r-final-gate", output: "full suite passed" };
+  }
+  if (key.startsWith("verify-fix-merge-")) {
+    return {
+      ok: true,
+      runId: "r-verify-fix-merge",
+      output: "fix-merge state checked",
+      structuredOutput: { mergeState: options.fixMergeMissing ? "MERGE_MISSING" : "MERGE_EFFECTIVE" },
+    };
+  }
+  if (key === "verify" || key.startsWith("verify-") || key.startsWith("verify-post-fix")) {
+    if (label.startsWith("Verify ")) {
+      return { ok: true, runId: "r-verify", output: "verified", structuredOutput: { verdict: "OK", criteria: [] } };
+    }
   }
   if (key.startsWith("review-")) {
     const configured = options.reviewByKey?.[key];
     if (configured?.error) throw new Error(configured.error);
     const verdict = typeof configured === "string" ? configured : options.reviewVerdict || "OK";
-    return { ok: true, output: "Review verdict: " + verdict + "\nFinding: simulated review finding" };
+    return {
+      ok: true,
+      runId: "r-review",
+      output: "simulated review finding",
+      structuredOutput: { verdict, findings: "simulated review finding" },
+    };
   }
   if (key === "pr") {
     if (options.prFail) return { ok: false, error: "request creation failed", output: "PR_FAILED" };
-    return { ok: true, output: options.noPrSurface ? "NO_PR_SURFACE" : "PR_CREATED: https://example.test/pull/42" };
+    return {
+      ok: true,
+      runId: "r-pr",
+      output: "request opened",
+      structuredOutput: options.noPrSurface ? { noPrSurface: true } : { prUrl: "https://example.test/pull/42", noPrSurface: false },
+    };
   }
-  if (key.startsWith("cleanup")) return { ok: true, output: "WORKTREES_CLEANED" };
+  if (key.startsWith("cleanup")) return { ok: true, runId: "r-cleanup", output: "WORKTREES_CLEANED" };
   if (label.startsWith("Validate ticket ")) {
-    return { ok: true, output: options.groomed === false ? "GROOM_NEEDED" : "GROOMED_OK" };
+    return {
+      ok: true,
+      runId: "r-groom",
+      output: "groom check done",
+      structuredOutput: { groomed: options.groomed !== false, missing: "" },
+    };
   }
   if (label.startsWith("Implement ticket ") || label.startsWith("Implement JRB-")) {
     if (options.implFail) return { ok: false, error: options.implFail, output: "failed" };
-    return { ok: true, output: "implementation complete" };
+    return { ok: true, runId: "r-impl", output: "implementation complete" };
   }
-  if (label.startsWith("Merge ticket ") || label.startsWith("merge-")) {
-    return { ok: true, output: "merge complete" };
-  }
-  if (label.startsWith("Verify JRB-") || key.startsWith("verify-")) {
-    return { ok: true, output: "Verification verdict: OK" };
+  if (label.startsWith("Merge ticket ") || label.startsWith("merge-") || label.startsWith("Commit and merge")) {
+    return { ok: true, runId: "r-merge", output: "merge complete" };
   }
   if (label.startsWith("Transition ")) {
-    return { ok: true, output: task.includes("MERGE_NOT_CONFIRMED") ? "MERGE_NOT_CONFIRMED" : "TRANSITION_APPLIED" };
+    return { ok: true, runId: "r-transition", output: "transition attempted", structuredOutput: { outcome: "TRANSITION_APPLIED" } };
   }
-  return { ok: true, output: "ok" };
+  return { ok: true, runId: "r-child", output: "ok" };
 }
 
 function singleArgs(overrides = {}) {
@@ -571,4 +614,137 @@ test("both workflows record evidence with reconcile-never-append semantics", asy
   const spec = await executeWorkflow("implement-spec", specArgs(oneTicket));
   assert.match(spec.calls.find((call) => call.label.startsWith("Implement ticket")).task, /Reconcile, never append/);
   assert.match(spec.calls.find((call) => call.label.startsWith("Verify ticket")).task, /CORRECT stale or contradictory/);
+});
+
+// ---------------------------------------------------------------------------
+// Contract tests: the orchestrator decides pass/fail from host gates and
+// structured output, never from scanning child prose (JRB-016/JRB-017).
+// ---------------------------------------------------------------------------
+
+const SOURCES = {
+  implement: await readFile(new URL("../skills/engineering/implement/orchestrate.js", import.meta.url), "utf8"),
+  "implement-spec": await readFile(new URL("../skills/engineering/implement-spec/orchestrate.js", import.meta.url), "utf8"),
+};
+
+for (const [skill, source] of Object.entries(SOURCES)) {
+  test(`${skill} never decides outcomes by scanning child prose for tokens`, async () => {
+    // Verdict tokens must appear only inside structured-output schema enums,
+    // never as indexOf/regex scans over child output.
+    assert.doesNotMatch(source, /indexOf\("(?:Review verdict|Verification verdict|MERGE_EFFECTIVE|MERGE_MISSING|CLEAN_TREE|DIRTY_TREE|GROOM_NEEDED|GROOMED_OK|BRANCH_EXISTS|BRANCH_CREATED|MERGED_CONFIRMED|NO_PR_SURFACE)"/);
+    assert.doesNotMatch(source, /\/Review verdict|\/Verification verdict|\/MERGE_EFFECTIVE|\/FLAKE_CONFIRMED_TRANSIENT/);
+    assert.doesNotMatch(source, /PR_CREATED:\\s\*\(/);
+    assert.doesNotMatch(source, /match\(\/WORKTREE_PATH/);
+    assert.doesNotMatch(source, /test\(String\((?:r && r\.)?output \|\| ""\)\) && \/TRANSITION_APPLIED/);
+  });
+
+  test(`${skill} never passes acceptanceRole as a run param (it is agent config only)`, async () => {
+    assert.ok(!source.includes('acceptanceRole:'));
+  });
+
+  test(`${skill} declares the shared structured-verdict schemas`, async () => {
+    for (const name of [
+      "REVIEW_OUTPUT_SCHEMA",
+      "VERIFY_OUTPUT_SCHEMA",
+      "PR_OUTPUT_SCHEMA",
+      "TRANSITION_OUTPUT_SCHEMA",
+      "CONFIRM_MERGE_OUTPUT_SCHEMA",
+      "MERGE_STATE_OUTPUT_SCHEMA",
+    ]) {
+      assert.ok(source.includes(`const ${name} =`), `${name} missing from ${skill}`);
+    }
+  });
+}
+
+test("both workflows give verdict-bearing children an outputSchema", async () => {
+  const single = await executeWorkflow("implement", singleArgs());
+  const reviews = single.calls.filter((call) => call.key.startsWith("review-"));
+  assert.ok(reviews.length > 0);
+  assert.ok(reviews.every((call) => call.outputSchema?.properties?.verdict?.enum?.join(",") === "OK,BLOCK,MISSING_TARGET"));
+  assert.equal(single.calls.find((call) => call.key === "verify").outputSchema.properties.verdict.enum.join(","), "OK,UNMET");
+  assert.equal(single.calls.find((call) => call.key === "pr").outputSchema.required.join(","), "noPrSurface");
+  const transitions = single.calls.filter((call) => call.key.startsWith("transition-"));
+  assert.ok(transitions.every((call) => call.outputSchema?.properties?.outcome?.enum?.includes("TRANSITION_APPLIED")));
+  const groom = single.calls.find((call) => call.key.startsWith("groom-check-"));
+  assert.equal(groom.outputSchema.properties.groomed.type, "boolean");
+
+  const spec = await executeWorkflow("implement-spec", specArgs(oneTicket));
+  const specReviews = spec.calls.filter((call) => call.key.startsWith("review-"));
+  assert.ok(specReviews.every((call) => call.outputSchema?.properties?.verdict?.enum?.join(",") === "OK,BLOCK,MISSING_TARGET"));
+  assert.ok(spec.calls.some((call) => call.label.startsWith("Verify ticket") && call.outputSchema?.properties?.verdict));
+  assert.equal(spec.calls.find((call) => call.key === "pr").outputSchema.properties.verdict, undefined);
+});
+
+test("both workflows decide merger and final-gate success without acceptance reports", async () => {
+  const single = await executeWorkflow("implement", singleArgs());
+  const gateDecided = single.calls.filter((call) =>
+    call.agent === "merger" || call.key === "preflight-clean-tree" || call.key === "ensure-integration-branch");
+  assert.ok(gateDecided.length > 0);
+  assert.ok(gateDecided.every((call) => call.acceptance === false));
+  assert.ok(single.calls.find((call) => call.key === "final-gate").acceptance === false);
+  // Implementers keep the harness's default acceptance: they own a real
+  // acceptance report, and their gate + report together decide success.
+  assert.equal(single.calls.find((call) => call.key.startsWith("impl-")).acceptance, undefined);
+
+  const spec = await executeWorkflow("implement-spec", specArgs(oneTicket));
+  const specGateDecided = spec.calls.filter((call) =>
+    call.agent === "merger" || call.key === "preflight-clean-tree" || call.key === "ensure-integration-branch");
+  assert.ok(specGateDecided.length > 0);
+  assert.ok(specGateDecided.every((call) => call.acceptance === false));
+  assert.ok(spec.calls.find((call) => call.key === "final-verify").acceptance === false);
+});
+
+test("merger idempotency is content-based, not trailer-based", async () => {
+  const single = await executeWorkflow("implement", singleArgs());
+  const merge = single.calls.find((call) => call.key.startsWith("merge-"));
+  assert.match(merge.task, /git apply --check --reverse/);
+  // The old idempotency decision grepped commit bodies for the ticket
+  // trailer; that check must be gone (the post-commit trailer VALIDATION in
+  // step 5 legitimately keeps its grep).
+  assert.ok(!merge.task.includes("git log --format=%B"));
+  assert.match(merge.task, /JRB-017/);
+
+  const spec = await executeWorkflow("implement-spec", specArgs(oneTicket));
+  const specMerge = spec.calls.find((call) => call.label.startsWith("Merge ticket"));
+  assert.match(specMerge.task, /git apply --check --reverse/);
+  assert.ok(!specMerge.task.includes("git log --format=%B"));
+});
+
+test("clean-tree and branch preflights are decided by host gates, not child prose", async () => {
+  const single = await executeWorkflow("implement", singleArgs());
+  const preflight = single.calls.find((call) => call.key === "preflight-clean-tree");
+  assert.match(preflight.gate.command, /status --porcelain/);
+  const ensure = single.calls.find((call) => call.key === "ensure-integration-branch");
+  assert.match(ensure.gate.command, /rev-parse --verify refs\/heads\/feature\/JRB-012-modal-dismissal/);
+
+  const spec = await executeWorkflow("implement-spec", specArgs(oneTicket));
+  const specPreflight = spec.calls.find((call) => call.key === "preflight-clean-tree");
+  assert.match(specPreflight.gate.command, /status --porcelain/);
+});
+
+test("implement-spec verifies a failed fix-merge against git state with a valid run key", async () => {
+  // Regression: the verify-fix-merge run key used keyOf(ticket.ref) with
+  // ticket undefined at that scope, throwing a ReferenceError mid-run.
+  const { calls, result } = await executeWorkflow("implement-spec", specArgs(oneTicket), {
+    reviewVerdict: "BLOCK",
+    fixMergeFail: true,
+  });
+  const gmVerify = calls.find((call) => call.key.startsWith("verify-fix-merge-"));
+  assert.ok(gmVerify, "verify-fix-merge child should run when the fix merger fails");
+  assert.ok(!gmVerify.key.includes("undefined"));
+  assert.equal(gmVerify.outputSchema.properties.mergeState.enum.join(","), "MERGE_EFFECTIVE,MERGE_MISSING");
+  assert.equal(gmVerify.acceptance, false);
+  assert.equal(result.fixMerged, true);
+  const specFixMergeTask = calls.find((call) => call.key === "merge-review-fixes");
+  assert.match(specFixMergeTask.task, /git apply --check --reverse/);
+  assert.ok(!specFixMergeTask.task.includes("git log --format=%B"));
+});
+
+test("implement-spec reads the continue-child's worktree from structured output", async () => {
+  const { calls } = await executeWorkflow("implement-spec", specArgs(oneTicket), {
+    implFail: "child timed out after deadline",
+  });
+  const continueChild = calls.find((call) => call.key.startsWith("continue-"));
+  assert.ok(continueChild, "a timed-out implementer should fall through to the continue-child");
+  assert.equal(continueChild.outputSchema.properties.worktreePath.type, "string");
+  assert.ok(!continueChild.task.includes("ABSOLUTE LAST LINE"));
 });

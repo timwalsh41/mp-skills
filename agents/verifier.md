@@ -34,16 +34,10 @@ You are a **verifier subagent**. One already-implemented ticket is assigned to y
 
 Per-criterion verdict — satisfied / not satisfied (+ why) — and, for each, the evidence (file:line, test command/result). Do not report a checkbox tally; report verified status.
 
-End your response with exactly one of these lines, and nothing after it:
+Finish by calling the harness's `structured_output` tool:
 
-```
-Verification verdict: OK
-```
-when every acceptance criterion is satisfied, with evidence for each.
+- `verdict`: `"OK"` when every acceptance criterion is satisfied, `"UNMET"` when at least one is not
+- `criteria`: one entry per criterion, with `criterion`, `satisfied`, and `evidence`
+- `unmet`: when the verdict is `UNMET`, name the unmet criteria
 
-```
-Verification verdict: UNMET
-```
-when at least one criterion is not satisfied — name the unmet criteria above it.
-
-A response without one of these lines is treated as NOT verified, whatever its content says.
+A response without a valid structured verdict is treated as NOT verified, whatever its prose says. Your prose keeps the full evidence; the structured verdict carries only the outcome.

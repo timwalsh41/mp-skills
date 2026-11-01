@@ -5,7 +5,7 @@
 // action on the world goes through child agents via runs.run / runs.all.
 //
 // Some helpers below (numArg, boolArg, gateObj, childControl, checkoutHint,
-// reviewAxisTask, parseReviewVerdict, parseVerification, classifyFailure) are
+// reviewAxisTask, classifyFailure) are
 // shared with implement/orchestrate.js — the /implement workflow inlines its
 // own copies, because the Pi workflow sandbox has no import/require mechanism.
 // If Pi adds module support to the workflow sandbox, these should be extracted
@@ -220,9 +220,7 @@ function runTransition(phase, ref, variables) {
         "Issue: " + ref,
         "Branch: " + String(variables.branch || ""),
         "PR URL: " + String(variables.prUrl || ""),
-        "Use the documented transition only. If the tracker explicitly has no such lifecycle transition, report TRANSITION_UNSUPPORTED without changing state.",
-        "Otherwise report exactly TRANSITION_APPLIED, TRANSITION_ALREADY_SET, TRANSITION_FAILED, or TRANSITION_STATE_MISMATCH, with the resulting status and any error.",
-        "Do not modify code, other issues, or repository files."
+        "Use the documented transition only. Do not modify code, other issues, or repository files.",
       ].join("\n");
   return runs.run("transition-" + phase + "-" + keyOf(ref), {
     agent: AG.worker,
@@ -235,30 +233,31 @@ function runTransition(phase, ref, variables) {
       "\nReport the HTTP status code or error. Change nothing else.",
     timeoutMs: TRANSITION_TIMEOUT_MS,
     quiet: true,
+    outputSchema: TRANSITION_OUTPUT_SCHEMA,
     // Lifecycle writes are decided by the tracker's state, not by this
-    // child's prose; declaring read-only keeps the harness from demanding an
-    // acceptance report that a transition child cannot meaningfully produce.
-    acceptanceRole: "read-only"
+    // child's prose; the outcome is read from the structured result, and no
+    // acceptance report is demanded from a transition child.
+    acceptance: false
   }).then(function(r) {
-    const output = String((r && r.output) || "");
-    const unsupported = output.indexOf("TRANSITION_UNSUPPORTED") >= 0;
-    // Firewall is state-verified, not prose-scanned: a compliant child that
-    // merely reports "No Agent Execution Evidence" must not trip it
-    // (JRB-016 false positive aborted the whole run). Pass requires a
-    // positive transition token; TRANSITION_STATE_MISMATCH means the phase
-    // lock refused an out-of-order lifecycle jump and is a failure.
-    const ok = !!(r && r.ok) &&
-      (unsupported || !/TRANSITION_FAILED|TRACKER_DOC_MISSING|TRANSITION_UNCLEAR|TRANSITION_STATE_MISMATCH/.test(output));
-    emit("implement-spec: transition " + phase + " for " + ref + " -- " + (unsupported ? "unsupported by tracker" : (ok ? "done" : "failed")));
-    return { ok: ok, output: output, unsupported: unsupported };
+    const structured = (r && r.structuredOutput) || null;
+    const outcome = structured && typeof structured.outcome === "string" ? structured.outcome : null;
+    const unsupported = outcome === "TRANSITION_UNSUPPORTED";
+    // TRANSITION_APPLIED / TRANSITION_ALREADY_SET are the only positive
+    // outcomes for the requested phase. TRANSITION_FAILED and
+    // TRANSITION_STATE_MISMATCH are failures. A child that never produced a
+    // structured outcome counts as failed (the harness rejects it first).
+    const ok = !!(r && r.ok) && (outcome === "TRANSITION_APPLIED" || outcome === "TRANSITION_ALREADY_SET");
+    emit("implement-spec: transition " + phase + " for " + ref + " -- " + (unsupported ? "unsupported by tracker" : (ok ? "done" : "failed (" + (outcome || "no structured outcome") + ")")));
+    return { ok: ok, output: String((r && r.output) || "") + (structured ? "\n[outcome] " + outcome : ""), unsupported: unsupported };
   });
 }
 function parsePrWriterResult(result) {
-  const output = String((result && result.output) || "");
-  const match = output.match(/(?:^|\n)PR_CREATED:\s*(https?:\/\/[^\s]+)/);
+  const structured = (result && result.structuredOutput) || null;
+  const url = structured && typeof structured.prUrl === "string" && structured.prUrl.trim()
+    ? structured.prUrl.trim() : null;
   return {
-    url: match ? match[1] : null,
-    noPrSurface: /(?:^|\n)NO_PR_SURFACE(?:\n|$)/.test(output)
+    url: url,
+    noPrSurface: !!(structured && structured.noPrSurface)
   };
 }
 function confirmMerged(refs, mergeRef) {
@@ -271,10 +270,14 @@ function confirmMerged(refs, mergeRef) {
       "Issues: " + refs.join(", "),
       "Integration branch: " + integrationBranch,
       "Merge or PR reference: " + mergeRef,
-      "Do not change issue statuses. Report exactly MERGED_CONFIRMED or MERGE_NOT_CONFIRMED, with evidence."
+      "Do not change issue statuses. Report the outcome through structured_output:",
+      "confirmed: true when the documented process confirms the work reached its",
+      "completion point, false otherwise, plus the evidence you relied on."
     ].join("\n"),
     timeoutMs: TRANSITION_TIMEOUT_MS,
-    quiet: true
+    quiet: true,
+    outputSchema: CONFIRM_MERGE_OUTPUT_SCHEMA,
+    acceptance: false
   });
 }
 
@@ -304,6 +307,102 @@ const REVIEW_AXES = [
   { name: "spec", agent: AG.reviewerSpec, focus: "does the integrated work satisfy the spec and ticket acceptance criteria" },
   { name: "quality", agent: AG.reviewerQuality, focus: "correctness, robustness, test coverage, maintainability" }
 ];
+
+// Structured verdict schemas. Verdict-bearing children must finish by calling
+// the harness's structured_output tool with one of these shapes; the workflow
+// reads result.structuredOutput and never parses the child's prose.
+// (JRB-016/JRB-017: prose token parsing rejected green children and misread
+// compliance statements.)
+const REVIEW_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    verdict: { type: "string", enum: ["OK", "BLOCK", "MISSING_TARGET"] },
+    findings: { type: "string" },
+    missingTarget: { type: "string" }
+  },
+  required: ["verdict"],
+  additionalProperties: false
+};
+const VERIFY_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    verdict: { type: "string", enum: ["OK", "UNMET"] },
+    criteria: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          criterion: { type: "string" },
+          satisfied: { type: "boolean" },
+          evidence: { type: "string" }
+        },
+        required: ["criterion", "satisfied"],
+        additionalProperties: false
+      }
+    },
+    unmet: { type: "string" }
+  },
+  required: ["verdict"],
+  additionalProperties: false
+};
+const PR_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    prUrl: { type: "string" },
+    noPrSurface: { type: "boolean" }
+  },
+  required: ["noPrSurface"],
+  additionalProperties: false
+};
+const TRANSITION_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    outcome: {
+      type: "string",
+      enum: ["TRANSITION_APPLIED", "TRANSITION_ALREADY_SET", "TRANSITION_FAILED", "TRANSITION_UNSUPPORTED", "TRANSITION_STATE_MISMATCH"]
+    },
+    resultingStatus: { type: "string" },
+    detail: { type: "string" }
+  },
+  required: ["outcome"],
+  additionalProperties: false
+};
+const CONFIRM_MERGE_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    confirmed: { type: "boolean" },
+    evidence: { type: "string" }
+  },
+  required: ["confirmed"],
+  additionalProperties: false
+};
+const MERGE_STATE_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    mergeState: { type: "string", enum: ["MERGE_EFFECTIVE", "MERGE_MISSING"] }
+  },
+  required: ["mergeState"],
+  additionalProperties: false
+};
+const WORKTREE_PATH_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    worktreePath: { type: "string" }
+  },
+  required: ["worktreePath"],
+  additionalProperties: false
+};
+const FLAKE_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    outcome: { type: "string", enum: ["FLAKE_CONFIRMED_TRANSIENT", "FLAKE_PERSISTENT", "WORKTREE_NOT_FOUND"] },
+    testPath: { type: "string" },
+    detail: { type: "string" }
+  },
+  required: ["outcome"],
+  additionalProperties: false
+};
+const REVIEW_VERDICTS = ["OK", "BLOCK", "MISSING_TARGET"];
 
 const IMPL_TIMEOUT_MS = numArg(A.implTimeoutMs, 75 * 60 * 1000);
 const MERGE_TIMEOUT_MS = numArg(A.mergeTimeoutMs, 20 * 60 * 1000);
@@ -667,9 +766,8 @@ function spawnContinueChild(ticket, runId, wave) {
     "3. Finish the remaining criteria, keep the gate green yourself: " + gateCommand(ticket.ref),
     "4. Leave changes uncommitted. Do NOT commit, stage, or spawn subagents.",
     "",
-    "The ABSOLUTE LAST LINE of your final response MUST be exactly:",
-    "WORKTREE_PATH: /absolute/path/to/the/worktree",
-    "so the orchestrator can hand your worktree to the merger."
+    "Finish by calling structured_output with worktreePath: the absolute path of",
+    "the worktree you worked in, so the orchestrator can hand it to the merger."
   ].join("\n");
   return runs.run(key, {
     label: "Continue ticket " + ticket.ref + " (finish timed-out work in place)",
@@ -677,7 +775,8 @@ function spawnContinueChild(ticket, runId, wave) {
     task: task,
     timeoutMs: IMPL_TIMEOUT_MS,
     gate: gateFor(ticket.ref),
-    control: childControl()
+    control: childControl(),
+    outputSchema: WORKTREE_PATH_OUTPUT_SCHEMA
   });
 }
 
@@ -803,9 +902,15 @@ function spawnMerger(ticket, implResult, wave, worktreePath) {
     "Steps:",
     "1. Confirm the main checkout is on " + integrationBranch + " and clean",
     "   (git status). If it is dirty or on another branch, STOP and report.",
-    "2. If a commit with an exact `Issue: " + ticket.ref + "` body trailer or the",
-    "   legacy subject `Implement ticket " + ticket.ref + ":` already exists, report",
-    "   that the merge was already done and exit successfully; do not merge twice.",
+    "2. CONTENT-BASED IDEMPOTENCY CHECK. This decides whether the work is already",
+    "   merged. Run: git apply --check --reverse <patch>",
+    "   Exit 0 means the captured patch is ALREADY applied to this branch: do NOT",
+    "   apply or commit; report that the merge was already done, with the existing",
+    "   commit hash, and exit successfully. A non-zero exit means it is NOT applied:",
+    "   continue. Never decide this from `Issue:` trailer grep or `git log --grep`:",
+    "   a trailer proves only that some commit for this ticket exists, not that",
+    "   THIS patch is applied (JRB-017: a fix merge was skipped because the",
+    "   implementation commit already carried the trailer).",
     "3. Apply the implementer's changes (per the source above). If the patch is",
     "   empty or already applied, note that and continue.",
     "4. Read the issue and diff, then create a Conventional Commit subject using the appropriate type and a concise change summary. Include `Issue: " + ticket.ref + "` as a commit-body trailer. Do not use a generic 'Implement ticket' subject.",
@@ -828,9 +933,9 @@ function spawnMerger(ticket, implResult, wave, worktreePath) {
     gate: gate,
     control: childControl(),
     // Merger success is decided by the host-run gate and the commit state;
-    // declaring read-only keeps the harness from rejecting a green merge
+    // acceptance: false keeps the harness from rejecting a green merge
     // because no acceptance-report block was found in the output (JRB-016).
-    acceptanceRole: "read-only"
+    acceptance: false
   });
 }
 
@@ -891,26 +996,27 @@ function spawnVerifier(ticket, wave) {
     "- Touch only this ticket. Do NOT edit code, do NOT commit, do NOT change",
     "  git state, do NOT spawn subagents.",
     "",
-    "The LAST line of your final response MUST be exactly one of:",
-    "  Verification verdict: OK    — every criterion is satisfied, with evidence",
-    "  Verification verdict: UNMET  — at least one criterion is not satisfied",
-    "A missing verdict is treated as NOT verified."
+    "Finish by calling structured_output:",
+    "- verdict: OK when every criterion is satisfied, UNMET when at least one is not;",
+    "- criteria: one entry per criterion (criterion, satisfied, evidence);",
+    "- unmet: when verdict is UNMET, name the unmet criteria.",
+    "A missing or malformed structured verdict is treated as NOT verified."
   );
   return runs.run(key, {
     label: "Verify ticket " + ticket.ref + " against the merged code",
     agent: AG.verifier,
     task: task.join("\n"),
     timeoutMs: MERGE_TIMEOUT_MS,
-    control: childControl()
+    control: childControl(),
+    outputSchema: VERIFY_OUTPUT_SCHEMA
   });
 }
 
 // A missing verdict is not a pass — the same rule the review axes follow.
-function parseVerification(output) {
-  const text = String(output || "");
-  if (text.indexOf("Verification verdict: OK") >= 0) return "OK";
-  if (text.indexOf("Verification verdict: UNMET") >= 0) return "UNMET";
-  return "UNVERDICTED";
+function verificationVerdictOf(result) {
+  const structured = (result && result.structuredOutput) || null;
+  return structured && (structured.verdict === "OK" || structured.verdict === "UNMET")
+    ? structured.verdict : "UNVERDICTED";
 }
 
 // Review axis task template — extracted so the retry logic can re-launch
@@ -932,28 +1038,28 @@ function reviewAxisTask(axis, focus) {
     "do NOT pick a nearby branch, another feature's tickets, or the current",
     "checkout and review that instead. Trace changed shared files to their other",
     "callers and verify adjacent workflows and cross-ticket interactions.",
-    "In that case answer with one line:",
-    "'Review verdict: MISSING_TARGET' plus what was absent, and stop.",
+    "In that case answer with verdict MISSING_TARGET (name what was absent in",
+    "missingTarget) and stop.",
     "",
-    "Report concrete findings with file:line references. Otherwise end with",
-    "exactly one line: 'Review verdict: BLOCK' if there are must-fix defects,",
-    "or 'Review verdict: OK' if there are none. No other final line is a",
-    "verdict; the orchestrator treats a missing one as an unfinished review."
+    "Report concrete findings with file:line references, then call structured_output:",
+    "- verdict: OK (no must-fix defects), BLOCK (must-fix defects exist), or",
+    "  MISSING_TARGET (the target named above does not resolve).",
+    "- findings: a summary of your concrete findings (empty or omitted when none).",
+    "No other verdict is a pass; a missing or malformed structured verdict is an",
+    "unfinished review."
   );
   return task.join("\n");
 }
 function reviewRecord(axis, result) {
   const output = String((result && result.output) || "");
-  let verdict = "UNVERDICTED";
-  if (result && result.ok) {
-    if (output.indexOf("Review verdict: BLOCK") >= 0) verdict = "BLOCK";
-    else if (output.indexOf("Review verdict: OK") >= 0) verdict = "OK";
-    else if (output.indexOf("Review verdict: MISSING_TARGET") >= 0) verdict = "MISSING_TARGET";
-  }
+  const structured = (result && result.structuredOutput) || null;
+  const verdict = structured && REVIEW_VERDICTS.indexOf(structured.verdict) >= 0
+    ? structured.verdict : "UNVERDICTED";
   return {
     axis: axis,
     ok: !!(result && result.ok),
-    verdict: verdict,
+    verdict: result && result.ok ? verdict : "UNVERDICTED",
+    findings: structured && typeof structured.findings === "string" ? structured.findings.slice(0, 2000) : null,
     excerpt: output.slice(0, 4000),
     error: result && result.error ? String(result.error) : null
   };
@@ -968,7 +1074,8 @@ function spawnReviews(stage, wave) {
         agent: a.agent,
         task: reviewAxisTask(a.name, a.focus),
         timeoutMs: MERGE_TIMEOUT_MS,
-        control: childControl()
+        control: childControl(),
+        outputSchema: REVIEW_OUTPUT_SCHEMA
       });
     }).then(function(result) {
       return reviewRecord(a.name, result);
@@ -985,7 +1092,8 @@ function respawnReview(stage, wave, axis, attempt) {
     agent: cfg.agent,
     task: reviewAxisTask(axis, cfg.focus),
     timeoutMs: MERGE_TIMEOUT_MS,
-    control: childControl()
+    control: childControl(),
+    outputSchema: REVIEW_OUTPUT_SCHEMA
   });
 }
 
@@ -1101,19 +1209,22 @@ function spawnFlakeRecheck(ticket, priorResult, wave) {
     "3. In THAT tree, run ONLY that test: " + (RETEST_COMMAND
       ? RETEST_COMMAND + " — substitute the failing test's own path/name."
       : "use the single-test command this repo documents (docs/agents/verification.md)."),
-    "4. If it passes, report the exact test path and 'FLAKE_CONFIRMED_TRANSIENT'.",
-    "5. If it fails again, report 'FLAKE_PERSISTENT' and the failure detail.",
+    "4. If it passes, report the exact test path and the outcome FLAKE_CONFIRMED_TRANSIENT.",
+    "5. If it fails again, report FLAKE_PERSISTENT and the failure detail.",
     "",
     "Do NOT modify any files. Do NOT run the full suite. Do NOT commit, create",
     "branches or worktrees, or spawn subagents.",
     "",
-    "Return ONLY the test result and one of the labels above."
+    "Finish by calling structured_output with outcome:",
+    "FLAKE_CONFIRMED_TRANSIENT | FLAKE_PERSISTENT | WORKTREE_NOT_FOUND, plus",
+    "testPath (the failing test's own path/name) and detail."
   ].join("\n");
   return runs.run(key, {
     label: "Flake recheck ticket " + ticket.ref + " (in the failed run's worktree)",
     agent: AG.implementer,
     task: task,
-    timeoutMs: 15 * 60 * 1000
+    timeoutMs: 15 * 60 * 1000,
+    outputSchema: FLAKE_OUTPUT_SCHEMA
   });
 }
 
@@ -1150,12 +1261,11 @@ function getTicketGraph(forceDiscovery) {
   });
 }
 
-// The continue-child reports its retained worktree as the final line:
-// WORKTREE_PATH: /absolute/path
-function extractWorktreePath(output) {
-  const text = String(output || "");
-  const m = text.match(/WORKTREE_PATH:\s*(\S+)/);
-  return m ? m[1] : null;
+// The continue-child reports its retained worktree through structured output.
+function extractWorktreePath(result) {
+  const structured = (result && result.structuredOutput) || null;
+  const p = structured && typeof structured.worktreePath === "string" ? structured.worktreePath.trim() : "";
+  return p || null;
 }
 
 // Structured escalation: the lead (not the script) decides what happens next.
@@ -1200,22 +1310,22 @@ if (!finalizeMergedPR) {
     const cleanTreePreflight = await runs.run("preflight-clean-tree", {
       agent: AG.worker,
       label: "Preflight: verify clean checkout",
-      task: "Run `git -C " + REPO_PATH + " status --porcelain`.\n" +
-        "- If the output is empty, report exactly CLEAN_TREE and stop.\n" +
-        "- Otherwise report exactly DIRTY_TREE, followed by the full porcelain output.\n" +
-        "Change nothing: do not stash, commit, delete, or clean anything — the user resolves the tree, not you.",
+      task: "Change nothing and run nothing: the host gate performs this check.\n" +
+        "The gate fails when the checkout " + REPO_PATH + " has uncommitted or untracked changes.",
       timeoutMs: 30 * 1000,
-      quiet: true
+      quiet: true,
+      // The tree state is a deterministic host fact. The gate decides, so a
+      // child's prose can never misreport it (JRB-014/JRB-016 class).
+      gate: { command: "test -z \"$(git -C '" + REPO_PATH + "' status --porcelain 2>/dev/null)\"" },
+      acceptance: false
     });
-    const cleanTreeOutput = String((cleanTreePreflight && cleanTreePreflight.output) || "");
-    if (!cleanTreePreflight || !cleanTreePreflight.ok || cleanTreeOutput.indexOf("CLEAN_TREE") < 0 ||
-        cleanTreeOutput.indexOf("DIRTY_TREE") >= 0) {
+    if (!cleanTreePreflight || !cleanTreePreflight.ok) {
       return {
         ok: false,
         dirtyTree: true,
         error: "DIRTY_TREE: the checkout " + REPO_PATH + " has uncommitted or untracked changes. " +
           "Resolve them manually (commit, stash, or remove) and relaunch. No child work started." +
-          (cleanTreeOutput ? "\nPorcelain output:\n" + cleanTreeOutput.slice(0, 2000) : ""),
+          (cleanTreePreflight && cleanTreePreflight.error ? "\nGate detail: " + String(cleanTreePreflight.error).slice(0, 2000) : ""),
         discoveredTickets: tickets.length
       };
     }
@@ -1248,25 +1358,29 @@ if (preflight && preflight.integrationBranchExists === false && !finalizeMergedP
     task: "Ensure the git branch '" + integrationBranch + "' exists in " + REPO_PATH +
       ", creating it from '" + BASE_BRANCH + "' if it does not.\n" +
       "1. git -C " + REPO_PATH + " rev-parse --verify refs/heads/" + integrationBranch +
-      " -> if it succeeds, report BRANCH_EXISTS and exit.\n" +
+      " -> if it succeeds, done.\n" +
       "2. If it fails: git -C " + REPO_PATH + " branch " + integrationBranch + " " + BASE_BRANCH +
-      " && git -C " + REPO_PATH + " push -u origin " + integrationBranch + ". Report BRANCH_CREATED.\n" +
-      "3. Change nothing else. Do not switch branches or modify files.",
+      " && git -C " + REPO_PATH + " push -u origin " + integrationBranch + ".\n" +
+      "3. Change nothing else. Do not switch branches or modify files.\n" +
+      "The host gate re-checks the branch after your run.",
     timeoutMs: 30 * 1000,
-    quiet: true
+    quiet: true,
+    // The branch's existence is a deterministic host fact: the gate verifies
+    // it after the child runs, so no reported token is trusted.
+    gate: { command: "git -C " + REPO_PATH + " rev-parse --verify refs/heads/" + integrationBranch },
+    acceptance: false
   });
-  if (!ensureRun || !ensureRun.ok || !ensureRun.output ||
-      ensureRun.output.indexOf("BRANCH_CREATED") < 0 && ensureRun.output.indexOf("BRANCH_EXISTS") < 0) {
+  if (!ensureRun || !ensureRun.ok) {
     return {
       ok: false,
       error: "implement-spec: could not create integration branch '" + integrationBranch + "' from " +
-        BASE_BRANCH + ". " + (ensureRun && ensureRun.error ? String(ensureRun.error).slice(0, 200) : ""),
+        BASE_BRANCH + ". Worktree children branch from it and would all fail. Fix the checkout and relaunch." +
+        (ensureRun && ensureRun.error ? " Gate detail: " + String(ensureRun.error).slice(0, 1000) : ""),
       preflight: preflight,
       discoveredTickets: tickets.length
     };
   }
-  emit("implement-spec: integration branch '" + integrationBranch + "' ensured (" +
-       String((ensureRun.output || "").match(/BRANCH_EXISTS|BRANCH_CREATED/) || ["UNKNOWN"])[0] + ")");
+  emit("implement-spec: integration branch '" + integrationBranch + "' ensured (gate verified)");
 }
 if (!preflight) {
   emit("implement-spec: discovery reported no preflight; cannot confirm " + baseRef +
@@ -1284,7 +1398,9 @@ if (finalizeMergedPR) {
     };
   }
   const confirmation = await confirmMerged(refs, String(A.prUrl || A.mergeRef));
-  if (!confirmation || !confirmation.ok || !/MERGED_CONFIRMED/.test(String(confirmation.output || ""))) {
+  const mergeConfirmed = !!(confirmation && confirmation.ok &&
+    confirmation.structuredOutput && confirmation.structuredOutput.confirmed === true);
+  if (!mergeConfirmed) {
     return {
       ok: false,
       finalized: false,
@@ -1568,7 +1684,7 @@ if (verifyOnly) {
             }
           }
           if (remediated && remediated.ok) {
-            const wt = extractWorktreePath(remediated.output);
+            const wt = extractWorktreePath(remediated);
             if (wt) {
               ld.worktreePath = wt;
               emit("ticket " + ticket.ref + ": continue-child reported worktree " + wt);
@@ -1581,7 +1697,8 @@ if (verifyOnly) {
           emit("ticket " + ticket.ref + ": flake detected — running quarantine recheck before fixer");
           try {
             const flakeResult = await spawnFlakeRecheck(ticket, implResult, wave);
-            if (flakeResult && flakeResult.ok && /FLAKE_CONFIRMED_TRANSIENT/i.test(String(flakeResult.output || ""))) {
+            const flakeOutcome = flakeResult && flakeResult.structuredOutput ? flakeResult.structuredOutput.outcome : null;
+            if (flakeResult && flakeResult.ok && flakeOutcome === "FLAKE_CONFIRMED_TRANSIENT") {
               emit("ticket " + ticket.ref + ": flake confirmed transient — proceeding to merge on the preserved work");
               // implResult.ok is false — that is why we are in this branch — so
               // handing it back as the "remediation" would fail the ok check
@@ -1651,7 +1768,7 @@ if (verifyOnly) {
         } catch (eVer) {
           emit("ticket " + ticket.ref + ": verifier launch rejected (" + eVer + ")");
         }
-        const verdict = (verifyRun && verifyRun.ok) ? parseVerification(verifyRun.output) : "UNVERDICTED";
+        const verdict = (verifyRun && verifyRun.ok) ? verificationVerdictOf(verifyRun) : "UNVERDICTED";
         ld.verification = verdict;
         verifications.push({
           ref: ticket.ref,
@@ -1721,7 +1838,7 @@ if (absorbedPending.length) {
     } catch (eVer) {
       emit("ticket " + ref + ": verifier launch rejected (" + eVer + ")");
     }
-    const verdict = (verifyRun && verifyRun.ok) ? parseVerification(verifyRun.output) : "UNVERDICTED";
+    const verdict = (verifyRun && verifyRun.ok) ? verificationVerdictOf(verifyRun) : "UNVERDICTED";
     ledgerFor(ref).verification = verdict;
     verifications.push({
       ref: ref,
@@ -1775,7 +1892,7 @@ if (merged.length) {
     emit("ESCALATION: review is INCOMPLETE" +
          (detail.length ? " — axes without a verdict: " + detail.join(", ")
                         : " — only " + reviews.length + " of 3 axes returned") +
-         ". An axis with no 'Review verdict:' line is not a pass. PR suppressed; rerun the incomplete review. Incomplete reviews cannot be waived.");
+         ". An axis with no structured verdict is not a pass. PR suppressed; rerun the incomplete review. Incomplete reviews cannot be waived.");
   }
 
   if (blockedAxes.length && !(PR_WAIVER_REASON && !skipPR)) {
@@ -1821,7 +1938,14 @@ if (merged.length) {
         "",
         "Steps:",
         "1. Confirm the main checkout is on " + integrationBranch + " and clean.",
-        "2. Locate and apply the captured patch (git apply --whitespace=fix --index <patch>).",
+        "2. CONTENT-BASED IDEMPOTENCY CHECK. Run: git apply --check --reverse <patch>",
+        "   Exit 0 means the fix patch is ALREADY applied to this branch: do NOT apply",
+        "   or commit; report that the merge was already done, with the existing commit",
+        "   hash, and exit successfully. A non-zero exit means it is NOT applied:",
+        "   continue. Never decide this from `Issue:` trailer grep or `git log --grep`",
+        "   (JRB-017: a fix merge was skipped because an earlier commit for the same",
+        "   ticket already carried the trailer).",
+        "3. Locate and apply the captured patch (git apply --whitespace=fix --index <patch>).",
         "3. Commit with a Conventional Commit subject whose type matches the fixes, such as `fix: address review findings`, and include `Issue: <ref>` trailers for each affected issue in this run: " + merged.join(", ") + ".",
         "4. Validate the subject with `git log -1 --format=%s | grep -Eq '^[a-z][a-z0-9-]*(\\([a-z0-9._/-]+\\))?!?: .+'` and validate the Issue trailers for the affected issues in this run: " + merged.join(", ") + ".",
         "   If either check fails, amend only the message and re-check.",
@@ -1835,7 +1959,10 @@ if (merged.length) {
           task: fixMergeTask.join("\n"),
           timeoutMs: MERGE_TIMEOUT_MS,
           gate: gateFor(merged[0]),
-          control: childControl()
+          control: childControl(),
+          // Merger success is decided by the host-run gate and the commit
+          // state; no acceptance report is required (JRB-016).
+          acceptance: false
         });
       } catch (eM) {
         emit("implement-spec: merge-review-fixes rejected (" + eM + ")");
@@ -1845,26 +1972,29 @@ if (merged.length) {
         // The fixer's changes may already be on the branch. Verify git state
         // directly: if the expected changes are present and the gate passes,
         // treat the merge as successful rather than escalating.
-        const gmVerify = await runs.run("verify-fix-merge-" + keyOf(ticket.ref), {
+        const gmVerify = await runs.run("verify-fix-merge-" + keyOf(merged[0]), {
           agent: AG.merger,
-          label: "Verify fix-merge git state for " + ticket.ref,
+          label: "Verify fix-merge git state for " + merged.join(", "),
           task: "The merge-review-fixes child reported failure, but its work may already be committed. " +
             "Confirm: (1) checkout is on " + integrationBranch + " and clean; " +
             "(2) the fixer's changes are present (git log --oneline main.." + integrationBranch +
             " shows commits beyond the original implementation); (3) the intermediate gate " + (NARROW_GATE && NARROW_GATE.command) +
-            " passes. If (3) passes and (2) shows changes, report MERGE_EFFECTIVE. " +
-            "If the changes are NOT present, report MERGE_MISSING. " + checkoutHint(),
+            " passes (the host runs it automatically). Finish by calling structured_output with " +
+            "mergeState: MERGE_EFFECTIVE when (2) and (3) hold, MERGE_MISSING when the changes are not present. " +
+            checkoutHint(),
           timeoutMs: MERGE_TIMEOUT_MS,
           gate: gateFor(merged[0]),
-          control: childControl()
+          control: childControl(),
+          outputSchema: MERGE_STATE_OUTPUT_SCHEMA,
+          acceptance: false
         }).catch(function(e) {
           emit("implement-spec: fix-merge verification rejected (" + e + ")");
           return null;
         });
-        const gmOutput = (gmVerify && gmVerify.output) ? String(gmVerify.output) : "";
-        if (gmVerify && gmVerify.ok && gmOutput.indexOf("MERGE_EFFECTIVE") >= 0) {
-          emit("implement-spec: fix-merge acceptance rejected but git state verified; treating as merged");
-          fixMergerRun = { ok: true, output: gmOutput };
+        const gmState = gmVerify && gmVerify.structuredOutput ? gmVerify.structuredOutput.mergeState : null;
+        if (gmVerify && gmVerify.ok && gmState === "MERGE_EFFECTIVE") {
+          emit("implement-spec: fix-merge git state verified; treating as merged");
+          fixMergerRun = { ok: true, output: String((gmVerify && gmVerify.output) || "") };
         } else {
           emit("ESCALATION: review fixes were produced but NOT merged into " +
                integrationBranch + " — the fixer's worktree may hold uncommitted work, and " +
@@ -1897,7 +2027,7 @@ if (merged.length) {
         } catch (eVer) {
           emit("ticket " + ref + ": post-fix verifier launch rejected (" + eVer + ")");
         }
-        const verdict = (verifyRun && verifyRun.ok) ? parseVerification(verifyRun.output) : "UNVERDICTED";
+        const verdict = (verifyRun && verifyRun.ok) ? verificationVerdictOf(verifyRun) : "UNVERDICTED";
         ledgerFor(ref).verification = verdict;
         verifications.push({
           ref: ref,
@@ -1943,7 +2073,7 @@ if (merged.length) {
         // The host-run gate decides pass/fail; the child's prose is only
         // context. Do not let a missing acceptance report block a green gate
         // (JRB-016: three green merges rejected on report format).
-        acceptanceRole: "read-only"
+        acceptance: false
       });
     } catch (eV) {
       emit("implement-spec: final-verify rejected (" + eV + ")");
@@ -1979,8 +2109,11 @@ if (merged.length) {
       "Read docs/agents/issue-tracker.md for lifecycle behavior and docs/agents/verification.md for the request surface.",
       "The head branch must exist on the remote before a request can be",
       "opened — push it first (git push -u origin <branch>) if it is not there.",
-      "If this repo has no request surface, leave the work on the integration branch and return exactly `NO_PR_SURFACE` on its own line.",
-      "If a PR was opened, return exactly `PR_CREATED: <url>` on its own line. Report failure clearly if a PR was expected but could not be opened."
+      "Finish by calling structured_output:",
+      "- prUrl: the request URL when a request was opened;",
+      "- noPrSurface: true when this repo has no request surface (leave the work",
+      "  on the integration branch).",
+      "Report failure clearly if a request was expected but could not be opened."
     );
     if (prWaived) {
       prTask.push(
@@ -1996,7 +2129,8 @@ if (merged.length) {
         agent: AG.prWriter,
         task: prTask.join("\n"),
         timeoutMs: MERGE_TIMEOUT_MS,
-        control: childControl()
+        control: childControl(),
+        outputSchema: PR_OUTPUT_SCHEMA
       });
     } catch (eP) {
       emit("implement-spec: pr run rejected (" + eP + ")");

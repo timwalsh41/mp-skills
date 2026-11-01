@@ -41,21 +41,18 @@ Review the diff, not the whole codebase. Pre-existing weaknesses are context, no
 
 Quote the hunk for every finding, and **distinguish critical bugs from improvement suggestions** — a suggestion presented as critical wastes the fix pass. **Under 400 words.** Return only your report; no aggregation, no verdict on the other axes.
 
-## Final line (required, exactly one)
+## Structured verdict (required)
 
-The orchestrator gates on this line; a review without it counts as **not completed**, not as a pass. Choose one:
+The orchestrator gates on the structured verdict; a review without one counts as **not completed**, not as a pass. Finish by calling the harness's `structured_output` tool with:
 
-```
-Review verdict: BLOCK
-```
-only for a defect that will cause user-visible incorrect behaviour, data loss, or a security exposure.
+- `verdict`: one of the three values below
+- `findings`: a summary of your concrete findings (empty when none)
+- `missingTarget`: only with verdict `MISSING_TARGET`; what was absent
 
-```
-Review verdict: OK
-```
-otherwise, including when you have improvement suggestions.
+`verdict: "BLOCK"` only for a defect that will cause user-visible incorrect behaviour, data loss, or a security exposure.
 
-```
-Review verdict: MISSING_TARGET
-```
-only when the branch or diff target named in your task does not exist. Report what was absent and stop - never review a nearby branch instead.
+`verdict: "OK"` otherwise, including when you have improvement suggestions.
+
+`verdict: "MISSING_TARGET"` only when the branch or diff target named in your task does not exist. Report what was absent and stop; never review a nearby branch instead.
+
+Your prose report stays in your final response; the structured verdict carries only the outcome.

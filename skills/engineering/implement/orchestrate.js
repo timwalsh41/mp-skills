@@ -39,7 +39,15 @@
 //   - The implementer runs in its OWN managed git worktree; parent checkout
 //     is never switched; changes are committed via a merger child.
 //   - Every child carries a verification gate that runs on the host.
-//   - A review without a verdict line is INCOMPLETE, not a pass: PR suppressed.
+//   - A review without a structured verdict is INCOMPLETE, not a pass: PR suppressed.
+//   - Children whose judgment decides an outcome (reviews, verification, PR,
+//     transitions, merge confirmation, grooming) report through the harness's
+//     structured_output tool. The orchestrator reads parsed fields; it never
+//     scans child prose for decision tokens (JRB-016/JRB-017: prose token
+//     parsing rejected green children and misread compliance statements).
+//   - Children whose success is decided by a host-run gate or by git state
+//     (mergers, final gate, verify-fix) carry acceptance: false, so a missing
+//     acceptance report can never reject a green result.
 //   - Independent verification of acceptance criteria required before PR.
 //   - No PR unless reviews and verification pass, except an explicit review waiver
 //     that opens a draft and returns a non-green result.
@@ -50,7 +58,7 @@
 // Shared helpers — copied from implement-spec/orchestrate.js.
 //
 // These helpers (numArg, boolArg, gateObj, childControl, checkoutHint,
-// reviewAxisTask, parseReviewVerdict, parseVerification, classifyFailure)
+// reviewAxisTask, classifyFailure)
 // are shared with the implement-spec workflow, but the Pi subagent workflow
 // sandbox is a plain JS statement body with NO require/import/fs. We cannot
 // import a shared module at runtime, so each orchestrate.js carries its own
@@ -138,32 +146,104 @@ function reviewAxisTask(axis, focus, integrationBranch, baseBranch, repoPath, ti
   task.push.apply(task, checkoutHint(repoPath));
   task.push(
     "",
-    "If the branch or ticket does not resolve, answer with one line:",
-    "'Review verdict: MISSING_TARGET' plus what was absent, and stop. Do NOT",
-    "review nearby or related work instead.",
+    "If the branch or ticket does not resolve, answer with verdict MISSING_TARGET",
+    "(name what was absent in missingTarget) and stop. Do NOT review nearby or",
+    "related work instead.",
     "Trace changed shared files to their other callers and rendering modes; verify",
     "adjacent workflows support the change end to end or hide unsupported input.",
     "",
-    "Report concrete findings with file:line references. Otherwise end with",
-    "exactly one line: 'Review verdict: BLOCK' (must-fix defects) or",
-    "'Review verdict: OK' (none). A missing final line is treated as",
-    "INCOMPLETE, not a pass."
+    "Report concrete findings with file:line references, then call structured_output:",
+    "- verdict: OK (no must-fix defects), BLOCK (must-fix defects exist), or",
+    "  MISSING_TARGET (the target named above does not resolve).",
+    "- findings: a summary of your concrete findings (empty or omitted when none).",
+    "A missing or malformed structured verdict is an incomplete review, not a pass."
   );
   return task.join("\n");
 }
-function parseReviewVerdict(output) {
-  const text = String(output || "");
-  if (text.indexOf("Review verdict: BLOCK") >= 0) return "BLOCK";
-  if (text.indexOf("Review verdict: OK") >= 0) return "OK";
-  if (text.indexOf("Review verdict: MISSING_TARGET") >= 0) return "MISSING_TARGET";
-  return "UNVERDICTED";
-}
-function parseVerification(output) {
-  const text = String(output || "");
-  if (text.indexOf("Verification verdict: OK") >= 0) return "OK";
-  if (text.indexOf("Verification verdict: UNMET") >= 0) return "UNMET";
-  return "UNVERDICTED";
-}
+// Structured verdict schemas. Verdict-bearing children must finish by calling
+// the harness's structured_output tool with one of these shapes; the workflow
+// reads result.structuredOutput and never parses the child's prose.
+const REVIEW_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    verdict: { type: "string", enum: ["OK", "BLOCK", "MISSING_TARGET"] },
+    findings: { type: "string" },
+    missingTarget: { type: "string" }
+  },
+  required: ["verdict"],
+  additionalProperties: false
+};
+const VERIFY_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    verdict: { type: "string", enum: ["OK", "UNMET"] },
+    criteria: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          criterion: { type: "string" },
+          satisfied: { type: "boolean" },
+          evidence: { type: "string" }
+        },
+        required: ["criterion", "satisfied"],
+        additionalProperties: false
+      }
+    },
+    unmet: { type: "string" }
+  },
+  required: ["verdict"],
+  additionalProperties: false
+};
+const PR_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    prUrl: { type: "string" },
+    noPrSurface: { type: "boolean" }
+  },
+  required: ["noPrSurface"],
+  additionalProperties: false
+};
+const TRANSITION_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    outcome: {
+      type: "string",
+      enum: ["TRANSITION_APPLIED", "TRANSITION_ALREADY_SET", "TRANSITION_FAILED", "TRANSITION_UNSUPPORTED", "TRANSITION_STATE_MISMATCH"]
+    },
+    resultingStatus: { type: "string" },
+    detail: { type: "string" }
+  },
+  required: ["outcome"],
+  additionalProperties: false
+};
+const CONFIRM_MERGE_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    confirmed: { type: "boolean" },
+    evidence: { type: "string" }
+  },
+  required: ["confirmed"],
+  additionalProperties: false
+};
+const GROOM_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    groomed: { type: "boolean" },
+    missing: { type: "string" }
+  },
+  required: ["groomed"],
+  additionalProperties: false
+};
+const MERGE_STATE_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    mergeState: { type: "string", enum: ["MERGE_EFFECTIVE", "MERGE_MISSING"] }
+  },
+  required: ["mergeState"],
+  additionalProperties: false
+};
+const REVIEW_VERDICTS = ["OK", "BLOCK", "MISSING_TARGET"];
 function classifyFailure(result, flakeRe) {
   if (!result) return "unknown";
   if (result.ok) return "ok";
@@ -195,8 +275,15 @@ function failureSignature(result) {
 const A = args || {};
 
 const finalizeMergedPR = boolArg(A.finalizeMergedPR);
-const FULL_GATE = A.fullGate || A.gate || null;
-const NARROW_GATE = A.narrowGate || FULL_GATE;
+// Config preflight errors collect here; unwrapGate (below) reports gate-arg
+// violations into this array, so it must be declared before the gate args.
+// Gates are normalized ONCE here: a string or { command, timeoutMs } object
+// both yield a { command, timeoutMs } gate, and every later consumer can rely
+// on .command (JRB-016: two launches were burned on raw strings reaching
+// gateObj(FULL_GATE.command), which produced { command: undefined }).
+const configErrors = [];
+const FULL_GATE = unwrapGate(A.fullGate || A.gate, "fullGate", configErrors);
+const NARROW_GATE = unwrapGate(A.narrowGate, "narrowGate", configErrors) || FULL_GATE;
 const missingArgs = [];
 if (!A.ticketRef) missingArgs.push("ticketRef");
 if (!finalizeMergedPR && !FULL_GATE) missingArgs.push("fullGate");
@@ -236,9 +323,7 @@ function runTransition(phase, ref, variables) {
         "Issue: " + ref,
         "Branch: " + String(variables.branch || ""),
         "PR URL: " + String(variables.prUrl || ""),
-        "Use the documented transition only. If the tracker explicitly has no such lifecycle transition, report TRANSITION_UNSUPPORTED without changing state.",
-        "Otherwise report exactly TRANSITION_APPLIED, TRANSITION_ALREADY_SET, or TRANSITION_FAILED, with the resulting status and any error.",
-        "Do not modify code, other issues, or repository files."
+        "Use the documented transition only. Do not modify code, other issues, or repository files.",
       ].join("\n");
   return runs.run("transition-" + phase + "-" + keyOf(ref), {
     agent: AG.worker,
@@ -256,34 +341,32 @@ function runTransition(phase, ref, variables) {
       "\nReport the HTTP status code or error. Change nothing else.",
     timeoutMs: TRANSITION_TIMEOUT_MS,
     quiet: true,
-    // Transitions are lifecycle writes, not deliverables: a structured
-    // acceptance report is not required from this child, and its output is
-    // never used to decide pass/fail. Pass/fail is decided by the tracker's
-    // own state after the call (source-status/target-status contract below).
-    acceptanceRole: "read-only"
+    outputSchema: TRANSITION_OUTPUT_SCHEMA,
+    // Transitions are lifecycle writes, not deliverables: no acceptance
+    // report, and the outcome is read from the structured result, never
+    // scanned from prose (JRB-016: a prose confession regex aborted a green
+    // run on a compliance statement).
+    acceptance: false
   }).then(function(r) {
-    const output = String((r && r.output) || "");
-    const unsupported = output.indexOf("TRANSITION_UNSUPPORTED") >= 0;
-    // The transition firewall is the tracker's state, not the child's prose:
+    const structured = (r && r.structuredOutput) || null;
+    const outcome = structured && typeof structured.outcome === "string" ? structured.outcome : null;
+    const unsupported = outcome === "TRANSITION_UNSUPPORTED";
     // TRANSITION_APPLIED / TRANSITION_ALREADY_SET are the only positive
-    // outcomes for the requested phase. TRANSITION_FAILED / TRACKER_DOC_MISSING /
-    // TRANSITION_UNCLEAR / TRANSITION_STATE_MISMATCH are failures. A compliant
-    // child reporting "No Agent Execution Evidence" no longer trips a false
-    // positive here because prose is not scanned at all (JRB-016: the old
-    // confession regex aborted a green run on a compliance statement).
-    const ok = !!(r && r.ok) && (unsupported ||
-      /TRANSITION_APPLIED|TRANSITION_ALREADY_SET/.test(output)) &&
-      !/TRANSITION_FAILED|TRACKER_DOC_MISSING|TRANSITION_UNCLEAR|TRANSITION_STATE_MISMATCH/.test(output);
-    emit("implement: transition " + phase + " for " + ref + " -- " + (unsupported ? "unsupported by tracker" : (ok ? "done" : "failed")));
-    return { ok: ok, output: output, unsupported: unsupported };
+    // outcomes for the requested phase. TRANSITION_FAILED and
+    // TRANSITION_STATE_MISMATCH are failures. A child that never produced a
+    // structured outcome counts as failed (the harness rejects it first).
+    const ok = !!(r && r.ok) && (outcome === "TRANSITION_APPLIED" || outcome === "TRANSITION_ALREADY_SET");
+    emit("implement: transition " + phase + " for " + ref + " -- " + (unsupported ? "unsupported by tracker" : (ok ? "done" : "failed (" + (outcome || "no structured outcome") + ")")));
+    return { ok: ok, output: String((r && r.output) || "") + (structured ? "\n[outcome] " + outcome : ""), unsupported: unsupported };
   });
 }
 function parsePrWriterResult(result) {
-  const output = String((result && result.output) || "");
-  const match = output.match(/(?:^|\n)PR_CREATED:\s*(https?:\/\/[^\s]+)/);
+  const structured = (result && result.structuredOutput) || null;
+  const url = structured && typeof structured.prUrl === "string" && structured.prUrl.trim()
+    ? structured.prUrl.trim() : null;
   return {
-    url: match ? match[1] : null,
-    noPrSurface: /(?:^|\n)NO_PR_SURFACE(?:\n|$)/.test(output)
+    url: url,
+    noPrSurface: !!(structured && structured.noPrSurface)
   };
 }
 function confirmMerged(ref, mergeRef) {
@@ -296,10 +379,14 @@ function confirmMerged(ref, mergeRef) {
       "Issue: " + ref,
       "Integration branch: " + integrationBranch,
       "Merge or PR reference: " + mergeRef,
-      "Do not change issue status. Report exactly MERGED_CONFIRMED or MERGE_NOT_CONFIRMED, with evidence."
+      "Do not change issue status. Report the outcome through structured_output:",
+      "confirmed: true when the documented process confirms the work reached its", 
+      "completion point, false otherwise, plus the evidence you relied on."
     ].join("\n"),
     timeoutMs: TRANSITION_TIMEOUT_MS,
-    quiet: true
+    quiet: true,
+    outputSchema: CONFIRM_MERGE_OUTPUT_SCHEMA,
+    acceptance: false
   });
 }
 const STANDARDS_DOCS = A.standardsDocs ||
@@ -340,7 +427,6 @@ const MAX_REVIEW_RETRIES = numArg(A.maxReviewRetries, 2);
 // per-repo tuning.
 const TRANSITION_TIMEOUT_MS = 3 * 60 * 1000;
 
-const configErrors = [];
 requireInt(GATE_TIMEOUT_MS, "gateTimeoutMs", 1000, configErrors);
 requireInt(IMPL_TIMEOUT_MS, "implTimeoutMs", 1000, configErrors);
 requireInt(REVIEW_TIMEOUT_MS, "reviewTimeoutMs", 1000, configErrors);
@@ -367,7 +453,9 @@ emit("implement: ticket=" + ticketRef + " integration=" + integrationBranch +
 if (finalizeMergedPR) {
   const mergeRef = String(A.prUrl || A.mergeRef);
   const confirmation = await confirmMerged(ticketRef, mergeRef);
-  if (!confirmation || !confirmation.ok || !/MERGED_CONFIRMED/.test(String(confirmation.output || ""))) {
+  const mergeConfirmed = !!(confirmation && confirmation.ok &&
+    confirmation.structuredOutput && confirmation.structuredOutput.confirmed === true);
+  if (!mergeConfirmed) {
     return {
       ok: false,
       ticket: ticketRef,
@@ -433,7 +521,7 @@ function spawnImplementer() {
     "Read docs/agents/issue-tracker.md first. It is the source of truth for ticket fields, acceptance evidence, and lifecycle status.",
     "Rules:",
     "- Implement only this ticket: " + ticketRef,
-    "- The orchestrator confirmed this ticket is groomed. If it is not ready, stop and report GROOM_NEEDED instead of implementing or changing lifecycle status.",
+    "- The orchestrator confirmed this ticket is groomed. If it is not ready, stop and report that grooming is required instead of implementing or changing lifecycle status.",
     "- Record your implementation report under `## Agent Execution Evidence` / `### Implementation` in the ticket description, following docs/agents/issue-tracker.md.",
     "  Reconcile, never append: fetch the current description first; if a `### Implementation`",
     "  section already exists, replace/merge it in place — one section, latest content, with a",
@@ -515,10 +603,15 @@ function spawnMerger(result, retry) {
     "1. Confirm the main checkout is clean (git status); if dirty, STOP and report.",
     "   If it is on another branch (typically " + BASE_BRANCH + "), check out " + integrationBranch,
     "   first (git checkout " + integrationBranch + "; the branch already exists), then", "   re-confirm the tree is clean before continuing.",
-    "2. IDEMPOTENCY CHECK: a predecessor may have already merged this work.",
-    "   Run: git log --format=%B " + BASE_BRANCH + ".." + integrationBranch + " | grep -Fx 'Issue: " + ticketRef + "'",
-    "   If a commit with that trailer exists, DO NOT apply the patch and DO NOT commit.",
-    "   Skip straight to step 6 (return) and report the existing commit hash.",
+    "2. CONTENT-BASED IDEMPOTENCY CHECK. This decides whether the work is already",
+    "   merged. Run: git apply --check --reverse <patch>",
+    "   Exit 0 means the captured patch is ALREADY applied to this branch: do NOT",
+    "   apply the patch and do NOT commit; skip straight to step 6 and report the",
+    "   existing commit hash. A non-zero exit means it is NOT applied: continue.",
+    "   Never decide this from `Issue:` trailer grep or `git log --grep`: a trailer",
+    "   proves only that some commit for this ticket exists, not that THIS patch is",
+    "   applied (JRB-017: the fix merge was skipped because the implementation",
+    "   commit already carried the trailer).",
     "3. Find and apply the captured patch: git apply --whitespace=fix --index <patch>",
     "4. Read the ticket and diff, then create a Conventional Commit subject using the appropriate type and a concise change summary. Include `Issue: " + ticketRef + "` as a commit-body trailer. Do not use a generic 'Implement ticket' subject.",
     "5. Commit using that subject and trailer, then validate both:",
@@ -538,19 +631,23 @@ function spawnMerger(result, retry) {
     gate: gateObj(NARROW_GATE.command, GATE_TIMEOUT_MS),
     control: childControl(GATE_TIMEOUT_MS),
     // Merger success is decided by the host-run gate and the commit state,
-    // not by a prose acceptance report. Declaring the role keeps the harness
+    // not by a prose acceptance report. acceptance: false keeps the harness
     // from rejecting an otherwise-green merge because the report block was
     // missing (JRB-016: three green merges rejected on report format).
-    acceptanceRole: "read-only"
+    acceptance: false
   });
 }
 
 function reviewRecord(axis, result) {
   const output = String((result && result.output) || "");
+  const structured = (result && result.structuredOutput) || null;
+  const verdict = structured && REVIEW_VERDICTS.indexOf(structured.verdict) >= 0
+    ? structured.verdict : "UNVERDICTED";
   return {
     axis: axis,
     ok: !!(result && result.ok),
-    verdict: result && result.ok ? parseReviewVerdict(output) : "UNVERDICTED",
+    verdict: result && result.ok ? verdict : "UNVERDICTED",
+    findings: structured && typeof structured.findings === "string" ? structured.findings.slice(0, 2000) : null,
     excerpt: output.slice(0, 4000),
     error: result && result.error ? String(result.error) : null
   };
@@ -563,7 +660,8 @@ function respawnReview(stage, axis, attempt) {
     agent: cfg.agent,
     task: reviewAxisTask(axis, cfg.focus, integrationBranch, BASE_BRANCH, REPO_PATH, ticketRef),
     timeoutMs: REVIEW_TIMEOUT_MS,
-    control: childControl(REVIEW_TIMEOUT_MS)
+    control: childControl(REVIEW_TIMEOUT_MS),
+    outputSchema: REVIEW_OUTPUT_SCHEMA
   });
 }
 
@@ -576,7 +674,8 @@ function spawnReviews(stage) {
         agent: a.agent,
         task: reviewAxisTask(a.name, a.focus, integrationBranch, BASE_BRANCH, REPO_PATH, ticketRef),
         timeoutMs: REVIEW_TIMEOUT_MS,
-        control: childControl(REVIEW_TIMEOUT_MS)
+        control: childControl(REVIEW_TIMEOUT_MS),
+        outputSchema: REVIEW_OUTPUT_SCHEMA
       });
     }).then(function(result) {
       return reviewRecord(a.name, result);
@@ -663,16 +762,19 @@ function spawnVerifier() {
     "change lifecycle status or acceptance outcomes. Do NOT edit code, commit,",
     "or spawn subagents. Trace shared-file consumers and verify affected adjacent workflows too.",
     "",
-    "The LAST line of your final response MUST be exactly:",
-    "  Verification verdict: OK    — every criterion is satisfied, with evidence",
-    "  Verification verdict: UNMET  — at least one criterion is not satisfied"
+    "Finish by calling structured_output:",
+    "- verdict: OK when every criterion is satisfied, UNMET when at least one is not;",
+    "- criteria: one entry per criterion (criterion, satisfied, evidence);",
+    "- unmet: when verdict is UNMET, name the unmet criteria.",
+    "A missing or malformed structured verdict counts as NOT verified."
   );
   return runs.run("verify", {
     label: "Verify " + ticketRef + " against committed code",
     agent: AG.verifier,
     task: task.join("\n"),
     timeoutMs: REVIEW_TIMEOUT_MS,
-    control: childControl(REVIEW_TIMEOUT_MS)
+    control: childControl(REVIEW_TIMEOUT_MS),
+    outputSchema: VERIFY_OUTPUT_SCHEMA
   });
 }
 
@@ -693,7 +795,7 @@ function spawnFinalGate() {
     control: childControl(GATE_TIMEOUT_MS),
     // The host-run gate result decides pass/fail; the child's prose is only
     // context. Do not let a missing report block a green gate (JRB-016).
-    acceptanceRole: "read-only"
+    acceptance: false
   });
 }
 
@@ -721,14 +823,19 @@ function spawnPrWriter(waiverReason, blockedReviews) {
     "The ticket at " + ticketRef + " holds the acceptance answer.",
     "Push the head branch first (git push -u origin " + integrationBranch + ")",
     "if it is not on the remote.",
-    "Return exactly `PR_CREATED: <url>` on its own line if a PR was opened. If the repo docs say there is no PR surface, return `NO_PR_SURFACE` and leave the work on the integration branch. Report failure clearly if a PR was expected but could not be opened."
+    "Finish by calling structured_output:",
+    "- prUrl: the request URL when a request was opened;",
+    "- noPrSurface: true when this repo has no request surface (leave the work on",
+    "  the integration branch).",
+    "Report failure clearly if a request was expected but could not be opened."
   );
   return runs.run("pr", {
     label: "Open pull request for " + ticketRef,
     agent: AG.prWriter,
     task: task.join("\n"),
     timeoutMs: REVIEW_TIMEOUT_MS,
-    control: childControl(REVIEW_TIMEOUT_MS)
+    control: childControl(REVIEW_TIMEOUT_MS),
+    outputSchema: PR_OUTPUT_SCHEMA
   });
 }
 
@@ -752,23 +859,23 @@ if (!finalizeMergedPR) {
     const preflight = await runs.run("preflight-clean-tree", {
       agent: AG.worker,
       label: "Preflight: verify clean checkout",
-      task: "Run `git -C " + REPO_PATH + " status --porcelain`.\n" +
-        "- If the output is empty, report exactly CLEAN_TREE and stop.\n" +
-        "- Otherwise report exactly DIRTY_TREE, followed by the full porcelain output.\n" +
-        "Change nothing: do not stash, commit, delete, or clean anything — the user resolves the tree, not you.",
+      task: "Change nothing and run nothing: the host gate performs this check.\n" +
+        "The gate fails when the checkout " + REPO_PATH + " has uncommitted or untracked changes.",
       timeoutMs: 30 * 1000,
-      quiet: true
+      quiet: true,
+      // The tree state is a deterministic host fact. The gate decides, so a
+      // child's prose can never misreport it (JRB-014/JRB-016 class).
+      gate: { command: "test -z \"$(git -C '" + REPO_PATH + "' status --porcelain 2>/dev/null)\"" },
+      acceptance: false
     });
-    const preflightOutput = String((preflight && preflight.output) || "");
-    if (!preflight || !preflight.ok || preflightOutput.indexOf("CLEAN_TREE") < 0 ||
-        preflightOutput.indexOf("DIRTY_TREE") >= 0) {
+    if (!preflight || !preflight.ok) {
       return {
         ok: false,
         ticket: ticketRef,
         dirtyTree: true,
         error: "DIRTY_TREE: the checkout " + REPO_PATH + " has uncommitted or untracked changes. " +
           "Resolve them manually (commit, stash, or remove) and relaunch. No child work started." +
-          (preflightOutput ? "\nPorcelain output:\n" + preflightOutput.slice(0, 2000) : "")
+          (preflight && preflight.error ? "\nGate detail: " + String(preflight.error).slice(0, 2000) : "")
       };
     }
     emit("implement: preflight clean-tree check passed");
@@ -783,19 +890,30 @@ if (REPO_PATH) {
     task: "Ensure the git branch '" + integrationBranch + "' exists in " + REPO_PATH +
       ", creating it from '" + BASE_BRANCH + "' if missing.\n" +
       "1. git -C " + REPO_PATH + " rev-parse --verify refs/heads/" + integrationBranch +
-      " -> if it succeeds, report BRANCH_EXISTS and exit.\n" +
+      " -> if it succeeds, done.\n" +
       "2. If it does not: git -C " + REPO_PATH + " branch " + integrationBranch + " " + BASE_BRANCH +
       " && git -C " + REPO_PATH + " push -u origin " + integrationBranch +
-      " 2>/dev/null || true. Report BRANCH_CREATED.\n" +
-      "3. Change nothing else. Do not switch branches or modify files.",
+      " 2>/dev/null || true.\n" +
+      "3. Change nothing else. Do not switch branches or modify files.\n" +
+      "The host gate re-checks the branch after your run.",
     timeoutMs: 30 * 1000,
-    quiet: true
+    quiet: true,
+    // The branch's existence is a deterministic host fact: the gate verifies
+    // it after the child runs, so no reported token is trusted.
+    gate: { command: "git -C " + REPO_PATH + " rev-parse --verify refs/heads/" + integrationBranch },
+    acceptance: false
   });
-  if (!ensureBranch || !ensureBranch.ok || !String(ensureBranch.output || "").match(/BRANCH_EXISTS|BRANCH_CREATED/)) {
-    emit("implement: WARNING - could not ensure integration branch '" + integrationBranch + "'; worktree children may fail");
-  } else {
-    emit("implement: integration branch '" + integrationBranch + "' ensured");
+  if (!ensureBranch || !ensureBranch.ok) {
+    return {
+      ok: false,
+      ticket: ticketRef,
+      error: "Could not ensure integration branch '" + integrationBranch + "' in " + REPO_PATH +
+        ". Worktree children branch from it and would all fail. Fix the checkout and relaunch." +
+        (ensureBranch && ensureBranch.error ? " Gate detail: " + String(ensureBranch.error).slice(0, 1000) : ""),
+      branchSetupFailed: true
+    };
   }
+  emit("implement: integration branch '" + integrationBranch + "' ensured (gate verified)");
 }
 
 // Grooming preflight is a gate, not a warning. The lead can groom through the
@@ -806,19 +924,25 @@ const groomCheck = await runs.run("groom-check-" + keyOf(ticketRef), {
     task: "Read docs/agents/issue-tracker.md and inspect ticket " + ticketRef +
       " using the documented tracker workflow. " + (TRACKER_HINT || "") + "\n" +
       "Check whether the ticket is ready for implementation, including the documented grooming fields and acceptance criteria.\n" +
-      "Report GROOMED_OK if ready, or GROOM_NEEDED if the lead must groom it. Do not change the issue or repository.",
+      "Finish by calling structured_output: groomed (true when ready, false when the lead must groom it) and missing (the absent grooming fields, when any). Do not change the issue or repository.",
     timeoutMs: TRANSITION_TIMEOUT_MS,
-    quiet: true
+    quiet: true,
+    outputSchema: GROOM_OUTPUT_SCHEMA,
+    acceptance: false
   });
 if (!groomCheck || !groomCheck.ok) {
   return { ok: false, ticket: ticketRef, error: "Could not verify grooming for " + ticketRef + ". No implementation started." };
 }
-if (String(groomCheck.output || "").indexOf("GROOM_NEEDED") >= 0) {
+const groomed = !!(groomCheck.structuredOutput && groomCheck.structuredOutput.groomed === true);
+if (!groomed) {
   return {
     ok: false,
     ticket: ticketRef,
     groomingRequired: true,
-    error: "Ticket " + ticketRef + " is not groomed. Follow docs/agents/issue-tracker.md or /groom, then relaunch. No implementation started."
+    error: "Ticket " + ticketRef + " is not groomed" +
+      (groomCheck.structuredOutput && groomCheck.structuredOutput.missing
+        ? " (missing: " + groomCheck.structuredOutput.missing + ")" : "") +
+      ". Follow docs/agents/issue-tracker.md or /groom, then relaunch. No implementation started."
   };
 }
 emit("implement: ticket " + ticketRef + " is groomed");
@@ -1000,18 +1124,21 @@ if (blockedAxes.length && !(PR_WAIVER_REASON && !skipPR)) {
           "Confirm: (1) checkout is on " + integrationBranch + " and clean; " +
           "(2) the fixer's changes are present (git log --oneline main.." + integrationBranch +
           " shows commits beyond the original implementation); (3) the intermediate gate " + (NARROW_GATE && NARROW_GATE.command) +
-          " passes. If (3) passes and (2) shows changes, report MERGE_EFFECTIVE. " +
-          "If the changes are NOT present, report MERGE_MISSING. " + checkoutHint(REPO_PATH),
+          " passes (the host runs it automatically). Finish by calling structured_output with " +
+          "mergeState: MERGE_EFFECTIVE when (2) and (3) hold, MERGE_MISSING when the changes are not present. " +
+          checkoutHint(REPO_PATH),
         timeoutMs: GATE_TIMEOUT_MS + 120000,
         gate: gateObj(NARROW_GATE.command, GATE_TIMEOUT_MS),
         control: childControl(GATE_TIMEOUT_MS),
-        quiet: true
+        quiet: true,
+        outputSchema: MERGE_STATE_OUTPUT_SCHEMA,
+        acceptance: false
       }).catch(function(e) {
         emit("implement: fix-merge verification rejected (" + e + ")");
         return null;
       });
-      const gmOutput = (gmVerify && gmVerify.output) ? String(gmVerify.output) : "";
-      if (gmVerify && gmVerify.ok && gmOutput.indexOf("MERGE_EFFECTIVE") >= 0) {
+      const gmState = gmVerify && gmVerify.structuredOutput ? gmVerify.structuredOutput.mergeState : null;
+      if (gmVerify && gmVerify.ok && gmState === "MERGE_EFFECTIVE") {
         emit("implement: fix-merge acceptance rejected but git state verified; treating as merged");
         fixMerged = true;
       } else {
@@ -1048,7 +1175,7 @@ if (!reviewsOk && !waivedReviewBlock) {
   return {
     ok: false,
     error: "ESCALATION: review is incomplete or blocked for " + ticketRef + ". PR suppressed. " +
-      (reviewsIncomplete ? "An axis returned no 'Review verdict:' line (treated as INCOMPLETE, not a pass)." : ""),
+      (reviewsIncomplete ? "An axis returned no structured verdict (treated as INCOMPLETE, not a pass)." : ""),
     escalated: true,
     ticket: ticketRef,
     reviews: reviews,
@@ -1063,8 +1190,9 @@ try {
 } catch (eVer) {
   emit("implement: verifier launch rejected (" + eVer + ")");
 }
-const verificationVerdict = (verifyResult && verifyResult.ok)
-  ? parseVerification(verifyResult.output)
+const verificationVerdict = (verifyResult && verifyResult.ok &&
+  verifyResult.structuredOutput && verifyResult.structuredOutput.verdict)
+  ? verifyResult.structuredOutput.verdict
   : "UNVERDICTED";
 
 if (verificationVerdict !== "OK") {

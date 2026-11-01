@@ -41,4 +41,7 @@ Use the command from your inputs, with the base and head branches from your inpu
 
 ## Output
 
-The request URL and number (or, when there is no request surface: the branch, the evidence, and why nothing was opened).
+Finish by calling the harness's `structured_output` tool:
+
+- `prUrl`: the request URL (and report the number in your prose) when a request was opened
+- `noPrSurface`: `true` when there is no request surface; in that case leave the work on the integration branch and explain in your prose what evidence exists and why nothing was opened

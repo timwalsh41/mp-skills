@@ -36,9 +36,11 @@ The workflow owns implementation, verification, review, merging, and PR creation
 ## Lifecycle and PRs
 
 - Tracker lifecycle actions default to the target repo's `docs/agents/issue-tracker.md`. Issues move to In Progress before implementation and Ready for Review only after a PR is confirmed created.
-- A PR is attempted by default after final verification, complete reviews, and verification of every in-scope issue. `skipPR: true` stops at the integration branch. A repo with no PR surface reports `NO_PR_SURFACE` and leaves the branch available for direct integration.
+- A PR is attempted by default after final verification, complete reviews, and verification of every in-scope issue. `skipPR: true` stops at the integration branch. A repo with no PR surface is reported through the writer's structured output (`noPrSurface: true`) and the work stays on the integration branch.
 - Complete is post-merge only. After the user reports that the PR or integration branch has merged, rerun with `finalizeMergedPR: true` and `prUrl` or `mergeRef`. The workflow confirms that the merge includes the in-scope issues before transitioning them to Complete. It does not reimplement the issues.
 - `prWaiverReason` is only for a user-authorized waiver of completed review blockers. It opens a draft PR where supported, records the reason and findings, and returns a non-green result. It never waives a failed final gate, incomplete review, or unresolved issue.
 - An issue that fails the tracker-defined grooming preflight is not dispatched. Its dependents wait; independent groomed issues may proceed.
 
 The orchestrator enforces host-run gates and independent acceptance verification. Incomplete, escalated, PR-failed, and waived runs retain worktrees for user-directed recovery. Successful, fully gated runs clean up child worktrees.
+
+Every child's success mechanism (host gate, structured output, or implementer acceptance) is tabulated in [docs/agents/orchestrator-contracts.md](../../../docs/agents/orchestrator-contracts.md); `npm run test:workflows` enforces it.

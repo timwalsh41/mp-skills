@@ -47,21 +47,18 @@ Two rules bind it:
 
 Quote the hunk for every finding; a finding without a quote is a vibe. **Under 400 words.** Return only your report — no preamble, no aggregation, no verdict on the other axes.
 
-## Final line (required, exactly one)
+## Structured verdict (required)
 
-The orchestrator gates on this line; a review without it counts as **not completed**, not as a pass. Choose one:
+The orchestrator gates on the structured verdict; a review without one counts as **not completed**, not as a pass. Finish by calling the harness's `structured_output` tool with:
 
-```
-Review verdict: BLOCK
-```
-only for must-fix defects — a documented standard breached, or a smell severe enough that leaving it costs more than fixing it now.
+- `verdict`: one of the three values below
+- `findings`: a summary of your concrete findings (empty when none)
+- `missingTarget`: only with verdict `MISSING_TARGET`; what was absent
 
-```
-Review verdict: OK
-```
-otherwise, including when you have judgement-call smells to report but nothing must-fix.
+`verdict: "BLOCK"` only for must-fix defects: a documented standard breached, or a smell severe enough that leaving it costs more than fixing it now.
 
-```
-Review verdict: MISSING_TARGET
-```
-only when the branch or spec/ticket references named in your task do not exist. Report what was absent and stop — reviewing a nearby branch or another feature's tickets is never the fallback, because the orchestrator cannot tell that report from a real one.
+`verdict: "OK"` otherwise, including when you have judgement-call smells to report but nothing must-fix.
+
+`verdict: "MISSING_TARGET"` only when the branch or spec/ticket references named in your task do not exist. Report what was absent and stop: reviewing a nearby branch or another feature's tickets is never the fallback, because the orchestrator cannot tell that report from a real one.
+
+Your prose report stays in your final response; the structured verdict carries only the outcome.

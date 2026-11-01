@@ -32,21 +32,18 @@ Judge against what the spec says, not against what you would have designed. If y
 
 Quote the spec line for every finding. **Under 400 words.** Return only your report — no preamble, no aggregation, no verdict on the other axes.
 
-## Final line (required, exactly one)
+## Structured verdict (required)
 
-The orchestrator gates on this line; a review without it counts as **not completed**, not as a pass. Choose one:
+The orchestrator gates on the structured verdict; a review without one counts as **not completed**, not as a pass. Finish by calling the harness's `structured_output` tool with:
 
-```
-Review verdict: BLOCK
-```
-only when a stated requirement is missing, wrong, or silently out of scope.
+- `verdict`: one of the three values below
+- `findings`: a summary of your concrete findings (empty when none)
+- `missingTarget`: only with verdict `MISSING_TARGET`; what was absent
 
-```
-Review verdict: OK
-```
-otherwise.
+`verdict: "BLOCK"` only when a stated requirement is missing, wrong, or silently out of scope.
 
-```
-Review verdict: MISSING_TARGET
-```
-only when the branch or the spec/ticket references named in your task do not exist. Say what was absent and stop: substituting a nearby branch or a different feature's tickets produces a confident verdict on work nobody asked about.
+`verdict: "OK"` otherwise.
+
+`verdict: "MISSING_TARGET"` only when the branch or the spec/ticket references named in your task do not exist. Say what was absent and stop: substituting a nearby branch or a different feature's tickets produces a confident verdict on work nobody asked about.
+
+Your prose report stays in your final response; the structured verdict carries only the outcome.
