@@ -1,0 +1,5 @@
+interface:
+  display_name: "Teardown"
+  short_description: "Clean up the repo after a working session"
+policy:
+  allow_implicit_invocation: false
