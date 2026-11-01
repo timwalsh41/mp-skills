@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
+import { execFileSync, spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 const root = new URL("../skills/engineering/", import.meta.url);
@@ -13,7 +16,23 @@ async function executeWorkflow(skill, args, options = {}) {
     run(key, config = {}) {
       const call = { key: String(key), ...config };
       calls.push(call);
-      return Promise.resolve().then(() => responseFor(call, { ...options, ticketGraph: args.ticketGraph }));
+      return Promise.resolve().then(() => {
+        if (options.cacheKeys && options.cacheKeys.has(call.key)) return options.cacheKeys.get(call.key);
+        const response = responseFor(call, { ...options, ticketGraph: args.ticketGraph });
+        if (options.mergeAction && call.agent === "merger" && call.key.startsWith("merge-")) options.mergeAction(call);
+        if (options.runHostGates && response.ok && call.gate && (!options.gateFilter || options.gateFilter(call))) {
+          const gate = spawnSync("sh", ["-c", call.gate.command], { cwd: options.gateCwd || args.repoPath, encoding: "utf8" });
+          if (gate.status !== 0) return { ok: false, error: `host gate failed: ${gate.stderr || gate.stdout}` };
+          if (call.gate.output === "json") {
+            try { response.structuredOutput = JSON.parse(gate.stdout); }
+            catch { return { ok: false, error: "invalid typed host gate JSON" }; }
+          }
+        } else if (call.gate?.output === "json" && response.ok && !options.missingHostProof?.(call)) {
+          response.structuredOutput = { verified: true };
+        }
+        if (options.cacheKeys) options.cacheKeys.set(call.key, response);
+        return response;
+      });
     },
     all(promises) {
       return Promise.all(promises).then((results) => {
@@ -47,7 +66,7 @@ function responseFor(call, options) {
     };
   }
   if (key === "ticket-graph-forced" || key === "ticket-graph") {
-    return { ok: true, runId: "r-graph", output: JSON.stringify(options.ticketGraph) };
+    return { ok: true, runId: "r-graph", output: options.graphOutput ?? "graph discovered", structuredOutput: options.graphOutput === undefined ? options.ticketGraph : undefined };
   }
   if (key === "confirm-merge" || key.startsWith("verify-merge-") || key.startsWith("confirm-merge-")) {
     return {
@@ -89,7 +108,7 @@ function responseFor(call, options) {
       ok: true,
       runId: "r-verify-fix-merge",
       output: "fix-merge state checked",
-      structuredOutput: { mergeState: options.fixMergeMissing ? "MERGE_MISSING" : "MERGE_EFFECTIVE" },
+      ...(options.fixMergeMissing ? { ok: false, error: "captured patch missing" } : {}),
     };
   }
   if (key === "verify" || key.startsWith("verify-") || key.startsWith("verify-post-fix")) {
@@ -117,6 +136,9 @@ function responseFor(call, options) {
       structuredOutput: options.noPrSurface ? { noPrSurface: true } : { prUrl: "https://example.test/pull/42", noPrSurface: false },
     };
   }
+  if (options.failFirstMerge && key.endsWith("-attempt-1") && key.startsWith("merge-")) {
+    return { ok: false, error: "simulated merge failure" };
+  }
   if (key.startsWith("cleanup")) return { ok: true, runId: "r-cleanup", output: "WORKTREES_CLEANED" };
   if (label.startsWith("Validate ticket ")) {
     return {
@@ -127,8 +149,8 @@ function responseFor(call, options) {
     };
   }
   if (label.startsWith("Implement ticket ") || label.startsWith("Implement JRB-")) {
-    if (options.implFail) return { ok: false, error: options.implFail, output: "failed" };
-    return { ok: true, runId: "r-impl", output: "implementation complete" };
+    if (options.implFail || options.implFailByKey?.[key]) return { ok: false, error: options.implFailByKey?.[key] || options.implFail, output: "failed" };
+    return { ok: true, runId: "r-impl", output: "implementation complete", artifactPaths: options.implArtifactPaths };
   }
   if (label.startsWith("Merge ticket ") || label.startsWith("merge-") || label.startsWith("Commit and merge")) {
     return { ok: true, runId: "r-merge", output: "merge complete" };
@@ -147,6 +169,8 @@ function singleArgs(overrides = {}) {
     baseBranch: "main",
     repoPath: "/repo",
     trackerHint: "Read docs/agents/issue-tracker.md for issue operations.",
+    transitionCheckCommands: { in_progress: "true", ready_for_review: "true", complete: "true" },
+    prCheckCommand: "true", mergeCheckCommand: "true",
     ...overrides,
   };
 }
@@ -164,6 +188,8 @@ function specArgs(ticketGraph, overrides = {}) {
     maxParallel: 1,
     maxWaves: 1,
     ticketGraph: ticketGraph,
+    transitionCheckCommands: { in_progress: "true", ready_for_review: "true", complete: "true" },
+    prCheckCommand: "true", mergeCheckCommand: "true",
     ...overrides,
   };
 }
@@ -188,7 +214,7 @@ test("implement defaults to tracker-doc transitions and does not complete on PR 
 });
 
 test("implement reports a tracker with no PR surface without marking Ready for Review", async () => {
-  const { calls, result } = await executeWorkflow("implement", singleArgs(), { noPrSurface: true });
+  const { calls, result } = await executeWorkflow("implement", singleArgs({ noPrSurface: true }), { noPrSurface: true });
   assert.equal(result.ok, true);
   assert.equal(result.prCreated, false);
   assert.equal(result.prSurfaceUnavailable, true);
@@ -307,7 +333,7 @@ test("implement-spec defaults to tracker-doc transitions and waits for merge bef
 });
 
 test("implement-spec leaves the integration branch when the tracker has no PR surface", async () => {
-  const { calls, result } = await executeWorkflow("implement-spec", specArgs(oneTicket), { noPrSurface: true });
+  const { calls, result } = await executeWorkflow("implement-spec", specArgs(oneTicket, { noPrSurface: true }), { noPrSurface: true });
   assert.equal(result.ok, true);
   assert.equal(result.prCreated, false);
   assert.equal(result.prSurfaceUnavailable, true);
@@ -463,8 +489,8 @@ test("implement re-reviews a merged review fix before verification and the final
   assert.equal(result.fullGatePassed, true);
   assert.equal(result.ok, true);
   assert.equal(calls.find((call) => call.key.startsWith("impl-")).gate.command, "npm run test:fast");
-  assert.equal(calls.find((call) => call.key.startsWith("merge-")).gate.command, "npm run test:fast");
-  assert.equal(calls.find((call) => call.key === "final-gate").gate.command, "npm run test:full");
+  assert.match(calls.find((call) => call.key.startsWith("merge-")).gate.command, /\(npm run test:fast\).*printf/);
+  assert.match(calls.find((call) => call.key === "final-gate").gate.command, /\(npm run test:full\).*printf/);
 });
 
 test("implement-spec retries only the reviewer whose initial run failed", async () => {
@@ -477,9 +503,9 @@ test("implement-spec retries only the reviewer whose initial run failed", async 
   const implementer = calls.find((call) => call.label.startsWith("Implement ticket"));
   const merger = calls.find((call) => call.label.startsWith("Merge ticket"));
   assert.equal(implementer.gate.command, "npm run test:unit");
-  assert.equal(merger.gate.command, "npm run test:unit");
+  assert.match(merger.gate.command, /\(npm run test:unit\).*printf/);
   const finalGate = calls.find((call) => call.key === "final-verify");
-  assert.equal(finalGate.gate.command, "npm test");
+  assert.match(finalGate.gate.command, /\(npm test\).*printf/);
 });
 
 test("implement-spec re-reviews and re-verifies a review fix before its final full gate", async () => {
@@ -500,7 +526,7 @@ test("implement-spec re-reviews and re-verifies a review fix before its final fu
   const fixImplementer = calls.find((call) => call.key === "fix-review-findings");
   const fixMerger = calls.find((call) => call.key === "merge-review-fixes");
   assert.equal(fixImplementer.gate.command, "npm run test:unit");
-  assert.equal(fixMerger.gate.command, "npm run test:unit");
+  assert.match(fixMerger.gate.command, /\(npm run test:unit\).*printf/);
 });
 
 test("implement suppresses a PR when the final full gate fails", async () => {
@@ -547,7 +573,7 @@ test("implement-spec can opt selected tickets into full intermediate gates", asy
   const implementer = calls.find((call) => call.label.startsWith("Implement ticket"));
   const merger = calls.find((call) => call.label.startsWith("Merge ticket"));
   assert.equal(implementer.gate.command, "npm test");
-  assert.equal(merger.gate.command, "npm test");
+  assert.match(merger.gate.command, /\(npm test\).*printf/);
 });
 
 test("both workflows tell agents to record evidence and check adjacent consumers", async () => {
@@ -648,7 +674,6 @@ for (const [skill, source] of Object.entries(SOURCES)) {
       "PR_OUTPUT_SCHEMA",
       "TRANSITION_OUTPUT_SCHEMA",
       "CONFIRM_MERGE_OUTPUT_SCHEMA",
-      "MERGE_STATE_OUTPUT_SCHEMA",
     ]) {
       assert.ok(source.includes(`const ${name} =`), `${name} missing from ${skill}`);
     }
@@ -706,6 +731,7 @@ test("merger idempotency is content-based, not trailer-based", async () => {
   const spec = await executeWorkflow("implement-spec", specArgs(oneTicket));
   const specMerge = spec.calls.find((call) => call.label.startsWith("Merge ticket"));
   assert.match(specMerge.task, /git apply --check --reverse/);
+  assert.match(specMerge.task, /check out feature\/jrb-001-integration/);
   assert.ok(!specMerge.task.includes("git log --format=%B"));
 });
 
@@ -714,7 +740,7 @@ test("clean-tree and branch preflights are decided by host gates, not child pros
   const preflight = single.calls.find((call) => call.key === "preflight-clean-tree");
   assert.match(preflight.gate.command, /status --porcelain/);
   const ensure = single.calls.find((call) => call.key === "ensure-integration-branch");
-  assert.match(ensure.gate.command, /rev-parse --verify refs\/heads\/feature\/JRB-012-modal-dismissal/);
+  assert.match(ensure.gate.command, /rev-parse --verify 'refs\/heads\/feature\/JRB-012-modal-dismissal'/);
 
   const spec = await executeWorkflow("implement-spec", specArgs(oneTicket));
   const specPreflight = spec.calls.find((call) => call.key === "preflight-clean-tree");
@@ -731,7 +757,8 @@ test("implement-spec verifies a failed fix-merge against git state with a valid 
   const gmVerify = calls.find((call) => call.key.startsWith("verify-fix-merge-"));
   assert.ok(gmVerify, "verify-fix-merge child should run when the fix merger fails");
   assert.ok(!gmVerify.key.includes("undefined"));
-  assert.equal(gmVerify.outputSchema.properties.mergeState.enum.join(","), "MERGE_EFFECTIVE,MERGE_MISSING");
+  assert.equal(gmVerify.gate.output, "json");
+  assert.equal(gmVerify.agentContract.version, 1);
   assert.equal(gmVerify.acceptance, false);
   assert.equal(result.fixMerged, true);
   const specFixMergeTask = calls.find((call) => call.key === "merge-review-fixes");
@@ -747,4 +774,244 @@ test("implement-spec reads the continue-child's worktree from structured output"
   assert.ok(continueChild, "a timed-out implementer should fall through to the continue-child");
   assert.equal(continueChild.outputSchema.properties.worktreePath.type, "string");
   assert.ok(!continueChild.task.includes("ABSOLUTE LAST LINE"));
+});
+
+async function integrationFixture(fn) {
+  const repo = await mkdtemp(join(tmpdir(), "workflow-contract-"));
+  const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+  try {
+    git("init", "-q", "-b", "main");
+    git("config", "user.name", "Workflow Test");
+    git("config", "user.email", "workflow@example.test");
+    await writeFile(join(repo, "feature.txt"), "old\n");
+    git("add", ".");
+    git("commit", "-qm", "chore: initial");
+    git("checkout", "-qb", "feature/JRB-012-modal-dismissal");
+    await writeFile(join(repo, "feature.txt"), "new\n");
+    const patch = git("diff");
+    git("checkout", "--", "feature.txt");
+    const asyncDir = join(repo, "async-subagent-runs", "r-impl");
+    await mkdir(join(asyncDir, "worktree-diffs", "step-0"), { recursive: true });
+    const patchPath = join(asyncDir, "worktree-diffs", "step-0", "change.patch");
+    await writeFile(patchPath, patch);
+    // Runtime artifacts live outside the checkout in production. The fixture
+    // keeps them here for access; exclude them from git's clean-tree check.
+    await writeFile(join(repo, ".gitignore"), "async-subagent-runs/\n");
+    git("add", ".gitignore");
+    git("commit", "-qm", "chore: ignore runtime artifacts");
+    await fn({ repo, git, patchPath, asyncDir });
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+}
+
+test("host clean-tree gate fails closed when the checkout is not a git repository", async () => {
+  for (const skill of ["implement", "implement-spec"]) {
+    const graph = structuredClone(oneTicket);
+    graph.preflight.integrationBranch = "feature/JRB-012-modal-dismissal";
+    const { calls } = await executeWorkflow(skill, skill === "implement"
+      ? singleArgs({ repoPath: "/not/a/workflow/repo", skipPR: true })
+      : specArgs(graph, { repoPath: "/not/a/workflow/repo", skipPR: true }));
+    const command = calls.find((call) => call.key === "preflight-clean-tree").gate.command;
+    assert.notEqual(spawnSync("sh", ["-c", command]).status, 0, `${skill} incorrectly accepted a missing checkout`);
+  }
+});
+
+test("a passing test suite cannot accept a merger that never applied the captured patch", async () => {
+  await integrationFixture(async ({ repo, git, asyncDir }) => {
+    const args = singleArgs({ repoPath: repo, fullGate: "true", narrowGate: "true", skipPR: true });
+    const { calls, result } = await executeWorkflow("implement", args, {
+      implArtifactPaths: [asyncDir], runHostGates: true,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.failureClass, "merge");
+    assert.ok(calls.some((call) => call.key.startsWith("merge-")));
+    assert.equal(git("show", "HEAD:feature.txt"), "old\n");
+  });
+});
+
+test("implement-spec merger retries launch under distinct keys after a failed first attempt", async () => {
+  const { calls, result } = await executeWorkflow("implement-spec", specArgs(oneTicket), {
+    cacheKeys: new Map(), failFirstMerge: true,
+  });
+  assert.equal(result.ok, true);
+  const merges = calls.filter((call) => call.key.startsWith("merge-"));
+  assert.equal(merges.length, 2);
+  assert.notEqual(merges[0].key, merges[1].key);
+});
+
+test("host postconditions accept only an applied patch on the integration branch", async () => {
+  await integrationFixture(async ({ repo, git, patchPath, asyncDir }) => {
+    const args = singleArgs({ repoPath: repo, fullGate: "true", narrowGate: "true", skipPR: true });
+    const { result } = await executeWorkflow("implement", args, {
+      implArtifactPaths: [asyncDir], runHostGates: true,
+      mergeAction: () => {
+        git("apply", "--index", patchPath);
+        git("commit", "-qm", "fix: update fixture\n\nIssue: JRB-012");
+      },
+    });
+    assert.equal(result.ok, true);
+    assert.equal(git("show", "HEAD:feature.txt"), "new\n");
+  });
+});
+
+test("implement-spec refuses a green test command when the merger did not commit", async () => {
+  await integrationFixture(async ({ repo, asyncDir }) => {
+    const graph = structuredClone(oneTicket);
+    graph.preflight.integrationBranch = "feature/JRB-012-modal-dismissal";
+    const args = specArgs(graph, { repoPath: repo, integrationBranch: "feature/JRB-012-modal-dismissal", fullGate: "true", narrowGate: "true", skipPR: true });
+    const { calls, result } = await executeWorkflow("implement-spec", args, {
+      implArtifactPaths: [asyncDir], runHostGates: true,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(calls.filter((call) => call.key.startsWith("merge-")).length, 2);
+  });
+});
+
+test("a transition's structured success cannot override a failing tracker-state check", async () => {
+  await integrationFixture(async ({ repo }) => {
+    const { result, calls } = await executeWorkflow("implement", singleArgs({
+      repoPath: repo, fullGate: "true", skipPR: true,
+      transitionCheckCommands: { in_progress: "false" },
+    }), { runHostGates: true });
+    assert.equal(result.ok, false);
+    assert.ok(!calls.some((call) => call.key.startsWith("impl-")));
+  });
+});
+
+test("a child-reported PR URL requires an independent host lookup", async () => {
+  const { calls, result } = await executeWorkflow("implement", singleArgs({ prCheckCommand: "false" }), {
+    runHostGates: true, gateFilter: (call) => call.key === "confirm-pr",
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.prFailed, true);
+  assert.ok(calls.some((call) => call.key === "confirm-pr"));
+});
+
+test("post-merge completion requires a host check of the merge reference", async () => {
+  const { calls, result } = await executeWorkflow("implement", singleArgs({
+    finalizeMergedPR: true, prUrl: "https://example.test/pull/42", mergeCheckCommand: "false",
+  }), { runHostGates: true, gateFilter: (call) => call.key.startsWith("check-merge") });
+  assert.equal(result.ok, false);
+  assert.ok(!calls.some((call) => call.key.includes("transition-complete")));
+});
+
+test("implement-spec does not complete issues when host merge confirmation fails", async () => {
+  const { result, calls } = await executeWorkflow("implement-spec", specArgs(oneTicket, {
+    finalizeMergedPR: true, prUrl: "https://example.test/pull/42", mergeCheckCommand: "false",
+  }), { runHostGates: true, gateFilter: (call) => call.key === "check-merge" });
+  assert.equal(result.finalized, false);
+  assert.ok(!calls.some((call) => call.key.includes("transition-complete")));
+});
+
+test("implement-spec rejects an incomplete ticket graph rather than implementing a subset", async () => {
+  const graph = structuredClone(oneTicket);
+  graph.tickets.push({ ref: "JRB-013", title: "second ticket", resolved: false, blockedBy: [], groomed: true });
+  const partial = JSON.stringify(graph).slice(0, -65);
+  const { result, calls } = await executeWorkflow("implement-spec", specArgs(graph), {
+    graphOutput: partial,
+  });
+  assert.equal(result.ok, false);
+  assert.ok(!calls.some((call) => call.key.startsWith("impl-")));
+});
+
+test("successful child execution without typed host proof never passes preflight", async () => {
+  for (const skill of ["implement", "implement-spec"]) {
+    const { calls, result } = await executeWorkflow(skill,
+      skill === "implement" ? singleArgs() : specArgs(oneTicket), {
+        missingHostProof: (call) => call.key === "preflight-clean-tree",
+      });
+    assert.equal(result.ok, false);
+    assert.ok(!calls.some((call) => call.key.startsWith("impl-")));
+  }
+});
+
+test("a failed implementer does not relaunch successful siblings under cached keys", async () => {
+  const graph = structuredClone(oneTicket);
+  graph.tickets.push({ ref: "JRB-013", title: "Independent", resolved: false, blockedBy: [], onBranch: false, groomed: true });
+  const { calls } = await executeWorkflow("implement-spec", specArgs(graph, { maxParallel: 2 }), {
+    cacheKeys: new Map(), implFailByKey: { "impl-1-tJRB-012": "provider unavailable" },
+  });
+  for (const ref of ["JRB-012", "JRB-013"]) {
+    assert.equal(calls.filter((call) => call.key === `impl-1-t${ref}`).length, 1);
+  }
+});
+
+test("both workflows reject missing state-check configuration before launching children", async () => {
+  for (const skill of ["implement", "implement-spec"]) {
+    const args = skill === "implement"
+      ? singleArgs({ transitionCheckCommands: {} })
+      : specArgs(oneTicket, { transitionCheckCommands: {} });
+    const { result, calls } = await executeWorkflow(skill, args);
+    assert.equal(result.configError, true);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /transitionCheckCommands.in_progress/);
+    assert.equal(calls.length, 0);
+  }
+});
+
+test("implement-spec rejects a false tracker-state claim before starting a worktree", async () => {
+  await integrationFixture(async ({ repo }) => {
+    const graph = structuredClone(oneTicket);
+    graph.preflight.integrationBranch = "feature/JRB-012-modal-dismissal";
+    const { result, calls } = await executeWorkflow("implement-spec", specArgs(graph, {
+      repoPath: repo, integrationBranch: "feature/JRB-012-modal-dismissal", fullGate: "true",
+      transitionCheckCommands: { in_progress: "false" }, skipPR: true,
+    }), { runHostGates: true });
+    assert.equal(result.ok, false);
+    assert.ok(!calls.some((call) => call.key.startsWith("impl-")));
+  });
+});
+
+test("implement-spec confirms the captured patch and issue trailer on the host", async () => {
+  await integrationFixture(async ({ repo, git, patchPath, asyncDir }) => {
+    const graph = structuredClone(oneTicket);
+    graph.preflight.integrationBranch = "feature/JRB-012-modal-dismissal";
+    const args = specArgs(graph, { repoPath: repo, integrationBranch: "feature/JRB-012-modal-dismissal", fullGate: "true", narrowGate: "true", skipPR: true });
+    const { result } = await executeWorkflow("implement-spec", args, {
+      implArtifactPaths: [asyncDir], runHostGates: true,
+      mergeAction: () => {
+        git("apply", "--index", patchPath);
+        git("commit", "-qm", "fix: update fixture\n\nIssue: JRB-012");
+      },
+    });
+    assert.equal(result.ok, true);
+    assert.equal(git("show", "HEAD:feature.txt"), "new\n");
+  });
+});
+
+test("gate-only children use host-owned typed proof rather than a child acceptance report", async () => {
+  const single = await executeWorkflow("implement", singleArgs());
+  const spec = await executeWorkflow("implement-spec", specArgs(oneTicket));
+  for (const call of [...single.calls, ...spec.calls].filter((step) => step.gate?.output === "json")) {
+    assert.equal(call.agentContract?.version, 1, `${call.key} must not require an acceptance report`);
+    assert.equal(call.acceptance, false);
+    assert.equal(call.outputSchema, undefined, `${call.key} cannot mix a typed gate and child outputSchema`);
+    assert.equal(call.gate.schema.properties.verified.const, true);
+  }
+  for (const calls of [single.calls, spec.calls]) {
+    const transition = calls.find((call) => call.key.startsWith("transition-"));
+    assert.ok(transition.outputSchema);
+    assert.equal(transition.gate, undefined);
+    assert.ok(calls.some((call) => call.key.startsWith("check-transition-") && call.gate.output === "json"));
+  }
+});
+
+test("shared verdict schemas remain identical across both orchestrators", () => {
+  for (const name of ["REVIEW", "VERIFY", "PR", "TRANSITION", "CONFIRM_MERGE"]) {
+    const re = new RegExp(`const ${name}_OUTPUT_SCHEMA = [\\s\\S]*?\\n};`);
+    const single = SOURCES.implement.match(re)?.[0];
+    const spec = SOURCES["implement-spec"].match(re)?.[0];
+    assert.ok(single && spec, `${name} is missing`);
+    assert.equal(spec, single, `${name} drifted across workflows`);
+  }
+});
+
+test("a PR surface claimed absent by a worker needs advance authorization", async () => {
+  for (const skill of ["implement", "implement-spec"]) {
+    const args = skill === "implement" ? singleArgs() : specArgs(oneTicket);
+    const { result } = await executeWorkflow(skill, args, { noPrSurface: true });
+    assert.equal(result.ok, false);
+    assert.equal(result.prFailed, true);
+  }
 });

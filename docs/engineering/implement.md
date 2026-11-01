@@ -8,11 +8,11 @@ Lifecycle operations come from the target repo's `docs/agents/issue-tracker.md`,
 
 You invoke this by typing `/implement`, and the agent won't reach for it on its own. Reach for it when one groomed issue, or a small standalone spec, is ready to build. For a dependency graph of several issues, use [`implement-spec`](https://aihero.dev/skills-implement-spec) instead.
 
-The target repo should describe its issue-tracker workflow in `docs/agents/issue-tracker.md` and its test and PR commands in `docs/agents/verification.md`. Groom an issue first when its tracker documentation says it is not ready.
+The target repo should describe its issue-tracker workflow in `docs/agents/issue-tracker.md` and its test and PR commands in `docs/agents/verification.md`. The agent must also be able to derive commands to check the issue status and confirm a created PR or completed merge independently. Without those checks, it stops before launching. Groom an issue first when its tracker documentation says it is not ready.
 
 ## The run
 
-The workflow uses fast gates during implementation, then runs standards and quality reviews, independent acceptance verification, and the full gate on the final reviewed commit. A review fix gets fresh reviews before PR eligibility. It opens a PR by default only when every gate passes; `skipPR` opts out.
+The workflow uses fast gates during implementation and checks that the captured patch and issue commit are on the integration branch. It then runs standards and quality reviews, independent acceptance verification, and the full gate on the final reviewed commit. A review fix gets fresh reviews before PR eligibility. It opens a PR by default only when every gate passes; `skipPR` opts out.
 
 A user can explicitly waive completed review blockers with `prWaiverReason`. That produces a draft PR where the repo supports drafts, records the unresolved findings and reason, and is reported as non-green. It does not waive a failed test gate, incomplete review, or unmet acceptance criteria.
 
@@ -38,8 +38,8 @@ No. It owns one issue at a time. Use [`implement-spec`](https://aihero.dev/skill
 
 ## It's working if
 
-- The run stops before coding when the issue fails the documented grooming preflight, and stops before any child work when the checkout is dirty — with the full `git status --porcelain` output for the user to resolve.
-- The issue moves to In Progress before implementation and Ready for Review only after a PR is created.
+- The run stops before coding when the issue is not groomed or the checkout is dirty or invalid. It also stops when it cannot verify the required tracker or request state.
+- The issue moves to In Progress before implementation and Ready for Review only after a PR is independently confirmed to exist.
 - Any review fix is freshly reviewed, and the full gate passes on the final reviewed commit before a PR can open.
 - The PR is suppressed when verification fails or reviews are incomplete or blocked without an explicit waiver.
 - Complete is recorded only after the merge is independently confirmed.

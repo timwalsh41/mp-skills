@@ -17,13 +17,13 @@ You invoke this by typing `/implement-spec`, and the agent won't reach for it on
 
 ## Prerequisites
 
-- **An issue tracker.** The skill reads issues from the tracker configured by [setup-matt-pocock-skills](https://aihero.dev/skills-setup-matt-pocock-skills). `docs/agents/issue-tracker.md` describes how to groom, update, transition, and complete issues. If no tracker has been configured, the skill stops rather than guessing.
+- **An issue tracker with checkable states.** The skill reads issues from the tracker configured by [setup-matt-pocock-skills](https://aihero.dev/skills-setup-matt-pocock-skills). `docs/agents/issue-tracker.md` describes how to groom, update, transition, and complete issues. The agent must derive host commands to verify lifecycle statuses, created PRs, and completed merges. If it cannot, the skill stops before dispatching.
 - **Tickets with blocking edges**, as [to-tickets](https://aihero.dev/skills-to-tickets) writes them. Without edges the graph is flat and every ticket starts at once.
 - **A [harness](https://www.aihero.dev/ai-coding-dictionary/harness) that runs subagents in the background and gives each one a git worktree.** The skill exists to run tickets at the same time, so on a harness that runs subagents one at a time, it is only a slower `implement`.
 
 ## The integration branch
 
-Everything lands on one branch. Each implementer:
+Everything lands on one branch. The orchestrator rejects malformed or changing issue lists and confirms each captured patch and issue commit on that branch before accepting a merge. Each implementer:
 
 1. confirms its worktree is based on the integration branch before it starts,
 2. builds its ticket with [tdd](https://aihero.dev/skills-tdd), red-green one slice at a time,
@@ -77,9 +77,9 @@ A worktree holds only what git tracks. Tests that read gitignored fixtures, loca
 - A ticket starts as soon as its last blocker lands on the integration branch, not when the whole run ends.
 - Every ticket's trace shows `tdd` running, with a failing test before the code.
 - Merges into the integration branch are fast-forwards, not conflict resolutions.
-- The integration branch contains every in-scope issue, has fresh reviews and verification after any review fix, and passes the full-suite gate on that final commit before any PR opens.
+- The integration branch contains every in-scope issue, with captured patches confirmed by host gates, fresh reviews and verification after any review fix, and the full-suite gate passing before any PR opens.
 - Issues move to Ready for Review only after PR creation, and to Complete only after merge confirmation.
-- A dirty checkout stops the run at the pre-flight with the full `git status --porcelain` output, before any implementer worktree is attempted.
+- A dirty or invalid checkout stops the run at the preflight, before any implementer worktree is attempted.
 - A ticket that fails twice with the same failure signature escalates immediately rather than exhausting its remediation ladder.
 
 ## Where it fits

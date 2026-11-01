@@ -9,19 +9,15 @@ Orchestrate implementation of one ticket on its integration branch. The workflow
 ## Steps
 
 1. Read the ticket and `docs/agents/issue-tracker.md`. Follow that document for grooming, ticket fields, status transitions, and resolution. If the ticket is not ready for implementation, groom it through the documented process before launching the workflow.
-2. Read `docs/agents/verification.md` for the full and fast gates, base branch, and PR instructions. Resolve the ticket's branch and integration details from the ticket and repo guidance.
+2. Read `docs/agents/verification.md` for the full and fast gates, base branch, and PR instructions. Resolve the ticket's branch and integration details. From the repo's tracker and request docs, supply host commands that return 0 only when each lifecycle transition reached its target status, the created PR exists, or the supplied merge reference contains the issue. If the required check cannot be constructed, stop and report the missing contract instead of launching.
 3. Launch the orchestrator and yield. It creates the integration branch when needed, runs the implementation and review workflow, and opens a PR by default when the gates pass. The branch and PR instructions come from the repo docs.
 
 ```js
 subagent({ workflow: "/home/pi/.pi/agent/skills/implement/orchestrate.js", async: true, args: {
-  ticketRef, fullGate, narrowGate, integrationBranch,
-  baseBranch, repoPath,
-  gateTimeoutMs, implTimeoutMs,
-  maxRemediations, maxReviewRetries,
-  skipPR, prInstructions, prWaiverReason,
-  finalizeMergedPR, prUrl, mergeRef,
-  standardsDocs, trackerHint,
-  singleRetestCommand, agents
+  ticketRef, fullGate, narrowGate, integrationBranch, repoPath,
+  transitionCheckCommands, prCheckCommand
+  // Add only applicable options such as skipPR, noPrSurface, or
+  // finalizeMergedPR + mergeRef + mergeCheckCommand (at most 16 args).
 }})
 ```
 
@@ -29,10 +25,10 @@ The script lives next to this skill. Use its absolute installed path, not `~/`, 
 
 ## Lifecycle and exceptions
 
-- Lifecycle actions default to `docs/agents/issue-tracker.md`; do not require the prompt to pass transition commands. The workflow uses the documented actions to move an issue to In Progress before implementation and Ready for Review after a PR is created. A tracker that explicitly has no such transitions is reported as unsupported rather than guessed at. `transitionCommands` is an optional override for unusual integrations.
-- Complete is a post-merge action, not a PR-creation action. After the user reports that the PR or integration branch was merged, rerun the workflow with `finalizeMergedPR: true` and `prUrl` or `mergeRef`. It confirms the merge using the repo docs before asking the tracker to complete the issue. It does not reimplement the ticket.
+- Lifecycle **writes** default to `docs/agents/issue-tracker.md`; `transitionCommands` is an optional override. Supply `transitionCheckCommands` with commands for `in_progress` and, when a PR is expected, `ready_for_review`. Finalization uses `complete`. Each command must re-read the tracker and exit 0 only when the issue is in that phase's target status. Use `$TICKET_REF` and `$PHASE` as placeholders outside any other shell quotes; the workflow quotes the values. A missing check stops the run before any child launches.
+- Complete is post-merge only. For `finalizeMergedPR: true`, provide `prUrl` or `mergeRef` and `mergeCheckCommand` to independently verify the reference includes `$TICKET_REF` (and optionally `$BRANCH`). It does not reimplement the issue.
 - `prWaiverReason` is only for an explicit user-approved waiver of completed review blockers. The workflow creates a draft request where supported, includes the reason and unresolved review findings, and reports a waived, non-green result. It cannot waive failed verification, incomplete reviews, or unfinished work.
-- `skipPR: true` opts out of PR creation. Otherwise PR creation is attempted after the required verification and review gates pass. The PR writer reports its outcome through structured output (`prUrl` or `noPrSurface`); Ready for Review is set only for a created request.
+- `skipPR: true` opts out of PR creation. Otherwise supply `prCheckCommand` to independently look up `$PR_URL` on `$BRANCH` after the PR writer returns it. Use `noPrSurface: true` only if the repo docs explicitly rule out a request surface. An unverified URL or unsupported no-PR claim is a failure, not a green run.
 
 ## What the workflow enforces
 
@@ -40,7 +36,7 @@ The script lives next to this skill. Use its absolute installed path, not `~/`, 
 - **Grooming gate:** an issue that fails the documented preflight is not implemented until it is groomed.
 - **Gate enforcement:** every implementation and merge carries a host-run verification gate; claims alone do not count.
 - **Structured verdicts:** reviews, verification, the PR writer, transitions, merge confirmation, and grooming all report through the harness's structured_output tool. The orchestrator reads parsed fields and never scans child prose for decision tokens. A missing structured verdict is incomplete, not a pass, and suppresses the PR.
-- **Host-decided facts:** tree cleanliness and branch existence are decided by host-run gate commands; merger and final-gate children carry `acceptance: false` so a green gate or commit can never be rejected for a missing report.
+- **Host-decided facts:** a valid, clean checkout and branch, the captured patch applied on the integration branch with an issue commit, lifecycle states, and PR or merge existence are verified by host-run gates. Merger and final-gate children use `acceptance: false` so missing prose reports do not reject green gates.
 - **Independent verification:** a verifier re-derives acceptance criteria from the committed code before PR eligibility.
 - **Conventional Commits:** the merger validates a Conventional Commit subject and an `Issue: <ref>` body trailer. Whether the work is already merged is decided from the captured patch itself (`git apply --check --reverse`), never from trailer grep; the trailer lets later runs recognize already-landed work only as context.
 - **PR gate:** no PR without passing verification, complete reviews, and verified acceptance criteria, except for the explicit review waiver described above.

@@ -18,7 +18,7 @@ Take these from the task. If the gate command is missing, read `docs/agents/veri
 
 ### 1. Check the checkout first
 
-Confirm the main checkout is on the integration branch and clean (`git status`). If it is dirty, or on another branch, **STOP and report** — change nothing. You are the only writer here, so a dirty tree means something else went wrong.
+Confirm the main checkout is clean (`git status`). If your task explicitly names a base branch and allows switching from it, check out the integration branch when the clean checkout is on that base branch, then recheck cleanliness. If the tree is dirty or is on any other branch, **STOP and report**. You are the only writer here, so a dirty tree means something else went wrong.
 
 ### 2. Content-based idempotency check
 
@@ -32,7 +32,7 @@ Never decide this from `Issue:` trailer grep or `git log --grep`: a trailer prov
 ### 3. Apply the work
 
 - Manifest/patch form: `git apply --index <patch>` — or, when your task gives a worktree path: `git -C <worktree> diff > /tmp/ticket-<n>.patch && git apply --index /tmp/ticket-<n>.patch`. Use a ticket-specific temp filename; other merges may run around you.
-- If the patch is empty or already applied, say so and continue.
+- If the patch is missing or empty, stop and report the failed handoff. An already-applied patch was handled in step 2.
 
 ### 4. Conflicts
 
@@ -56,4 +56,4 @@ Never decide this from `Issue:` trailer grep or `git log --grep`: a trailer prov
 
 ## Output
 
-Merge status (success / `MERGE_CONFLICT` / failure), commit hash, gate result on the integration branch, and any conflict or pre-existing-failure detail.
+Merge status (success / `MERGE_CONFLICT` / failure), commit hash when one exists, and conflict or pre-existing-failure detail. The host gate checks the applied patch, issue commit, branch, and tests after you finish.
