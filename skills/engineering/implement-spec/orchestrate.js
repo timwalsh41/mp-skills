@@ -134,7 +134,11 @@ const A = args || {};
 const specRef = A.specRef || A.specPath || null;
 const ticketsRef = A.ticketsRef || null;
 const integrationBranch = A.integrationBranch || null;
-const FULL_GATE = A.fullGate || null;
+// Config preflight errors collect here; unwrapGate (below) reports gate-arg
+// violations into this array, so it must be declared before the gate args.
+const configErrors = [];
+const FULL_GATE = unwrapGate(A.fullGate, "fullGate");
+const NARROW_GATE = unwrapGate(A.narrowGate, "narrowGate") || FULL_GATE;
 const finalizeMergedPR = boolArg(A.finalizeMergedPR);
 
 // Args arrive exactly as the caller wrote them. A caller that quotes a
@@ -151,6 +155,22 @@ function boolArg(value) {
   if (value === undefined || value === null || value === "") return false;
   if (typeof value === "boolean") return value;
   return String(value).toLowerCase() === "true";
+}
+// Gate args: accept a bare command string or a { command, timeoutMs } object;
+// reject anything else with an exact, named message (JRB-016: two launches
+// were burned passing objects/booleans where a string was expected, each
+// surfacing only at the first child spawn minutes into the run).
+function unwrapGate(value, label) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string" && value.trim()) return { command: value.trim(), timeoutMs: null };
+  if (value && typeof value === "object" && typeof value.command === "string" && value.command.trim()) {
+    return {
+      command: value.command.trim(),
+      timeoutMs: typeof value.timeoutMs === "number" ? value.timeoutMs : null
+    };
+  }
+  configErrors.push(label + " must be a command string or { command, timeoutMs }; got " + describeArg(value));
+  return null;
 }
 
 // Repo-specific args have no fallback: running a gate that does not exist in
@@ -205,7 +225,7 @@ function runTransition(phase, ref, variables) {
         "Branch: " + String(variables.branch || ""),
         "PR URL: " + String(variables.prUrl || ""),
         "Use the documented transition only. If the tracker explicitly has no such lifecycle transition, report TRANSITION_UNSUPPORTED without changing state.",
-        "Otherwise report exactly TRANSITION_APPLIED, TRANSITION_ALREADY_SET, or TRANSITION_FAILED, with the resulting status and any error.",
+        "Otherwise report exactly TRANSITION_APPLIED, TRANSITION_ALREADY_SET, TRANSITION_FAILED, or TRANSITION_STATE_MISMATCH, with the resulting status and any error.",
         "Do not modify code, other issues, or repository files."
       ].join("\n");
   return runs.run("transition-" + phase + "-" + keyOf(ref), {
@@ -218,22 +238,21 @@ function runTransition(phase, ref, variables) {
       " implementer and verifier children, never by a transition." +
       "\nReport the HTTP status code or error. Change nothing else.",
     timeoutMs: TRANSITION_TIMEOUT_MS,
-    quiet: true
+    quiet: true,
+    // Lifecycle writes are decided by the tracker's state, not by this
+    // child's prose; declaring read-only keeps the harness from demanding an
+    // acceptance report that a transition child cannot meaningfully produce.
+    acceptanceRole: "read-only"
   }).then(function(r) {
     const output = String((r && r.output) || "");
     const unsupported = output.indexOf("TRANSITION_UNSUPPORTED") >= 0;
-    // Output-based firewall check: a transition child that confesses to
-    // writing evidence or the ticket description has violated its contract
-    // (JRB-014: a transition child spent its budget appending evidence to the
-    // description and aborted the whole run). Treated as a failure, not a pass.
-    const wroteEvidence = /Agent Execution Evidence/i.test(output) ||
-      /\b(?:appended|wrote|added|updated|modified)\s+(?:the\s+)?(?:ticket\s+)?description/i.test(output);
-    if (wroteEvidence) {
-      emit("implement-spec: WARNING - transition " + phase + " for " + ref +
-           " reported writes outside its contract; treating as failed");
-    }
-    const ok = !!(r && r.ok) && !wroteEvidence &&
-      (unsupported || !/TRANSITION_FAILED|TRACKER_DOC_MISSING|TRANSITION_UNCLEAR/.test(output));
+    // Firewall is state-verified, not prose-scanned: a compliant child that
+    // merely reports "No Agent Execution Evidence" must not trip it
+    // (JRB-016 false positive aborted the whole run). Pass requires a
+    // positive transition token; TRANSITION_STATE_MISMATCH means the phase
+    // lock refused an out-of-order lifecycle jump and is a failure.
+    const ok = !!(r && r.ok) &&
+      (unsupported || !/TRANSITION_FAILED|TRACKER_DOC_MISSING|TRANSITION_UNCLEAR|TRANSITION_STATE_MISMATCH/.test(output));
     emit("implement-spec: transition " + phase + " for " + ref + " -- " + (unsupported ? "unsupported by tracker" : (ok ? "done" : "failed")));
     return { ok: ok, output: output, unsupported: unsupported };
   });
@@ -305,12 +324,13 @@ const MAX_REVIEW_RETRIES = numArg(A.maxReviewRetries, 2);
 // purpose: a lifecycle step should never need per-repo tuning.
 const TRANSITION_TIMEOUT_MS = 3 * 60 * 1000;
 
-// Gate commands are args-only
-const NARROW_GATE = A.narrowGate || FULL_GATE;
+// Gate commands are args-only (declared once above, unwrapped from strings
+// or { command, timeoutMs } objects).
 const fullGateTickets = A.fullGateTickets || [];
-function gateObj(command) { return { command: command, timeoutMs: GATE_TIMEOUT_MS }; }
+function gateObj(command, timeoutMs) { return { command: command, timeoutMs: timeoutMs || GATE_TIMEOUT_MS }; }
 function gateFor(ref) {
-  return gateObj(fullGateTickets.indexOf(ref) >= 0 ? FULL_GATE : NARROW_GATE);
+  const selected = fullGateTickets.indexOf(ref) >= 0 ? FULL_GATE : NARROW_GATE;
+  return gateObj(selected.command, selected.timeoutMs);
 }
 // The command STRING, for prompt text. Interpolating a gate *object* into a
 // task renders "[object Object]", which is what children were being told to
@@ -372,7 +392,6 @@ function childControl() {
 // in the run while looking exactly like a broken implementation. Fail once,
 // loudly, before any child launches.
 // ---------------------------------------------------------------------------
-const configErrors = [];
 function describeArg(value) {
   if (typeof value === "number" && !Number.isFinite(value)) return String(value);
   return JSON.stringify(value);
@@ -427,8 +446,8 @@ try {
 emit("implement-spec: spec=" + specRef + " tickets=" + ticketsRef +
       " integration=" + integrationBranch + " base=" + BASE_BRANCH +
       " maxParallel=" + maxParallel + " maxWaves=" + maxWaves +
-      " gates=[full: " + FULL_GATE + "]" +
-      (NARROW_GATE !== FULL_GATE ? " [narrow: " + NARROW_GATE + "]" : "") +
+      " gates=[full: " + (FULL_GATE && FULL_GATE.command) + "]" +
+      (FULL_GATE && NARROW_GATE && NARROW_GATE.command !== FULL_GATE.command ? " [narrow: " + NARROW_GATE.command + "]" : "") +
       " gateTimeoutMs=" + GATE_TIMEOUT_MS +
       " maxRemediations=" + MAX_REMEDIATIONS +
       (verifyOnly ? " verifyOnly" : "") +
@@ -798,8 +817,7 @@ function spawnMerger(ticket, implResult, wave, worktreePath) {
     "   git log -1 --format=%s | grep -Eq '^[a-z][a-z0-9-]*(\\([a-z0-9._/-]+\\))?!?: .+'",
     "   git show -s --format=%B HEAD | grep -Fx 'Issue: " + ticket.ref + "'",
     "   If either check fails, amend only the message and re-check.",
-    "6. Re-run the verification gate yourself as well: " + gate.command,
-    "7. Do NOT delete branches or run any worktree-manager commands.",
+    "6. Do NOT delete branches or run any worktree-manager commands.\n    (The verification gate runs on the host automatically; do not run it yourself.)",
     "",
     "If the patch cannot be found or applied, report FAILURE clearly and",
     "change nothing.",
@@ -812,7 +830,11 @@ function spawnMerger(ticket, implResult, wave, worktreePath) {
     task: mergerTask.join("\n"),
     timeoutMs: MERGE_TIMEOUT_MS,
     gate: gate,
-    control: childControl()
+    control: childControl(),
+    // Merger success is decided by the host-run gate and the commit state;
+    // declaring read-only keeps the harness from rejecting a green merge
+    // because no acceptance-report block was found in the output (JRB-016).
+    acceptanceRole: "read-only"
   });
 }
 
@@ -1769,7 +1791,7 @@ if (merged.length) {
       JSON.stringify(blockedAxes, null, 2),
       "",
       "Fix the must-fix defects in YOUR managed worktree (already branched from",
-      integrationBranch + "), keep the intermediate gate green (" + NARROW_GATE + "), and do NOT",
+      integrationBranch + "), keep the intermediate gate green (" + (NARROW_GATE && NARROW_GATE.command) + "), and do NOT",
       "commit — the orchestrator captures and merges your patch. Do NOT spawn",
       "subagents. End with the acceptance-report block."
     ].join("\n");
@@ -1807,7 +1829,7 @@ if (merged.length) {
         "3. Commit with a Conventional Commit subject whose type matches the fixes, such as `fix: address review findings`, and include `Issue: <ref>` trailers for each affected issue in this run: " + merged.join(", ") + ".",
         "4. Validate the subject with `git log -1 --format=%s | grep -Eq '^[a-z][a-z0-9-]*(\\([a-z0-9._/-]+\\))?!?: .+'` and validate the Issue trailers for the affected issues in this run: " + merged.join(", ") + ".",
         "   If either check fails, amend only the message and re-check.",
-        "5. Re-run the intermediate gate yourself: " + NARROW_GATE,
+        "5. The orchestrator runs the intermediate gate on the host automatically: " + (NARROW_GATE && NARROW_GATE.command),
         "6. Return: merge status, commit hash, gate result."
       );
       try {
@@ -1833,7 +1855,7 @@ if (merged.length) {
           task: "The merge-review-fixes child reported failure, but its work may already be committed. " +
             "Confirm: (1) checkout is on " + integrationBranch + " and clean; " +
             "(2) the fixer's changes are present (git log --oneline main.." + integrationBranch +
-            " shows commits beyond the original implementation); (3) the intermediate gate " + NARROW_GATE +
+            " shows commits beyond the original implementation); (3) the intermediate gate " + (NARROW_GATE && NARROW_GATE.command) +
             " passes. If (3) passes and (2) shows changes, report MERGE_EFFECTIVE. " +
             "If the changes are NOT present, report MERGE_MISSING. " + checkoutHint(),
           timeoutMs: MERGE_TIMEOUT_MS,
@@ -1905,7 +1927,7 @@ if (merged.length) {
   if (reviewsReady && verificationReady && runComplete) {
     const finalVerifyTask = [
       "Run the final full gate on the current HEAD of branch " + integrationBranch + ".",
-      "Full gate: " + FULL_GATE
+      "Full gate: " + (FULL_GATE && FULL_GATE.command)
     ];
     finalVerifyTask.push.apply(finalVerifyTask, checkoutHint());
     finalVerifyTask.push(
@@ -1920,8 +1942,12 @@ if (merged.length) {
         agent: AG.merger,
         task: finalVerifyTaskText,
         timeoutMs: MERGE_TIMEOUT_MS,
-        gate: gateObj(FULL_GATE),
-        control: childControl()
+        gate: gateObj(FULL_GATE.command),
+        control: childControl(),
+        // The host-run gate decides pass/fail; the child's prose is only
+        // context. Do not let a missing acceptance report block a green gate
+        // (JRB-016: three green merges rejected on report format).
+        acceptanceRole: "read-only"
       });
     } catch (eV) {
       emit("implement-spec: final-verify rejected (" + eV + ")");

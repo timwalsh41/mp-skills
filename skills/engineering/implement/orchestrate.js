@@ -83,6 +83,27 @@ function isConfigError(err) {
 }
 function keyOf(ref) { return String(ref).replace(/[^a-zA-Z0-9._-]+/g, "_"); }
 function gateObj(command, timeoutMs) { return { command: command, timeoutMs: timeoutMs }; }
+// Gate args: be liberal — a bare command string or a { command, timeoutMs }
+// object are both accepted. Booleans, numbers and other junk are rejected
+// here with an exact, named message (JRB-016: two launches were burned passing
+// objects and booleans where a string was expected, each surfacing only at
+// implementer spawn a minute into the run).
+function unwrapGate(value, label, errors) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string" && value.trim()) {
+    return { command: value.trim(), timeoutMs: null };
+  }
+  if (value && typeof value === "object" && !Array.isArray(value) &&
+      typeof value.command === "string" && value.command.trim()) {
+    return {
+      command: value.command.trim(),
+      timeoutMs: typeof value.timeoutMs === "number" && Number.isFinite(value.timeoutMs)
+        ? value.timeoutMs : null
+    };
+  }
+  errors.push(label + " must be a command string or { command, timeoutMs }; got: " + describeArg(value));
+  return null;
+}
 function childControl(gateTimeoutMs, silenceMarginMs) {
   silenceMarginMs = silenceMarginMs || (2 * 60 * 1000);
   return { needsAttentionAfterMs: gateTimeoutMs + silenceMarginMs, notifyOn: [] };
@@ -227,24 +248,32 @@ function runTransition(phase, ref, variables) {
       " Never PATCH the ticket description, never append Agent Execution Evidence" +
       " sections, never modify repository files. Evidence is written by the" +
       " implementer and verifier children, never by a transition." +
+      "\nBefore applying any transition, verify the current status matches the" +
+      " expected phase for this step; do not pick a different transition just" +
+      " because it is allowed. If the current status is neither the expected" +
+      " source nor the target, report TRANSITION_STATE_MISMATCH and change" +
+      " nothing." +
       "\nReport the HTTP status code or error. Change nothing else.",
     timeoutMs: TRANSITION_TIMEOUT_MS,
-    quiet: true
+    quiet: true,
+    // Transitions are lifecycle writes, not deliverables: a structured
+    // acceptance report is not required from this child, and its output is
+    // never used to decide pass/fail. Pass/fail is decided by the tracker's
+    // own state after the call (source-status/target-status contract below).
+    acceptanceRole: "read-only"
   }).then(function(r) {
     const output = String((r && r.output) || "");
     const unsupported = output.indexOf("TRANSITION_UNSUPPORTED") >= 0;
-    // Output-based firewall check: a transition child that confesses to
-    // writing evidence or the ticket description has violated its contract
-    // (JRB-014: a transition child spent its budget appending evidence to the
-    // description and aborted the whole run). Treated as a failure, not a pass.
-    const wroteEvidence = /Agent Execution Evidence/i.test(output) ||
-      /\b(?:appended|wrote|added|updated|modified)\s+(?:the\s+)?(?:ticket\s+)?description/i.test(output);
-    if (wroteEvidence) {
-      emit("implement: WARNING - transition " + phase + " for " + ref +
-           " reported writes outside its contract; treating as failed");
-    }
-    const ok = !!(r && r.ok) && !wroteEvidence &&
-      (unsupported || !/TRANSITION_FAILED|TRACKER_DOC_MISSING|TRANSITION_UNCLEAR/.test(output));
+    // The transition firewall is the tracker's state, not the child's prose:
+    // TRANSITION_APPLIED / TRANSITION_ALREADY_SET are the only positive
+    // outcomes for the requested phase. TRANSITION_FAILED / TRACKER_DOC_MISSING /
+    // TRANSITION_UNCLEAR / TRANSITION_STATE_MISMATCH are failures. A compliant
+    // child reporting "No Agent Execution Evidence" no longer trips a false
+    // positive here because prose is not scanned at all (JRB-016: the old
+    // confession regex aborted a green run on a compliance statement).
+    const ok = !!(r && r.ok) && (unsupported ||
+      /TRANSITION_APPLIED|TRANSITION_ALREADY_SET/.test(output)) &&
+      !/TRANSITION_FAILED|TRACKER_DOC_MISSING|TRANSITION_UNCLEAR|TRANSITION_STATE_MISMATCH/.test(output);
     emit("implement: transition " + phase + " for " + ref + " -- " + (unsupported ? "unsupported by tracker" : (ok ? "done" : "failed")));
     return { ok: ok, output: output, unsupported: unsupported };
   });
@@ -311,8 +340,6 @@ const MAX_REVIEW_RETRIES = numArg(A.maxReviewRetries, 2);
 // per-repo tuning.
 const TRANSITION_TIMEOUT_MS = 3 * 60 * 1000;
 
-// Config preflight — a malformed arg is a CONFIG error, not a task failure.
-const configErrors = [];
 requireInt(GATE_TIMEOUT_MS, "gateTimeoutMs", 1000, configErrors);
 requireInt(IMPL_TIMEOUT_MS, "implTimeoutMs", 1000, configErrors);
 requireInt(REVIEW_TIMEOUT_MS, "reviewTimeoutMs", 1000, configErrors);
@@ -330,8 +357,9 @@ if (configErrors.length) {
 emit("implement: ticket=" + ticketRef + " integration=" + integrationBranch +
      " base=" + BASE_BRANCH + " gateTimeoutMs=" + GATE_TIMEOUT_MS +
      " implTimeoutMs=" + IMPL_TIMEOUT_MS +
-     " gates=[full: " + FULL_GATE + "]" +
-     (NARROW_GATE !== FULL_GATE ? " [narrow: " + NARROW_GATE + "]" : "") +
+     " gates=[full: " + (FULL_GATE && FULL_GATE.command) + "]" +
+     (FULL_GATE && NARROW_GATE && NARROW_GATE.command !== FULL_GATE.command
+       ? " [narrow: " + NARROW_GATE.command + "]" : "") +
      " maxRemediations=" + MAX_REMEDIATIONS +
      (skipPR ? " skipPR" : ""));
 
@@ -414,7 +442,7 @@ function spawnImplementer() {
     "- Your worktree branches from " + integrationBranch + "; do NOT create branches, worktrees, or spawn subagents.",
     "- Do NOT commit — leave your changes uncommitted; the orchestrator's merger captures and commits them.",
     "",
-    "The intermediate verification gate runs on the host after you finish: " + NARROW_GATE
+    "The intermediate verification gate runs on the host after you finish: " + (NARROW_GATE && NARROW_GATE.command)
   );
   return runs.run("impl-t" + keyOf(ticketRef), {
     label: "Implement " + ticketRef,
@@ -423,7 +451,7 @@ function spawnImplementer() {
     worktree: true,
     baseRef: baseRef,
     timeoutMs: IMPL_TIMEOUT_MS,
-    gate: gateObj(NARROW_GATE, GATE_TIMEOUT_MS),
+    gate: gateObj(NARROW_GATE.command, GATE_TIMEOUT_MS),
     control: childControl(GATE_TIMEOUT_MS)
   });
 }
@@ -444,9 +472,8 @@ function spawnFixer(priorResult, wave) {
     "1. Find the previous run's captured patch (*.patch file in the directory above).",
     "2. Apply it to YOUR worktree: git apply --whitespace=fix --index <patch>",
     "   (your worktree already branches from " + integrationBranch + ").",
-    "3. Run the intermediate gate: " + NARROW_GATE,
-    "4. Fix the failures, re-run the gate until green.",
-    "5. Leave changes uncommitted — the orchestrator's merger captures and commits them.",
+    "3. Fix the failures the orchestrator reported; the intermediate gate runs on the host automatically once you finish, so leave your changes uncommitted for it to capture.",
+    "4. Leave changes uncommitted — the orchestrator's merger captures and commits them.",
     "",
     "If the patch cannot be found or applied, report FAILURE clearly and change nothing."
   ];
@@ -460,7 +487,7 @@ function spawnFixer(priorResult, wave) {
     worktree: true,
     baseRef: baseRef,
     timeoutMs: IMPL_TIMEOUT_MS,
-    gate: gateObj(NARROW_GATE, GATE_TIMEOUT_MS),
+    gate: gateObj(NARROW_GATE.command, GATE_TIMEOUT_MS),
     control: childControl(GATE_TIMEOUT_MS)
   });
 }
@@ -484,16 +511,21 @@ function spawnMerger(result, retry) {
     "Patch location: " + loc.text,
     "",
     "Steps:",
-    "1. Confirm the main checkout is on " + integrationBranch + " and clean (git status).",
-    "   If dirty or on another branch, STOP and report.",
-    "2. Find and apply the captured patch: git apply --whitespace=fix --index <patch>",
-    "3. Read the ticket and diff, then create a Conventional Commit subject using the appropriate type and a concise change summary. Include `Issue: " + ticketRef + "` as a commit-body trailer. Do not use a generic 'Implement ticket' subject.",
-    "4. Commit using that subject and trailer, then validate both:",
+    "1. Confirm the main checkout is clean (git status); if dirty, STOP and report.",
+    "   If it is on another branch (typically " + BASE_BRANCH + "), check out " + integrationBranch,
+    "   first (git checkout " + integrationBranch + "; the branch already exists), then", "   re-confirm the tree is clean before continuing.",
+    "2. IDEMPOTENCY CHECK: a predecessor may have already merged this work.",
+    "   Run: git log --format=%B " + BASE_BRANCH + ".." + integrationBranch + " | grep -Fx 'Issue: " + ticketRef + "'",
+    "   If a commit with that trailer exists, DO NOT apply the patch and DO NOT commit.",
+    "   Skip straight to step 6 (return) and report the existing commit hash.",
+    "3. Find and apply the captured patch: git apply --whitespace=fix --index <patch>",
+    "4. Read the ticket and diff, then create a Conventional Commit subject using the appropriate type and a concise change summary. Include `Issue: " + ticketRef + "` as a commit-body trailer. Do not use a generic 'Implement ticket' subject.",
+    "5. Commit using that subject and trailer, then validate both:",
     "   git log -1 --format=%s | grep -Eq '^[a-z][a-z0-9-]*(\\([a-z0-9._/-]+\\))?!?: .+'",
     "   git show -s --format=%B HEAD | grep -Fx 'Issue: " + ticketRef + "'",
     "   If either check fails, amend only the message and re-check.",
-    "5. Re-run the intermediate gate yourself: " + NARROW_GATE,
     "6. Return: merge status, commit hash, gate result.",
+    "   (The orchestrator runs the intermediate gate on the host automatically; do not run it yourself.)",
     "",
     "If the patch cannot be found or applied, report FAILURE clearly and change nothing."
   );
@@ -502,8 +534,13 @@ function spawnMerger(result, retry) {
     agent: AG.merger,
     task: task.join("\n"),
     timeoutMs: REVIEW_TIMEOUT_MS,
-    gate: gateObj(NARROW_GATE, GATE_TIMEOUT_MS),
-    control: childControl(GATE_TIMEOUT_MS)
+    gate: gateObj(NARROW_GATE.command, GATE_TIMEOUT_MS),
+    control: childControl(GATE_TIMEOUT_MS),
+    // Merger success is decided by the host-run gate and the commit state,
+    // not by a prose acceptance report. Declaring the role keeps the harness
+    // from rejecting an otherwise-green merge because the report block was
+    // missing (JRB-016: three green merges rejected on report format).
+    acceptanceRole: "read-only"
   });
 }
 
@@ -642,7 +679,7 @@ function spawnFinalGate() {
   const task = [
     "Run the final full verification gate on " + integrationBranch + ".",
     "Do not edit, stage, commit, or otherwise change code. If the gate fails, report the failure and stop.",
-    "Full gate: " + FULL_GATE
+    "Full gate: " + (FULL_GATE && FULL_GATE.command)
   ];
   task.push.apply(task, checkoutHint(REPO_PATH));
   const taskText = task.join("\n");
@@ -651,8 +688,11 @@ function spawnFinalGate() {
     agent: AG.merger,
     task: taskText,
     timeoutMs: GATE_TIMEOUT_MS + 120000,
-    gate: gateObj(FULL_GATE, GATE_TIMEOUT_MS),
-    control: childControl(GATE_TIMEOUT_MS)
+    gate: gateObj(FULL_GATE.command, GATE_TIMEOUT_MS),
+    control: childControl(GATE_TIMEOUT_MS),
+    // The host-run gate result decides pass/fail; the child's prose is only
+    // context. Do not let a missing report block a green gate (JRB-016).
+    acceptanceRole: "read-only"
   });
 }
 
@@ -918,7 +958,7 @@ if (blockedAxes.length && !(PR_WAIVER_REASON && !skipPR)) {
     JSON.stringify(blockedAxes, null, 2),
     "",
     "Fix must-fix defects in YOUR managed worktree (already branched from",
-    integrationBranch + "), keep the intermediate gate green: " + NARROW_GATE,
+    integrationBranch + "), keep the intermediate gate green: " + (NARROW_GATE && NARROW_GATE.command),
     "",
     "Leave changes uncommitted — the orchestrator's merger captures and commits them.",
     "Do NOT spawn subagents. End with the acceptance-report block."
@@ -932,7 +972,7 @@ if (blockedAxes.length && !(PR_WAIVER_REASON && !skipPR)) {
       worktree: true,
       baseRef: baseRef,
       timeoutMs: IMPL_TIMEOUT_MS,
-      gate: gateObj(NARROW_GATE, GATE_TIMEOUT_MS),
+      gate: gateObj(NARROW_GATE.command, GATE_TIMEOUT_MS),
       control: childControl(GATE_TIMEOUT_MS)
     });
   } catch (eFx) {
@@ -958,11 +998,11 @@ if (blockedAxes.length && !(PR_WAIVER_REASON && !skipPR)) {
         task: "The merge-review-fixes child reported failure, but its work may already be committed. " +
           "Confirm: (1) checkout is on " + integrationBranch + " and clean; " +
           "(2) the fixer's changes are present (git log --oneline main.." + integrationBranch +
-          " shows commits beyond the original implementation); (3) the intermediate gate " + NARROW_GATE +
+          " shows commits beyond the original implementation); (3) the intermediate gate " + (NARROW_GATE && NARROW_GATE.command) +
           " passes. If (3) passes and (2) shows changes, report MERGE_EFFECTIVE. " +
           "If the changes are NOT present, report MERGE_MISSING. " + checkoutHint(REPO_PATH),
         timeoutMs: GATE_TIMEOUT_MS + 120000,
-        gate: gateObj(NARROW_GATE, GATE_TIMEOUT_MS),
+        gate: gateObj(NARROW_GATE.command, GATE_TIMEOUT_MS),
         control: childControl(GATE_TIMEOUT_MS),
         quiet: true
       }).catch(function(e) {
