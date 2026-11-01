@@ -38,12 +38,13 @@ No. It owns one issue at a time. Use [`implement-spec`](https://aihero.dev/skill
 
 ## It's working if
 
-- The run stops before coding when the issue fails the documented grooming preflight.
+- The run stops before coding when the issue fails the documented grooming preflight, and stops before any child work when the checkout is dirty — with the full `git status --porcelain` output for the user to resolve.
 - The issue moves to In Progress before implementation and Ready for Review only after a PR is created.
 - Any review fix is freshly reviewed, and the full gate passes on the final reviewed commit before a PR can open.
 - The PR is suppressed when verification fails or reviews are incomplete or blocked without an explicit waiver.
 - Complete is recorded only after the merge is independently confirmed.
 - A PR waiver is visible in the draft request and the workflow result remains non-green.
+- Evidence sections in the ticket are reconciled, never duplicated, even across remediation and rerun cycles.
 
 ## Where it fits
 

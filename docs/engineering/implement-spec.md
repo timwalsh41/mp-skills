@@ -79,6 +79,8 @@ A worktree holds only what git tracks. Tests that read gitignored fixtures, loca
 - Merges into the integration branch are fast-forwards, not conflict resolutions.
 - The integration branch contains every in-scope issue, has fresh reviews and verification after any review fix, and passes the full-suite gate on that final commit before any PR opens.
 - Issues move to Ready for Review only after PR creation, and to Complete only after merge confirmation.
+- A dirty checkout stops the run at the pre-flight with the full `git status --porcelain` output, before any implementer worktree is attempted.
+- A ticket that fails twice with the same failure signature escalates immediately rather than exhausting its remediation ladder.
 
 ## Where it fits
 

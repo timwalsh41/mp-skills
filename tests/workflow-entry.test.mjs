@@ -31,6 +31,11 @@ async function executeWorkflow(skill, args, options = {}) {
 function responseFor(call, options) {
   const { key, label = "", task = "" } = call;
   if (key === "ensure-integration-branch") return { ok: true, output: "BRANCH_EXISTS" };
+  if (key === "preflight-clean-tree") {
+    return options.dirtyTree
+      ? { ok: false, error: "git status reported changes", output: "DIRTY_TREE\n?? leftover.py" }
+      : { ok: true, output: "CLEAN_TREE" };
+  }
   if (key.startsWith("groom-check-")) {
     return { ok: true, output: options.groomed === false ? "GROOM_NEEDED" : "GROOMED_OK" };
   }
@@ -50,6 +55,11 @@ function responseFor(call, options) {
     return options.reviewFixPass === false
       ? { ok: false, error: "review fix did not pass", output: "failed" }
       : { ok: true, output: "review fixes ready" };
+  }
+  if (key.startsWith("fix-t") || /^fix-\d+-t/.test(key)) {
+    return options.fixFail
+      ? { ok: false, error: options.fixFail, output: "failed" }
+      : { ok: true, output: "fix applied" };
   }
   if (key === "final-verify" || key === "final-gate") {
     return options.finalVerifyPass === false || options.finalGatePass === false
@@ -71,6 +81,7 @@ function responseFor(call, options) {
     return { ok: true, output: options.groomed === false ? "GROOM_NEEDED" : "GROOMED_OK" };
   }
   if (label.startsWith("Implement ticket ") || label.startsWith("Implement JRB-")) {
+    if (options.implFail) return { ok: false, error: options.implFail, output: "failed" };
     return { ok: true, output: "implementation complete" };
   }
   if (label.startsWith("Merge ticket ") || label.startsWith("merge-")) {
@@ -172,6 +183,54 @@ test("implement merger requests a Conventional Commit subject and issue trailer"
   assert.match(merge.task, /Conventional Commit/i);
   assert.match(merge.task, /git log -1 --format=%s/);
   assert.match(merge.task, /Issue: JRB-012/);
+});
+
+test("implement aborts on a dirty checkout before any child work", async () => {
+  const { calls, result } = await executeWorkflow("implement", singleArgs(), { dirtyTree: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.dirtyTree, true);
+  assert.match(result.error, /DIRTY_TREE/);
+  assert.ok(!calls.some((call) => call.key.startsWith("impl-")));
+  assert.ok(!calls.some((call) => call.key.startsWith("fix-")));
+  assert.ok(!calls.some((call) => call.key === "ensure-integration-branch"));
+});
+
+test("implement skips the clean-tree preflight in finalize mode", async () => {
+  const { calls, result } = await executeWorkflow("implement", singleArgs({ finalizeMergedPR: true, prUrl: "https://example.test/pull/42" }));
+  assert.equal(result.ok, true);
+  assert.ok(!calls.some((call) => call.key === "preflight-clean-tree"));
+});
+
+test("implement transitions use the 180s budget and carry the evidence firewall", async () => {
+  const { calls } = await executeWorkflow("implement", singleArgs());
+  const transitionTasks = calls.filter((call) => call.key.startsWith("transition-"));
+  assert.ok(transitionTasks.length > 0);
+  assert.ok(transitionTasks.every((call) => call.timeoutMs === 180000));
+  assert.ok(transitionTasks.every((call) => /Record nothing anywhere/.test(call.task)));
+  assert.ok(transitionTasks.every((call) => /Agent Execution Evidence/.test(call.task)));
+});
+
+test("implement escalates immediately when remediation fails with an identical failure signature", async () => {
+  const { calls, result } = await executeWorkflow("implement", singleArgs(), {
+    implFail: "worktree admission failed: dirty checkout",
+    fixFail: "worktree admission failed: dirty checkout",
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.escalated, true);
+  assert.match(result.error, /IDENTICAL/);
+  const fixers = calls.filter((call) => call.key.startsWith("fix-t"));
+  assert.equal(fixers.length, 1);
+});
+
+test("implement keeps remediating when failures have different signatures", async () => {
+  const { calls, result } = await executeWorkflow("implement", singleArgs(), {
+    implFail: "worktree admission failed: dirty checkout",
+    fixFail: "gate failed: 3 tests broken",
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.escalated, true);
+  const fixers = calls.filter((call) => call.key.startsWith("fix-t"));
+  assert.equal(fixers.length, 2);
 });
 
 test("implement-spec suppresses PR when final verification fails, even with a waiver", async () => {
@@ -464,4 +523,52 @@ test("both workflows tell agents to record evidence and check adjacent consumers
   assert.match(specImplementer.task, /### Implementation/);
   assert.match(specVerifier.task, /### Independent Verification/);
   assert.match(specReviewer.task, /cross-ticket interactions/);
+});
+
+test("implement-spec aborts on a dirty checkout before any worktree child", async () => {
+  const { calls, result } = await executeWorkflow("implement-spec", specArgs(oneTicket), { dirtyTree: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.dirtyTree, true);
+  assert.match(result.error, /DIRTY_TREE/);
+  assert.ok(!calls.some((call) => call.key.startsWith("impl-")));
+  assert.ok(!calls.some((call) => /^fix-\d+-t/.test(call.key)));
+  assert.ok(!calls.some((call) => call.key === "ensure-integration-branch"));
+});
+
+test("implement-spec skips the clean-tree preflight in finalize mode", async () => {
+  const { calls, result } = await executeWorkflow("implement-spec", specArgs(oneTicket, {
+    finalizeMergedPR: true,
+    prUrl: "https://example.test/pull/42",
+  }));
+  assert.equal(result.ok, true);
+  assert.ok(!calls.some((call) => call.key === "preflight-clean-tree"));
+});
+
+test("implement-spec transitions use the 180s budget and carry the evidence firewall", async () => {
+  const { calls } = await executeWorkflow("implement-spec", specArgs(oneTicket));
+  const transitionTasks = calls.filter((call) => call.key.startsWith("transition-"));
+  assert.ok(transitionTasks.length > 0);
+  assert.ok(transitionTasks.every((call) => call.timeoutMs === 180000));
+  assert.ok(transitionTasks.every((call) => /Record nothing anywhere/.test(call.task)));
+  assert.ok(transitionTasks.every((call) => /Agent Execution Evidence/.test(call.task)));
+});
+
+test("implement-spec escalates a ticket immediately on an identical failure signature", async () => {
+  const { calls, result } = await executeWorkflow("implement-spec", specArgs(oneTicket, { maxParallel: 1, maxWaves: 1 }), {
+    implFail: "worktree admission failed: dirty checkout",
+    fixFail: "worktree admission failed: dirty checkout",
+  });
+  assert.equal(result.ok, false);
+  assert.ok(result.escalated.includes("JRB-012"));
+  const fixers = calls.filter((call) => /^fix-\d+-t/.test(call.key));
+  assert.equal(fixers.length, 1);
+});
+
+test("both workflows record evidence with reconcile-never-append semantics", async () => {
+  const single = await executeWorkflow("implement", singleArgs());
+  assert.match(single.calls.find((call) => call.key.startsWith("impl-")).task, /Reconcile, never append/);
+  assert.match(single.calls.find((call) => call.key === "verify").task, /CORRECT stale or contradictory/);
+  const spec = await executeWorkflow("implement-spec", specArgs(oneTicket));
+  assert.match(spec.calls.find((call) => call.label.startsWith("Implement ticket")).task, /Reconcile, never append/);
+  assert.match(spec.calls.find((call) => call.label.startsWith("Verify ticket")).task, /CORRECT stale or contradictory/);
 });

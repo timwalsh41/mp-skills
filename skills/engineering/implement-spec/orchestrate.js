@@ -211,13 +211,29 @@ function runTransition(phase, ref, variables) {
   return runs.run("transition-" + phase + "-" + keyOf(ref), {
     agent: AG.worker,
     label: "Transition " + ref + " to " + phase,
-    task: task + "\nReport the HTTP status code or error. Change nothing else.",
-    timeoutMs: 60 * 1000,
+    task: task +
+      "\nRecord nothing anywhere: your ONLY write is the lifecycle transition itself." +
+      " Never PATCH the ticket description, never append Agent Execution Evidence" +
+      " sections, never modify repository files. Evidence is written by the" +
+      " implementer and verifier children, never by a transition." +
+      "\nReport the HTTP status code or error. Change nothing else.",
+    timeoutMs: TRANSITION_TIMEOUT_MS,
     quiet: true
   }).then(function(r) {
     const output = String((r && r.output) || "");
     const unsupported = output.indexOf("TRANSITION_UNSUPPORTED") >= 0;
-    const ok = !!(r && r.ok) && (unsupported || !/TRANSITION_FAILED|TRACKER_DOC_MISSING|TRANSITION_UNCLEAR/.test(output));
+    // Output-based firewall check: a transition child that confesses to
+    // writing evidence or the ticket description has violated its contract
+    // (JRB-014: a transition child spent its budget appending evidence to the
+    // description and aborted the whole run). Treated as a failure, not a pass.
+    const wroteEvidence = /Agent Execution Evidence/i.test(output) ||
+      /\b(?:appended|wrote|added|updated|modified)\s+(?:the\s+)?(?:ticket\s+)?description/i.test(output);
+    if (wroteEvidence) {
+      emit("implement-spec: WARNING - transition " + phase + " for " + ref +
+           " reported writes outside its contract; treating as failed");
+    }
+    const ok = !!(r && r.ok) && !wroteEvidence &&
+      (unsupported || !/TRANSITION_FAILED|TRACKER_DOC_MISSING|TRANSITION_UNCLEAR/.test(output));
     emit("implement-spec: transition " + phase + " for " + ref + " -- " + (unsupported ? "unsupported by tracker" : (ok ? "done" : "failed")));
     return { ok: ok, output: output, unsupported: unsupported };
   });
@@ -242,7 +258,7 @@ function confirmMerged(refs, mergeRef) {
       "Merge or PR reference: " + mergeRef,
       "Do not change issue statuses. Report exactly MERGED_CONFIRMED or MERGE_NOT_CONFIRMED, with evidence."
     ].join("\n"),
-    timeoutMs: 60 * 1000,
+    timeoutMs: TRANSITION_TIMEOUT_MS,
     quiet: true
   });
 }
@@ -282,6 +298,12 @@ const MERGE_TIMEOUT_MS = numArg(A.mergeTimeoutMs, 20 * 60 * 1000);
 const GATE_TIMEOUT_MS = numArg(A.gateTimeoutMs, 15 * 60 * 1000);
 const MAX_REMEDIATIONS = numArg(A.maxRemediations, 2);
 const MAX_REVIEW_RETRIES = numArg(A.maxReviewRetries, 2);
+// Transitions and merge confirmation are short, scripted lifecycle steps, but
+// their default tasks read the tracker docs before acting, and 60s proved too
+// tight whenever a child did anything beyond two HTTP calls (JRB-014: a
+// transition child spent its budget and aborted the whole run). Hardcoded on
+// purpose: a lifecycle step should never need per-repo tuning.
+const TRANSITION_TIMEOUT_MS = 3 * 60 * 1000;
 
 // Gate commands are args-only
 const NARROW_GATE = A.narrowGate || FULL_GATE;
@@ -545,7 +567,10 @@ function spawnImplementer(ticket, wave) {
     "Rules:",
     "- Implement only this ticket. Other tickets belong to other workers.",
     "- The orchestrator dispatches only tickets confirmed ready by the grooming preflight. If this ticket is not ready, stop and report GROOM_NEEDED; do not implement or change lifecycle status.",
-    "- Append the implementation report under `## Agent Execution Evidence` / `### Implementation` in the ticket description, following docs/agents/issue-tracker.md.",
+    "- Record your implementation report under `## Agent Execution Evidence` / `### Implementation` in the ticket description, following docs/agents/issue-tracker.md.",
+    "  Reconcile, never append: fetch the current description first; if a `### Implementation`",
+    "  section already exists, replace/merge it in place — one section, latest content, with a",
+    "  timestamp. Never duplicate section headers.",
     "- Do not change lifecycle status; the orchestrator owns In Progress and Ready for Review transitions, and Complete is post-merge only.",
     "- Write/update tests for every criterion (unit/integration/E2E per spec); trace shared files to other callers and protect adjacent workflows.",
     "- Your tree already branches from " + integrationBranch + "; do NOT create",
@@ -836,7 +861,11 @@ function spawnVerifier(ticket, wave) {
     "assume: if the work is NOT there, that is a finding — report the criterion",
     "as not satisfied. Do not conclude anything about work you cannot see.",
     "",
-    "Append verification evidence under `## Agent Execution Evidence` / `### Independent Verification` in the ticket description, following docs/agents/issue-tracker.md. Include",
+    "Record verification evidence under `## Agent Execution Evidence` / `### Independent Verification`",
+    "in the ticket description, following docs/agents/issue-tracker.md. Reconcile, never append:",
+    "fetch the description first; replace/merge your own section in place (one section, latest",
+    "content, timestamped; never duplicate headers), and CORRECT stale or contradictory prior",
+    "evidence in place — a stale note left behind is a defect, not a cosmetic issue. Include",
     "file paths, test names, commands run, and any gap. Do not change lifecycle",
     "status or acceptance outcomes. Trace shared-file consumers and verify affected adjacent workflows too.",
     "",
@@ -989,7 +1018,7 @@ function summarizeReviews(reviews) {
 // ---------------------------------------------------------------------------
 const ledger = {};   // ticket number -> { attempts, state, runId, lastError }
 function ledgerFor(num) {
-  if (!ledger[num]) ledger[num] = { attempts: 0, state: "pending", runId: null, lastError: null };
+  if (!ledger[num]) ledger[num] = { attempts: 0, state: "pending", runId: null, lastError: null, lastSignature: null };
   return ledger[num];
 }
 
@@ -1007,6 +1036,20 @@ function classifyFailure(result) {
   if (FLAKE_RE.test(err)) return "flake";
   if (/gate/i.test(err)) return "gate";
   return "unknown";
+}
+
+// Normalizes a failure into a comparable signature: run IDs, absolute paths,
+// and numbers are stripped so the same root cause matches across remediation
+// attempts (JRB-014: three identical worktree-admission failures burned the
+// whole ladder before escalating).
+function failureSignature(result) {
+  return String((result && (result.error || result.output)) || "")
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "<id>")
+    .replace(/\/[\w.@+-]+(?:\/[\w.@+-]+)+/g, "<path>")
+    .replace(/\d{2,}/g, "<n>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 400);
 }
 
 // Flake quarantine step: re-run the failing test ONCE in the *retained*
@@ -1125,6 +1168,41 @@ if (!tickets.length) {
       + ". Check the target against docs/agents/issue-tracker.md and relaunch.",
     discoveryRunId: graphRun && graphRun.runId
   };
+}
+
+// Pre-flight: the checkout must be clean before any worktree child launches.
+// A dirty parent checkout fails worktree admission, and in a multi-wave run
+// that can burn the remediation ladder for many tickets at once (JRB-014:
+// three identical admission failures from two untracked leftover files).
+// Fail loudly here instead and let the user resolve the tree.
+if (!finalizeMergedPR) {
+  if (!REPO_PATH) {
+    emit("implement-spec: WARNING - no repoPath arg; the clean-tree preflight cannot run");
+  } else {
+    const cleanTreePreflight = await runs.run("preflight-clean-tree", {
+      agent: AG.worker,
+      label: "Preflight: verify clean checkout",
+      task: "Run `git -C " + REPO_PATH + " status --porcelain`.\n" +
+        "- If the output is empty, report exactly CLEAN_TREE and stop.\n" +
+        "- Otherwise report exactly DIRTY_TREE, followed by the full porcelain output.\n" +
+        "Change nothing: do not stash, commit, delete, or clean anything — the user resolves the tree, not you.",
+      timeoutMs: 30 * 1000,
+      quiet: true
+    });
+    const cleanTreeOutput = String((cleanTreePreflight && cleanTreePreflight.output) || "");
+    if (!cleanTreePreflight || !cleanTreePreflight.ok || cleanTreeOutput.indexOf("CLEAN_TREE") < 0 ||
+        cleanTreeOutput.indexOf("DIRTY_TREE") >= 0) {
+      return {
+        ok: false,
+        dirtyTree: true,
+        error: "DIRTY_TREE: the checkout " + REPO_PATH + " has uncommitted or untracked changes. " +
+          "Resolve them manually (commit, stash, or remove) and relaunch. No child work started." +
+          (cleanTreeOutput ? "\nPorcelain output:\n" + cleanTreeOutput.slice(0, 2000) : ""),
+        discoveredTickets: tickets.length
+      };
+    }
+    emit("implement-spec: preflight clean-tree check passed");
+  }
 }
 
 // Wave 0 preflight: a tracker must be configured and the integration branch
@@ -1431,6 +1509,19 @@ if (verifyOnly) {
       }
 
       if (cls !== "ok") {
+        // Identical-failure dedup: if this failure's normalized signature
+        // matches the previous attempt's, retrying is pointless — escalate
+        // immediately instead of burning the remaining ladder (JRB-014: three
+        // identical admission failures consumed maxRemediations).
+        const sig = failureSignature(implResult);
+        if (ld.lastSignature && ld.lastSignature === sig) {
+          escalate(ticket.ref, "IDENTICAL failure signature repeated — further remediation is pointless (" + cls + ")",
+                   "runId=" + ld.runId + " lastError=" + ld.lastError);
+          ld.state = "escalated";
+          escalated.push(ticket.ref);
+          continue;
+        }
+        ld.lastSignature = sig;
         ld.attempts = ld.attempts + 1;
         ld.lastError = (implResult && implResult.error) || cls;
         remediationsThisWave = remediationsThisWave + 1;
