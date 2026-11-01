@@ -8,6 +8,7 @@ disable-model-invocation: true
 
 Clean up the repo after implementation of one or more tickets. Refer to the user input for the scope (e.g. a list of tickets, branches, session logs, etc.). Ensure first that all work has landed (PR merged to main); if not, then halt and ask for clarification. If so, then proceed with cleanup:
 
+- Set the ticket status to complete, per instructions at `docs/agents/issue-tracker.md`
 - Remove any worktrees associated with the change
 - Delete local feature/fix branches associated with the change
 - Ensure the feature/fix branch is deleted from the remote repo
