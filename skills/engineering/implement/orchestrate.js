@@ -340,6 +340,7 @@ const MAX_REVIEW_RETRIES = numArg(A.maxReviewRetries, 2);
 // per-repo tuning.
 const TRANSITION_TIMEOUT_MS = 3 * 60 * 1000;
 
+const configErrors = [];
 requireInt(GATE_TIMEOUT_MS, "gateTimeoutMs", 1000, configErrors);
 requireInt(IMPL_TIMEOUT_MS, "implTimeoutMs", 1000, configErrors);
 requireInt(REVIEW_TIMEOUT_MS, "reviewTimeoutMs", 1000, configErrors);

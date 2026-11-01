@@ -81,10 +81,6 @@
 //                      a child that lands in the wrong directory otherwise
 //                      reports a missing target, which suppresses the
 //                      request and escalates a run that is actually fine.
-//   implTimeoutMs      default 75 min per implementer/fixer/continue child
-//   mergeTimeoutMs     default 20 min per merger
-//   maxRemediations    default 2 remediation attempts per ticket before
-//                      escalation to the lead
 //
 // Enforcement (invariants unchanged from the 2026-10-15 rewrite):
 //   - EVERY implementer/fixer runs in its own managed git worktree
