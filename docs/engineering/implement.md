@@ -39,6 +39,8 @@ No. It owns one issue at a time. Use [`implement-spec`](https://aihero.dev/skill
 ## It's working if
 
 - The run stops before coding when the issue is not groomed or the checkout is dirty or invalid. It also stops when it cannot verify the required tracker or request state.
+- A lifecycle or request check command that cannot run under `/bin/sh` stops the run at the preflight, with the failing command and exit code named, instead of failing mid-run after work has started.
+- A review fix that legitimately changes nothing (for example, findings declined as out of scope) verifies as a no-op and the run proceeds to fresh reviews, instead of escalating on an empty patch.
 - The issue moves to In Progress before implementation and Ready for Review only after a PR is independently confirmed to exist.
 - Any review fix is freshly reviewed, and the full gate passes on the final reviewed commit before a PR can open.
 - The PR is suppressed when verification fails or reviews are incomplete or blocked without an explicit waiver.

@@ -22,12 +22,15 @@ dry-runs both orchestrators against stub children and fails on:
 - any prose-token decision scan (`Review verdict:`, `TRANSITION_APPLIED` regexes, `PR_CREATED:` matchers, trailer-grep idempotency)
 - verdict-bearing run calls that carry an `outputSchema` param (schemas travel with the agent frontmatter), or agent definitions missing their frontmatter schema
 - schema parity drift between `implement` and `implement-spec` (schemas, merger gate body)
+- shared-helper parity drift between `implement` and `implement-spec` (every helper that is byte-identical by contract), and absence of the transition phase-boundary clause in either script's transition task
 
 ## implement/orchestrate.js
 
 | Child (key) | Agent | Success mechanism | Structured shape |
 |---|---|---|---|
 | `preflight-clean-tree` | worker | typed host gate: valid Git checkout and empty porcelain | `verified: true`, `agentContract: { version: 1 }` |
+| `preflight-check-commands` | worker | typed host gate: runs every lead-supplied check command once under `/bin/sh`; fails only when a command cannot execute (rc 2 = shell syntax error, 126 = not executable, 127 = command not found). Exit 0 (state true) and 1 (state false) are valid verdicts and pass. `implement-spec` uses sentinel ticket refs, which discovery resolves later | `verified: true`, versioned contract |
+| `verify-fix-noop` (`verify-fix-noop-<ref>` in implement) | worker | typed host gate: empty captured fix patch, clean uncommitted fixer worktree when findable, main checkout clean on the integration branch, intermediate gate green. Proves a fixer that changed nothing (e.g. every finding adjudicated out of scope) is a valid fix-loop outcome, not a merge failure (JRB-019) | `verified: true`, versioned contract |
 | `ensure-integration-branch` | worker | typed host gate: named local branch exists | `verified: true`, versioned contract |
 | `groom-check-<ref>` | worker | structured: `groomed`, `missing` | GROOM_OUTPUT_SCHEMA |
 | `transition-<phase>-<ref>` | worker | structured: outcome must be `TRANSITION_APPLIED` or `TRANSITION_ALREADY_SET` | TRANSITION_OUTPUT_SCHEMA, `acceptance: false` |
@@ -64,6 +67,6 @@ Same table as above for shared child kinds, plus:
 1. A merger succeeds only when its host gate verifies the exact captured patch on the correct, clean branch, a matching issue commit, and passing tests. A green test command alone is not enough.
 2. A missing structured verdict is a failure that goes through the retry/escalation ladder; it is never parsed into a pass.
 3. The merger's "already merged" decision comes from `git apply --check --reverse <patch>` on its own captured patch. The host rechecks this postcondition; the ticket trailer corroborates commit identity but never substitutes for patch presence.
-4. Valid checkout, tree cleanliness, branch existence, tracker status, PR existence, and merge confirmation are host facts. The lead provides tracker/PR commands from the target repo docs; missing checks fail before child launch. No child prose substitutes for a host check.
-5. Both orchestrators stay in contract parity. Tests use disposable Git repositories to exercise merger and preflight host commands, not only stubbed child responses.
+4. Valid checkout, tree cleanliness, branch existence, tracker status, PR existence, and merge confirmation are host facts. The lead provides tracker/PR commands from the target repo docs; missing checks fail before child launch. Host gates execute those commands with `/bin/sh`, not the lead's bash shell, so the check-command preflight rejects a command that cannot run there (rc 2/126/127) before any child work. A check command that runs and exits non-zero is a valid false verdict, not a preflight failure. No child prose substitutes for a host check.
+5. Both orchestrators stay in contract parity: byte-identical shared helpers (schemas, gate bodies, preflight bodies, utility functions) are asserted equal by `npm run test:workflows`, and helpers that differ structurally (`patchLocation`/`patchHint`, `reviewAxisTask`, `checkoutHint`) are documented divergences, not drift. Tests use disposable Git repositories to exercise merger and preflight host commands, not only stubbed child responses.
 6. Any change to an orchestrate.js or an agent definition must pass `npm run test:workflows` before it is pushed: these scripts are loaded by every future run, and an unexecuted edit ships its crash with it (JRB-017: a `configErrors` ReferenceError pushed at 20:30 crashed the next run at 20:47).

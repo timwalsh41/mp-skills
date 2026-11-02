@@ -4,10 +4,13 @@
 // statement body with top-level await and NO fs/shell/require/tools — every
 // action on the world goes through child agents via runs.run / runs.all.
 //
-// Some helpers below (numArg, boolArg, gateObj, childControl, checkoutHint,
-// reviewAxisTask, classifyFailure) are
-// shared with implement/orchestrate.js — the /implement workflow inlines its
-// own copies, because the Pi workflow sandbox has no import/require mechanism.
+// Some helpers below (numArg, boolArg, describeArg, isConfigError, keyOf,
+// shellQuote, checkedCommand, cleanTreeCommand, hostGate, gateObj, hostVerified,
+// unwrapGate, requireInt, childControl, classifyFailure, failureSignature,
+// mergerGateBody, checkCommandPreflightBody, fixNoopGateBody) are shared with
+// implement/orchestrate.js: that workflow inlines its own copies, because the
+// Pi workflow sandbox has no import/require mechanism, and
+// tests/workflow-entry.test.mjs asserts the copies stay identical.
 // If Pi adds module support to the workflow sandbox, these should be extracted
 // into a single importable module to avoid drift.
 // Contract with the invoking lead agent:
@@ -56,6 +59,10 @@
 //                      the request targets; from the verification doc
 //   transitionCheckCommands REQUIRED host status commands for each phase;
 //                      $TICKET_REF and $PHASE become shell-quoted values.
+//                      Host gates execute these with /bin/sh (not bash); the
+//                      orchestrator preflights every check command under
+//                      /bin/sh before any child launches and rejects the
+//                      launch when a command cannot run (rc 2/126/127).
 //   prCheckCommand     REQUIRED unless skipPR/noPrSurface; host lookup for
 //                      $PR_URL on $BRANCH, exit 0 only if the PR exists.
 //   mergeCheckCommand  REQUIRED for finalizeMergedPR; host check for
@@ -103,6 +110,10 @@
 //     a pass: the PR is suppressed and the lead is escalated. (Silently
 //     reading a missing verdict as OK was how a crashed reviewer green-lit a
 //     whole run.)
+//   - A review fix that changes nothing (e.g. every finding adjudicated out
+//     of scope) is a verified no-op, not a merge failure: a host gate proves
+//     the empty captured patch and a green branch, and the fix loop succeeds
+//     without a merger (JRB-019).
 //
 // Remediation ladder (per ticket; replaces the old "fail -> permanent" list):
 //   implementer (attempt 1)
@@ -165,11 +176,15 @@ function boolArg(value) {
 // surfacing only at the first child spawn minutes into the run).
 function unwrapGate(value, label) {
   if (value === null || value === undefined) return null;
-  if (typeof value === "string" && value.trim()) return { command: value.trim(), timeoutMs: null };
-  if (value && typeof value === "object" && typeof value.command === "string" && value.command.trim()) {
+  if (typeof value === "string" && value.trim()) {
+    return { command: value.trim(), timeoutMs: null };
+  }
+  if (value && typeof value === "object" && !Array.isArray(value) &&
+      typeof value.command === "string" && value.command.trim()) {
     return {
       command: value.command.trim(),
-      timeoutMs: typeof value.timeoutMs === "number" ? value.timeoutMs : null
+      timeoutMs: typeof value.timeoutMs === "number" && Number.isFinite(value.timeoutMs)
+        ? value.timeoutMs : null
     };
   }
   configErrors.push(label + " must be a command string or { command, timeoutMs }; got " + describeArg(value));
@@ -242,6 +257,18 @@ function runTransition(phase, ref, variables) {
       " Never PATCH the ticket description, never append Agent Execution Evidence" +
       " sections, never modify repository files. Evidence is written by the" +
       " implementer and verifier children, never by a transition." +
+      "\nBefore applying any transition, read the issue's current status. Your" +
+      " phase is '" + phase + "': if the issue is already in this phase's" +
+      " target status (or has moved beyond it), do NOT POST anything; report" +
+      " TRANSITION_ALREADY_SET and change nothing. Never advance the issue" +
+      " past this phase's target status; later phases apply their own" +
+      " transition. If the current status is neither the expected source nor" +
+      " the target of this phase's transition, report TRANSITION_STATE_MISMATCH" +
+      " and change nothing. The phase instruction above outranks any tracker" +
+      " hint: a hint that describes a different phase never justifies" +
+      " transitioning to a different status (JRB-019: a hint that said 'In" +
+      " Progress is already applied' caused the child to POST Ready for" +
+      " Review with no PR in existence)." +
       "\nReport the HTTP status code or error. Change nothing else.",
     timeoutMs: TRANSITION_TIMEOUT_MS,
     quiet: true,
@@ -319,7 +346,9 @@ function confirmMerged(refs, mergeRef) {
 // docs/agents/issue-tracker.md, never from hard-coded Markdown assumptions.
 // A run key safe for any tracker's ticket reference (paths, #42, PROJ-123).
 function keyOf(ref) { return String(ref).replace(/[^a-zA-Z0-9._-]+/g, "_"); }
-function shellQuote(value) { return "'" + String(value).replace(/'/g, "'\\''") + "'"; }
+function shellQuote(value) {
+  return "'" + String(value).replace(/'/g, "'\\''") + "'";
+}
 function checkedCommand(template, replacements) {
   let command = template;
   for (const name of Object.keys(replacements)) {
@@ -447,7 +476,9 @@ const TRANSITION_TIMEOUT_MS = 3 * 60 * 1000;
 // Gate commands are args-only (declared once above, unwrapped from strings
 // or { command, timeoutMs } objects).
 const fullGateTickets = A.fullGateTickets || [];
-function gateObj(command, timeoutMs) { return { command: command, timeoutMs: timeoutMs || GATE_TIMEOUT_MS }; }
+function gateObj(command, timeoutMs) {
+  return { command: command, timeoutMs: timeoutMs || GATE_TIMEOUT_MS };
+}
 function hostGate(command, timeoutMs) {
   return {
     command: "(" + command + ") 1>&2 && printf '{\"verified\":true}\\n'",
@@ -507,12 +538,9 @@ function checkoutHint() {
 // own completion notice is the signal that matters. The control event still
 // updates the child's state (visible on demand via status), it just no
 // longer interrupts the lead.
-const CONTROL_SILENCE_MARGIN_MS = 2 * 60 * 1000;
-function childControl() {
-  return {
-    needsAttentionAfterMs: GATE_TIMEOUT_MS + CONTROL_SILENCE_MARGIN_MS,
-    notifyOn: []
-  };
+function childControl(gateTimeoutMs) {
+  gateTimeoutMs = gateTimeoutMs || GATE_TIMEOUT_MS;
+  return { needsAttentionAfterMs: gateTimeoutMs + (2 * 60 * 1000), notifyOn: [] };
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +591,61 @@ if (configErrors.length) {
     configError: true
   };
 }
+
+// Preflight: every check command this run will use must at least RUN under
+// /bin/sh, before any child work starts. The lead authors these commands in
+// its own bash shell, but the host gates execute them with /bin/sh, and a
+// bash-only command aborts the first gate it hits mid-run (JRB-019). Ticket
+// refs are not known until discovery, so a sentinel ref exercises the
+// command's syntax and executability; exit 0/1 are valid state verdicts and
+// pass, and only a broken command (rc 2/126/127) fails the launch.
+const checkCommandEntries = [];
+for (const phase of finalizeMergedPR ? ["complete"] : (skipPR || NO_PR_SURFACE ? ["in_progress"] : ["in_progress", "ready_for_review"])) {
+  checkCommandEntries.push({
+    label: "transitionCheckCommands." + phase,
+    command: checkedCommand(TRANSITION_CHECK_COMMANDS[phase], { TICKET_REF: "JRB-000", PHASE: phase })
+  });
+}
+if (!finalizeMergedPR && !skipPR && !NO_PR_SURFACE && PR_CHECK_COMMAND) {
+  checkCommandEntries.push({
+    label: "prCheckCommand",
+    command: checkedCommand(PR_CHECK_COMMAND, { PR_URL: "https://pr-check.placeholder/0", BRANCH: integrationBranch })
+  });
+}
+if (finalizeMergedPR && MERGE_CHECK_COMMAND) {
+  checkCommandEntries.push({
+    label: "mergeCheckCommand",
+    command: checkedCommand(MERGE_CHECK_COMMAND, { MERGE_REF: "merge-ref-placeholder", TICKET_REFS: "JRB-000,JRB-001", BRANCH: integrationBranch })
+  });
+}
+const checkCommandPreflight = await runs.run("preflight-check-commands", {
+  agent: AG.worker,
+  label: "Preflight: validate host check commands under /bin/sh",
+  task: "Change nothing and run nothing: the host gate performs this check.\n" +
+    "The gate runs this configuration's host check commands once under /bin/sh,\n" +
+    "with sentinel ticket refs (the run's real refs are discovered later).\n" +
+    "It fails only when a command cannot execute (shell syntax error, missing binary).\n" +
+    "Exit codes 0 (state true) and 1 (state false) are both valid verdicts.",
+  timeoutMs: 60 * 1000,
+  quiet: true,
+  gate: hostGate(checkCommandPreflightBody(checkCommandEntries), 60 * 1000),
+  agentContract: { version: 1 }, acceptance: false
+}).catch(function(e) {
+  emit("implement-spec: check-command preflight rejected (" + e + ")");
+  return null;
+});
+if (!hostVerified(checkCommandPreflight)) {
+  return {
+    ok: false,
+    configError: true,
+    error: "implement-spec config error: a host check command cannot run under /bin/sh. " +
+      "Host gates execute check commands with /bin/sh, not the lead's bash shell. " +
+      "Rewrite the failing command in POSIX sh and relaunch. No child work started." +
+      (checkCommandPreflight && checkCommandPreflight.error
+        ? "\nGate detail: " + String(checkCommandPreflight.error).slice(0, 2000) : "")
+  };
+}
+emit("implement-spec: preflight check-command validation passed");
 
 // A launch that the harness rejects is a CONFIG failure, not a child
 // failure: the child never started, so no ticket can be blamed for it.
@@ -939,6 +1022,56 @@ function mergerGateBody(patchPrologue, issueRefs, testCommand) {
   body.push("(" + testCommand + ") || fail \"verification command failed on " + integrationBranch + "\"");
   return body.join("\n");
 }
+// Shared with implement/orchestrate.js (duplicated because the workflow
+// sandbox cannot import modules); see that file for the incident history
+// (JRB-019) and the contract comments.
+function checkCommandPreflightBody(entries) {
+  const body = ["fail() { echo 'CHECK_COMMAND_FAIL:' \"$1\" >&2; exit 1; }"];
+  for (const e of entries) {
+    body.push([
+      "out=$(sh -c " + shellQuote(e.command) + " 2>&1); rc=$?",
+      "out=$(printf '%s' \"$out\" | head -c 400)",
+      "case \"$rc\" in",
+      "  0|1) : ;;",
+      "  2|126|127) fail \"check command '" + e.label + "' exited rc=$rc under /bin/sh; the command itself is broken (rc 2 = shell syntax error, 126 = not executable, 127 = command not found). Host gates run check commands with /bin/sh, so it must be valid POSIX sh. Output: $out\" ;;",
+      "  *) : ;;",
+      "esac"
+    ].join("\n"));
+  }
+  return body.join("\n");
+}
+
+function fixNoopGateBody(opts) {
+  const body = [
+    "fail() { echo 'FIX_NOOP_FAIL:' \"$1\" >&2; exit 1; }",
+    "cd " + shellQuote(opts.repoPath) + " || fail \"cannot enter checkout " + opts.repoPath + "\"",
+    "test \"$(git branch --show-current)\" = " + shellQuote(opts.branch) +
+      " || fail \"checkout is on '$(git branch --show-current)', expected " + opts.branch + "\"",
+    "test -z \"$(git status --porcelain)\" || fail \"checkout has uncommitted or untracked changes\""
+  ];
+  if (!opts.patchDir) {
+    body.push("fail \"cannot locate the fixer's run directory; cannot prove the fix changed nothing\"");
+  } else {
+    body.push([
+      "set -- " + shellQuote(opts.patchDir) + "/*.patch",
+      "if [ \"$#\" -eq 1 ] && [ -f \"$1\" ]; then",
+      "  test ! -s \"$1\" || fail \"the captured fix patch is non-empty: the fixer made changes that still need merging\"",
+      "fi"
+    ].join("\n"));
+  }
+  if (opts.runId && opts.runId !== "unknown") {
+    body.push([
+      "wt=$(git worktree list --porcelain | awk -v id=" + shellQuote(opts.runId) + " '$1 == \"worktree\" && $2 ~ id {print $2; exit}')",
+      "if [ -n \"$wt\" ]; then",
+      "  test -z \"$(git -C \"$wt\" status --porcelain)\" || fail \"the fixer's worktree $wt has uncommitted changes\"",
+      "  test -z \"$(git -C \"$wt\" log --oneline " + shellQuote(opts.baseRef) + "..HEAD 2>/dev/null)\" || fail \"the fixer's worktree $wt carries commits beyond " + opts.branch + "\"",
+      "fi"
+    ].join("\n"));
+  }
+  body.push("(" + opts.testCommand + ") || fail \"intermediate gate failed on " + opts.branch + "\"");
+  return body.join("\n");
+}
+
 function mergeGate(ref, result, worktreePath, affectedRefs) {
   const hint = patchHint(result);
   let prologue = null;
@@ -1247,7 +1380,7 @@ function ledgerFor(num) {
   return ledger[num];
 }
 
-function classifyFailure(result) {
+function classifyFailure(result, flakeRe) {
   if (!result) return "unknown";
   if (result.ok) return "ok";
   const err = String(result.error || "");
@@ -1255,10 +1388,9 @@ function classifyFailure(result) {
   // started, so no ticket is at fault and no remediation cycle applies.
   if (isConfigError(err)) return "config";
   if (/timed?\s?out|timeout|deadline/i.test(err)) return "timeout";
-  // A single flaky e2e test failure must not abort the
-  // whole workflow. Classify it explicitly so the ladder can re-run the
-  // gate (quarantine/recheck) instead of paying for a full code fixer.
-  if (FLAKE_RE.test(err)) return "flake";
+  // A single flaky test failure must not abort the whole workflow: the
+  // ladder re-runs that one test (quarantine) instead of paying for a fixer.
+  if (flakeRe && flakeRe.test(err)) return "flake";
   if (/gate/i.test(err)) return "gate";
   return "unknown";
 }
@@ -1653,7 +1785,7 @@ if (verifyOnly) {
       const ticket = batch[i];
       const ld = ledgerFor(ticket.ref);
       let implResult = implResults ? implResults[i] : null;
-      const cls = classifyFailure(implResult);
+      const cls = classifyFailure(implResult, FLAKE_RE);
       ld.runId = implResult && implResult.runId ? implResult.runId : ld.runId;
 
       if (cls === "config") {
@@ -1901,6 +2033,7 @@ let reviews = null;
 let reviewsIncomplete = false;
 let fixRun = null;
 let fixMergerRun = null;
+let fixNoopVerified = false;
 let prRun = null;
 let prEligible = false;
 let finalVerifyPassed = false;
@@ -1958,6 +2091,38 @@ if (merged.length) {
     }
 
     if (fixRun && fixRun.ok) {
+      // A fixer whose findings were all adjudicated out of scope legitimately
+      // changes nothing: its captured patch is empty. That is a valid
+      // fix-loop outcome, not a merge failure: the merger would refuse the
+      // empty patch and the run would dead-end (JRB-019). Prove the no-op on
+      // the host first; only an unproven fix falls through to the merger.
+      const fixLoc = patchHint(fixRun);
+      const noopRun = await runs.run("verify-fix-noop", {
+        agent: AG.worker,
+        label: "Verify review fix made no changes",
+        task: "Change nothing and run nothing: the host gate performs this check.\n" +
+          "The gate proves the review fix changed nothing (empty captured patch and a" +
+          " clean, uncommitted worktree) and that " + integrationBranch + " is clean and green.",
+        timeoutMs: GATE_TIMEOUT_MS + 120000,
+        quiet: true,
+        gate: hostGate(fixNoopGateBody({
+          repoPath: REPO_PATH,
+          branch: integrationBranch,
+          baseRef: baseRef,
+          patchDir: fixLoc.dir,
+          runId: fixLoc.runId,
+          testCommand: gateCommand(merged[0])
+        }), GATE_TIMEOUT_MS),
+        agentContract: { version: 1 }, acceptance: false
+      }).catch(function(e) {
+        emit("implement-spec: fix no-op verification rejected (" + e + ")");
+        return null;
+      });
+      if (hostVerified(noopRun)) {
+        fixNoopVerified = true;
+        fixMergerRun = noopRun;
+        emit("implement-spec: review fix changed nothing (host-verified no-op); branch stays as reviewed");
+      } else {
       const fixHint = patchHint(fixRun);
       const fixMergeTask = [
         "Merge the review-fix implementer's captured patch into " + integrationBranch + ".",
@@ -2041,6 +2206,7 @@ if (merged.length) {
                "Gate label: " + String((gmVerify && gmVerify.error) || (fixMergerRun && fixMergerRun.error) || "unknown").slice(0, 500) + ". " +
                "Lead decision needed before any PR.");
         }
+      }
       }
     } else {
       emit("ESCALATION: review fix pass failed or was rejected — lead decision needed before any PR.");
@@ -2248,6 +2414,7 @@ return {
   verifications: verifications,
   fixApplied: !!(fixRun && fixRun.ok),
   fixMerged: hostVerified(fixMergerRun),
+  fixNoopVerified: fixNoopVerified,
   prCreated: prCreated,
   prSurfaceUnavailable: prSurfaceUnavailable,
   prFailed: prFailed,

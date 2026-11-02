@@ -80,6 +80,8 @@ A worktree holds only what git tracks. Tests that read gitignored fixtures, loca
 - The integration branch contains every in-scope issue, with captured patches confirmed by host gates, fresh reviews and verification after any review fix, and the full-suite gate passing before any PR opens.
 - Issues move to Ready for Review only after PR creation, and to Complete only after merge confirmation.
 - A dirty or invalid checkout stops the run at the preflight, before any implementer worktree is attempted.
+- A lifecycle or request check command that cannot run under `/bin/sh` stops the run at the preflight, with the failing command and exit code named, instead of failing mid-run after tickets have dispatched.
+- A review fix that legitimately changes nothing (for example, findings declined as out of scope) verifies as a no-op and the run proceeds to fresh reviews, instead of escalating on an empty patch.
 - A ticket that fails twice with the same failure signature escalates immediately rather than exhausting its remediation ladder.
 
 ## Where it fits

@@ -88,10 +88,19 @@ function responseFor(call, options) {
   if (key === "fix-review-findings") {
     return options.reviewFixPass === false
       ? { ok: false, error: "review fix did not pass", output: "failed" }
-      : { ok: true, runId: "r-fix-review", output: "review fixes ready" };
+      : { ok: true, runId: "r-fix-review", output: "review fixes ready", ...(options.fixArtifactPaths ? { artifactPaths: options.fixArtifactPaths } : {}) };
   }
   if (key === "merge-review-fixes" && options.fixMergeFail) {
     return { ok: false, error: "merge rejected: simulated", output: "failed" };
+  }
+  if (key === "verify-fix-noop" || key.startsWith("verify-fix-noop-")) {
+    // A stub cannot prove that a fixer changed nothing, so the default is a
+    // failed gate (the run falls through to the merger path, as it does in
+    // production when the captured patch is non-empty). Options must opt in
+    // with fixNoop: true, and the gate then runs for real under runHostGates.
+    return options.fixNoop
+      ? { ok: true, runId: "r-fix-noop", output: "fix changed nothing" }
+      : { ok: false, error: "gate failed: the captured fix patch is non-empty" };
   }
   if (key.startsWith("fix-t") || /^fix-\d+-t/.test(key)) {
     return options.fixFail
@@ -1051,6 +1060,62 @@ test("both workflows reject missing state-check configuration before launching c
   }
 });
 
+test("transition children are phase-scoped, idempotent, and hint-proof in both workflows", async () => {
+  // JRB-019 run 2: a lead-authored tracker hint that said "In Progress is
+  // already applied" made the transition child POST Ready for Review with no
+  // PR in existence. The phase-boundary rule must live in the baked-in task
+  // text of BOTH scripts (it existed in neither at the time).
+  const single = await executeWorkflow("implement", singleArgs());
+  const spec = await executeWorkflow("implement-spec", specArgs(oneTicket));
+  for (const { calls } of [single, spec]) {
+    const transitions = calls.filter((call) => call.key.startsWith("transition-"));
+    assert.ok(transitions.length > 0);
+    for (const t of transitions) {
+      assert.match(t.task, /TRANSITION_ALREADY_SET/);
+      assert.match(t.task, /past this phase's target status/);
+      assert.match(t.task, /outranks any tracker hint/);
+      assert.match(t.task, /TRANSITION_STATE_MISMATCH/);
+    }
+  }
+});
+
+test("host check commands are validated under /bin/sh before any child work (JRB-019)", async () => {
+  // JRB-019 run 1: a lead-authored transition check used bash-only $((10#...))
+  // arithmetic; the host gate runs check commands with /bin/sh (dash), so it
+  // died with a syntax error in 5ms, mid-run, after the transition had already
+  // applied. The orchestrator must now reject the launch up front.
+  await integrationFixture(async ({ repo }) => {
+    const graph = structuredClone(oneTicket);
+    graph.preflight.integrationBranch = "feature/JRB-012-modal-dismissal";
+    const bashOnly = "ref='JRB-012'; test $((10#${ref#JRB-})) -ge 0";
+    for (const skill of ["implement", "implement-spec"]) {
+      const args = skill === "implement"
+        ? singleArgs({ repoPath: repo, fullGate: "true", narrowGate: "true", skipPR: true, transitionCheckCommands: { in_progress: bashOnly } })
+        : specArgs(graph, { repoPath: repo, integrationBranch: "feature/JRB-012-modal-dismissal", fullGate: "true", narrowGate: "true", skipPR: true, transitionCheckCommands: { in_progress: bashOnly } });
+      const { result, calls } = await executeWorkflow(skill, args, { runHostGates: true });
+      assert.equal(result.configError, true, skill + " must reject a bash-only check command");
+      assert.match(result.error, /rc=2/);
+      assert.match(result.error, /POSIX sh/);
+      assert.ok(!calls.some((call) => call.key.startsWith("impl-") || /^impl-\d+-t/.test(call.key)), "no implementer launched");
+      assert.ok(!calls.some((call) => call.key.startsWith("transition-")));
+    }
+  });
+});
+
+test("state-check and PR-check commands pass the preflight and run before discovery and implementation", async () => {
+  const single = await executeWorkflow("implement", singleArgs());
+  const singlePreflight = single.calls.find((call) => call.key === "preflight-check-commands");
+  assert.ok(singlePreflight, "implement must preflight its check commands");
+  assert.match(singlePreflight.gate.command, /sh -c/);
+  assert.ok(single.calls.findIndex((call) => call.key === "preflight-check-commands") < single.calls.findIndex((call) => call.key.startsWith("impl-")));
+
+  const spec = await executeWorkflow("implement-spec", specArgs(oneTicket));
+  const specPreflight = spec.calls.find((call) => call.key === "preflight-check-commands");
+  assert.ok(specPreflight, "implement-spec must preflight its check commands");
+  assert.match(specPreflight.gate.command, /sh -c/);
+  assert.ok(spec.calls.findIndex((call) => call.key === "preflight-check-commands") < spec.calls.findIndex((call) => call.key === "ticket-graph-forced"));
+});
+
 test("implement-spec rejects a false tracker-state claim before starting a worktree", async () => {
   await integrationFixture(async ({ repo }) => {
     const graph = structuredClone(oneTicket);
@@ -1081,6 +1146,46 @@ test("implement-spec confirms the captured patch and issue trailer on the host",
   });
 });
 
+test("a review fix that changes nothing is a verified no-op, not a merge failure (JRB-019)", async () => {
+  // JRB-019 runs 3/4: a fixer whose findings were all adjudicated out of scope
+  // produced an empty captured patch; the merger correctly refused it, and the
+  // run escalated forever. An empty patch plus a green unchanged branch must
+  // now be a verified no-op outcome, with no merger child at all.
+  for (const skill of ["implement", "implement-spec"]) {
+    await integrationFixture(async ({ repo, git, patchPath, asyncDir }) => {
+      const emptyAsyncDir = join(repo, "async-subagent-runs", "r-fix-review");
+      await mkdir(join(emptyAsyncDir, "worktree-diffs", "step-0"), { recursive: true });
+      await writeFile(join(emptyAsyncDir, "worktree-diffs", "step-0", "change.patch"), "");
+      const graph = structuredClone(oneTicket);
+      graph.preflight.integrationBranch = "feature/JRB-012-modal-dismissal";
+      const args = skill === "implement"
+        ? singleArgs({ repoPath: repo, fullGate: "true", narrowGate: "true", skipPR: true })
+        : specArgs(graph, { repoPath: repo, integrationBranch: "feature/JRB-012-modal-dismissal", fullGate: "true", narrowGate: "true", skipPR: true });
+      const { calls, result } = await executeWorkflow(skill, args, {
+        implArtifactPaths: [asyncDir], runHostGates: true, fixNoop: true,
+        fixArtifactPaths: [emptyAsyncDir],
+        reviewByKey: skill === "implement"
+          ? { "review-initial-standards": "BLOCK" }
+          : { "review-initial-standards-1": "BLOCK" },
+        mergeAction: (call) => {
+          if (call.key.startsWith("merge-fix-") || call.key === "merge-review-fixes") {
+            throw new Error("no merger child may run for a verified fix no-op");
+          }
+          git("apply", "--index", patchPath);
+          git("commit", "-qm", "fix: update fixture\n\nIssue: JRB-012");
+        },
+      });
+      assert.ok(calls.some((call) => call.key === "verify-fix-noop" || call.key.startsWith("verify-fix-noop-")), skill + " must run the no-op gate");
+      assert.ok(!calls.some((call) => call.key.startsWith("merge-fix-")) && !calls.some((call) => call.key === "merge-review-fixes"), skill + " must not spawn a merger for a verified no-op");
+      assert.ok(calls.some((call) => call.key.startsWith("review-post-fix-")), skill + " must still re-review after the no-op");
+      assert.equal(result.fixMerged, true);
+      assert.equal(result.fixNoopVerified, true);
+      assert.equal(result.ok, true);
+      assert.equal(git("show", "HEAD:feature.txt"), "new\n");
+    });
+  }
+});
+
 test("gate-only children use host-owned typed proof rather than a child acceptance report", async () => {
   const single = await executeWorkflow("implement", singleArgs());
   const spec = await executeWorkflow("implement-spec", specArgs(oneTicket));
@@ -1108,12 +1213,21 @@ test("shared worker lifecycle schemas remain identical across both orchestrators
   }
 });
 
-test("the shared merger gate body remains identical across both orchestrators", () => {
-  const re = /function mergerGateBody\([\s\S]*?\n}\n/;
-  const single = SOURCES.implement.match(re)?.[0];
-  const spec = SOURCES["implement-spec"].match(re)?.[0];
-  assert.ok(single && spec, "mergerGateBody is missing");
-  assert.equal(spec, single, "mergerGateBody drifted across workflows");
+test("shared helper functions remain identical across both orchestrators", () => {
+  // The workflow sandbox cannot import modules, so each orchestrate.js carries
+  // its own copy of every shared helper; these assertions turn copy drift into
+  // a test failure instead of a silent divergence (JRB-019: the transition
+  // phase-boundary text existed in one script and not the other).
+  for (const name of ["numArg", "boolArg", "describeArg", "isConfigError", "keyOf",
+    "shellQuote", "checkedCommand", "cleanTreeCommand", "hostGate", "gateObj",
+    "hostVerified", "unwrapGate", "requireInt", "childControl", "classifyFailure",
+    "failureSignature", "mergerGateBody", "checkCommandPreflightBody", "fixNoopGateBody"]) {
+    const re = new RegExp(`function ${name}\\([\\s\\S]*?\\n}\\n`);
+    const single = SOURCES.implement.match(re)?.[0];
+    const spec = SOURCES["implement-spec"].match(re)?.[0];
+    assert.ok(single && spec, `${name} is missing`);
+    assert.equal(spec, single, `${name} drifted across workflows`);
+  }
 });
 
 test("a PR surface claimed absent by a worker needs advance authorization", async () => {
