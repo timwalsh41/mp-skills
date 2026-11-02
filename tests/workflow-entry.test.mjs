@@ -907,6 +907,30 @@ test("merger gate tolerates a pre-commit hook reformatting the committed work (J
   }
 });
 
+test("merger gate finds the work committed deeper than HEAD~2 (multi-ticket wave)", async () => {
+  // In a wave, sibling tickets merge before and after this ticket's own
+  // commit, so the work commit can sit several commits below HEAD. The gate
+  // must walk the first-parent chain to the merge-base, not stop at HEAD~2.
+  await integrationFixture(async ({ repo, git, patchPath, asyncDir }) => {
+    const args = singleArgs({ repoPath: repo, fullGate: "true", narrowGate: "true", skipPR: true });
+    const { result } = await executeWorkflow("implement", args, {
+      implArtifactPaths: [asyncDir], runHostGates: true,
+      mergeAction: () => {
+        for (const sib of ["one", "two", "three"]) {
+          execFileSync("sh", ["-c", `echo ${sib} > sib-${sib}.txt && git add sib-${sib}.txt && git commit -qm 'chore: sibling ${sib}'`], { cwd: repo });
+        }
+        git("apply", "--index", patchPath);
+        git("commit", "-qm", "fix: update fixture\n\nIssue: JRB-012");
+        for (const sib of ["four", "five", "six"]) {
+          execFileSync("sh", ["-c", `echo ${sib} > sib-${sib}.txt && git add sib-${sib}.txt && git commit -qm 'chore: sibling ${sib}'`], { cwd: repo });
+        }
+      },
+    });
+    assert.equal(result.ok, true);
+    assert.equal(git("show", "HEAD~3:feature.txt"), "new\n");
+  });
+});
+
 test("implement-spec merger retries launch under distinct keys after a failed first attempt", async () => {
   const { calls, result } = await executeWorkflow("implement-spec", specArgs(oneTicket), {
     cacheKeys: new Map(), failFirstMerge: true,

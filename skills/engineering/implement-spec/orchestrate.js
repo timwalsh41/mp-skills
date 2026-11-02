@@ -681,6 +681,7 @@ function spawnImplementer(ticket, wave) {
     "  branches, worktrees, or spawn subagents.",
     "- Do NOT run git commit — leave your changes uncommitted in the worktree;",
     "  the orchestrator captures and merges them.",
+    "- If the repo configures a pre-commit formatter (check .pre-commit-config.yaml and the format command in docs/agents/verification.md or CODING_STANDARDS.md), run it over the files you changed before finishing, then re-run the gate. The merger's commit-time pre-commit hook reformats anything left unformatted, and the captured patch must already be in the form that lands (JRB-018).",
     "",
     "Return a concise summary: what you implemented, test results, decisions."
   );
@@ -754,7 +755,8 @@ function spawnContinueChild(ticket, runId, wave) {
     "2. cd into that worktree; git status shows the partial changes. Read the",
     "   ticket (" + ticket.ref + ") for the remaining acceptance criteria.",
     "3. Finish the remaining criteria, keep the gate green yourself: " + gateCommand(ticket.ref),
-    "4. Leave changes uncommitted. Do NOT commit, stage, or spawn subagents.",
+    "4. Run the repo's configured pre-commit formatter over the files you changed before finishing (see .pre-commit-config.yaml; the command is in docs/agents/verification.md or CODING_STANDARDS.md) — the merger's commit-time hook reformats anything left unformatted (JRB-018).",
+    "5. Leave changes uncommitted. Do NOT commit, stage, or spawn subagents.",
     "",
     "Finish by calling structured_output with worktreePath: the absolute path of",
     "the worktree you worked in, so the orchestrator can hand it to the merger."
@@ -834,7 +836,8 @@ function spawnFixer(ticket, priorResult, wave) {
     "   (your worktree already branches from " + integrationBranch + ").",
     "3. Run the gate: " + gateCommand(ticket.ref),
     "4. Fix the failures the gate reports. Stay within this ticket's scope.",
-    "5. Re-run the gate until green, then finish with the acceptance-report block.",
+    "5. Run the repo's configured pre-commit formatter (see .pre-commit-config.yaml; the command is documented in docs/agents/verification.md or CODING_STANDARDS.md) over the files you changed before finishing, then re-run the gate: the merger's commit-time hook reformats anything left unformatted (JRB-018).",
+    "6. Re-run the gate until green, then finish with the acceptance-report block.",
     "",
     "If the patch cannot be located or applied, report FAILURE clearly and",
     "change nothing."
@@ -866,11 +869,13 @@ function spawnFixer(ticket, priorResult, wave) {
 //
 // The patch check is formatter-tolerant: a repo pre-commit hook (ruff-format
 // et al.) rewrites staged files at commit time, so the captured patch never
-// textually reverse-applies to the commit even though the work landed. For
-// each candidate base (merge-base with the base branch, HEAD~1, HEAD~2), the
-// patch is applied to a temp index and the patched tree must equal HEAD's
-// tree modulo whitespace. That passes when the work is committed (exactly,
-// hook-reformatted, or already merged as a verified no-op) and fails when it
+// textually reverse-applies to the commit even though the work landed. The
+// gate walks the first-parent chain from HEAD down to the merge-base with
+// the base branch (capped), and for each commit C checks whether applying
+// the patch to a temp index seeded from C's parent yields a tree equal to
+// C's modulo whitespace. That passes when the work is committed (exactly,
+// hook-reformatted, or already merged as a verified no-op), including when
+// sibling commits landed after it in a multi-ticket wave, and fails when it
 // is absent — the no-op success path JRB-018's second merger was denied.
 function mergerGateBody(patchPrologue, issueRefs, testCommand) {
   const body = [
@@ -888,32 +893,42 @@ function mergerGateBody(patchPrologue, issueRefs, testCommand) {
     body.push([
       "work_on_branch=''",
       "mb=$(git merge-base HEAD " + shellQuote(BASE_BRANCH) + " 2>/dev/null || true)",
-      "for cand in \"$mb\" HEAD~1 HEAD~2; do",
-      "  test -n \"$cand\" || continue",
-      "  git rev-parse -q --verify \"$cand^{tree}\" >/dev/null 2>&1 || continue",
-      "  tidx=$(mktemp) && rm -f \"$tidx\"",
-      "  if GIT_INDEX_FILE=\"$tidx\" git read-tree \"$cand\" 2>/dev/null &&",
-      "     GIT_INDEX_FILE=\"$tidx\" git apply --cached --whitespace=fix \"$pfile\" 2>/dev/null; then",
-      "    ptree=$(GIT_INDEX_FILE=\"$tidx\" git write-tree 2>/dev/null)",
-      "    rm -f \"$tidx\"",
-      "    test -n \"$ptree\" || continue",
-      "    tlist=$(mktemp)",
-      "    git diff --name-only -z \"$ptree\" HEAD | tr '\\0' '\\n' > \"$tlist\" 2>/dev/null",
-      "    equiv=1",
-      "    while IFS= read -r p; do",
-      "      test -n \"$p\" || continue",
-      "      a=$(git show \"$ptree:$p\" 2>/dev/null | tr -d '[:space:]')",
-      "      b=$(git show \"HEAD:$p\" 2>/dev/null | tr -d '[:space:]')",
-      "      if ! test \"$a\" = \"$b\"; then equiv=''; break; fi",
-      "    done < \"$tlist\"",
-      "    rm -f \"$tlist\"",
-      "    if test -n \"$equiv\"; then work_on_branch=1; break; fi",
-      "  else",
-      "    rm -f \"$tidx\"",
+      "c=HEAD",
+      "i=0",
+      "while [ \"$i\" -le 12 ]; do",
+      "  if [ \"$i\" -gt 0 ]; then",
+      "    c=$(git rev-parse -q --verify \"HEAD~$i\" 2>/dev/null) || break",
       "  fi",
+      "  test -n \"$c\" || break",
+      "  parent=$(git rev-parse -q --verify \"$c^\" 2>/dev/null || true)",
+      "  if test -n \"$parent\"; then",
+      "    tidx=$(mktemp) && rm -f \"$tidx\"",
+      "    if GIT_INDEX_FILE=\"$tidx\" git read-tree \"$parent\" 2>/dev/null &&",
+      "       GIT_INDEX_FILE=\"$tidx\" git apply --cached --whitespace=fix \"$pfile\" 2>/dev/null; then",
+      "      ptree=$(GIT_INDEX_FILE=\"$tidx\" git write-tree 2>/dev/null)",
+      "      rm -f \"$tidx\"",
+      "      if test -n \"$ptree\"; then",
+      "        tlist=$(mktemp)",
+      "        git diff --name-only -z \"$ptree\" \"$c\" | tr '\\0' '\\n' > \"$tlist\" 2>/dev/null",
+      "        equiv=1",
+      "        while IFS= read -r p; do",
+      "          test -n \"$p\" || continue",
+      "          a=$(git show \"$ptree:$p\" 2>/dev/null | tr -d '[:space:]')",
+      "          b=$(git show \"$c:$p\" 2>/dev/null | tr -d '[:space:]')",
+      "          if ! test \"$a\" = \"$b\"; then equiv=''; break; fi",
+      "        done < \"$tlist\"",
+      "        rm -f \"$tlist\"",
+      "        test -n \"$equiv\" && work_on_branch=1 && break",
+      "      fi",
+      "    else",
+      "      rm -f \"$tidx\"",
+      "    fi",
+      "  fi",
+      "  test \"$c\" = \"$mb\" && break",
+      "  i=$((i+1))",
       "done",
       "test -n \"$work_on_branch\" || fail \"captured patch is not on " + integrationBranch +
-        ": no candidate base turns patch+base into HEAD's content modulo whitespace; branch delta: $(git diff --stat \"$(git merge-base HEAD " + shellQuote(BASE_BRANCH) + ")\" HEAD | tail -1)\""
+        ": no commit from HEAD down to the merge-base equals parent+patch modulo whitespace; branch delta: $(git diff --stat \"$(git merge-base HEAD " + shellQuote(BASE_BRANCH) + ")\" HEAD | tail -1)\""
     ].join("\n"));
   }
   for (const issueRef of issueRefs) {
@@ -1924,7 +1939,8 @@ if (merged.length) {
       "Fix the must-fix defects in YOUR managed worktree (already branched from",
       integrationBranch + "), keep the intermediate gate green (" + (NARROW_GATE && NARROW_GATE.command) + "), and do NOT",
       "commit — the orchestrator captures and merges your patch. Do NOT spawn",
-      "subagents. End with the acceptance-report block."
+      "subagents. End with the acceptance-report block.",
+      "Run the repo's configured pre-commit formatter over the files you changed before finishing (see .pre-commit-config.yaml; the command is in docs/agents/verification.md or CODING_STANDARDS.md), then re-run the gate: the merger's commit-time hook reformats anything left unformatted (JRB-018)."
     ].join("\n");
     try {
       fixRun = await runs.run("fix-review-findings", {

@@ -557,6 +557,7 @@ function spawnImplementer() {
     "- Write/update tests for every criterion (unit/integration/E2E per the spec); trace shared files to other callers and protect adjacent workflows.",
     "- Your worktree branches from " + integrationBranch + "; do NOT create branches, worktrees, or spawn subagents.",
     "- Do NOT commit — leave your changes uncommitted; the orchestrator's merger captures and commits them.",
+    "- If the repo configures a pre-commit formatter (check .pre-commit-config.yaml and the format command in docs/agents/verification.md or CODING_STANDARDS.md), run it over the files you changed before finishing, then re-run the gate. The merger's commit-time pre-commit hook reformats anything left unformatted, and the captured patch must already be in the form that lands (JRB-018).",
     "",
     "The intermediate verification gate runs on the host after you finish: " + (NARROW_GATE && NARROW_GATE.command)
   );
@@ -589,7 +590,8 @@ function spawnFixer(priorResult, wave) {
     "2. Apply it to YOUR worktree: git apply --whitespace=fix --index <patch>",
     "   (your worktree already branches from " + integrationBranch + ").",
     "3. Fix the failures the orchestrator reported; the intermediate gate runs on the host automatically once you finish, so leave your changes uncommitted for it to capture.",
-    "4. Leave changes uncommitted — the orchestrator's merger captures and commits them.",
+    "4. Run the repo's configured pre-commit formatter (see .pre-commit-config.yaml; the command is documented in docs/agents/verification.md or CODING_STANDARDS.md) over the files you changed before finishing, then re-check the gate: the merger's commit-time hook reformats anything left unformatted (JRB-018).",
+    "5. Leave changes uncommitted — the orchestrator's merger captures and commits them.",
     "",
     "If the patch cannot be found or applied, report FAILURE clearly and change nothing."
   ];
@@ -618,11 +620,13 @@ function spawnFixer(priorResult, wave) {
 //
 // The patch check is formatter-tolerant: a repo pre-commit hook (ruff-format
 // et al.) rewrites staged files at commit time, so the captured patch never
-// textually reverse-applies to the commit even though the work landed. For
-// each candidate base (merge-base with the base branch, HEAD~1, HEAD~2), the
-// patch is applied to a temp index and the patched tree must equal HEAD's
-// tree modulo whitespace. That passes when the work is committed (exactly,
-// hook-reformatted, or already merged as a verified no-op) and fails when it
+// textually reverse-applies to the commit even though the work landed. The
+// gate walks the first-parent chain from HEAD down to the merge-base with
+// the base branch (capped), and for each commit C checks whether applying
+// the patch to a temp index seeded from C's parent yields a tree equal to
+// C's modulo whitespace. That passes when the work is committed (exactly,
+// hook-reformatted, or already merged as a verified no-op), including when
+// sibling commits landed after it in a multi-ticket wave, and fails when it
 // is absent — the no-op success path JRB-018's second merger was denied.
 function mergerGateBody(patchPrologue, issueRefs, testCommand) {
   const body = [
@@ -640,32 +644,42 @@ function mergerGateBody(patchPrologue, issueRefs, testCommand) {
     body.push([
       "work_on_branch=''",
       "mb=$(git merge-base HEAD " + shellQuote(BASE_BRANCH) + " 2>/dev/null || true)",
-      "for cand in \"$mb\" HEAD~1 HEAD~2; do",
-      "  test -n \"$cand\" || continue",
-      "  git rev-parse -q --verify \"$cand^{tree}\" >/dev/null 2>&1 || continue",
-      "  tidx=$(mktemp) && rm -f \"$tidx\"",
-      "  if GIT_INDEX_FILE=\"$tidx\" git read-tree \"$cand\" 2>/dev/null &&",
-      "     GIT_INDEX_FILE=\"$tidx\" git apply --cached --whitespace=fix \"$pfile\" 2>/dev/null; then",
-      "    ptree=$(GIT_INDEX_FILE=\"$tidx\" git write-tree 2>/dev/null)",
-      "    rm -f \"$tidx\"",
-      "    test -n \"$ptree\" || continue",
-      "    tlist=$(mktemp)",
-      "    git diff --name-only -z \"$ptree\" HEAD | tr '\\0' '\\n' > \"$tlist\" 2>/dev/null",
-      "    equiv=1",
-      "    while IFS= read -r p; do",
-      "      test -n \"$p\" || continue",
-      "      a=$(git show \"$ptree:$p\" 2>/dev/null | tr -d '[:space:]')",
-      "      b=$(git show \"HEAD:$p\" 2>/dev/null | tr -d '[:space:]')",
-      "      if ! test \"$a\" = \"$b\"; then equiv=''; break; fi",
-      "    done < \"$tlist\"",
-      "    rm -f \"$tlist\"",
-      "    if test -n \"$equiv\"; then work_on_branch=1; break; fi",
-      "  else",
-      "    rm -f \"$tidx\"",
+      "c=HEAD",
+      "i=0",
+      "while [ \"$i\" -le 12 ]; do",
+      "  if [ \"$i\" -gt 0 ]; then",
+      "    c=$(git rev-parse -q --verify \"HEAD~$i\" 2>/dev/null) || break",
       "  fi",
+      "  test -n \"$c\" || break",
+      "  parent=$(git rev-parse -q --verify \"$c^\" 2>/dev/null || true)",
+      "  if test -n \"$parent\"; then",
+      "    tidx=$(mktemp) && rm -f \"$tidx\"",
+      "    if GIT_INDEX_FILE=\"$tidx\" git read-tree \"$parent\" 2>/dev/null &&",
+      "       GIT_INDEX_FILE=\"$tidx\" git apply --cached --whitespace=fix \"$pfile\" 2>/dev/null; then",
+      "      ptree=$(GIT_INDEX_FILE=\"$tidx\" git write-tree 2>/dev/null)",
+      "      rm -f \"$tidx\"",
+      "      if test -n \"$ptree\"; then",
+      "        tlist=$(mktemp)",
+      "        git diff --name-only -z \"$ptree\" \"$c\" | tr '\\0' '\\n' > \"$tlist\" 2>/dev/null",
+      "        equiv=1",
+      "        while IFS= read -r p; do",
+      "          test -n \"$p\" || continue",
+      "          a=$(git show \"$ptree:$p\" 2>/dev/null | tr -d '[:space:]')",
+      "          b=$(git show \"$c:$p\" 2>/dev/null | tr -d '[:space:]')",
+      "          if ! test \"$a\" = \"$b\"; then equiv=''; break; fi",
+      "        done < \"$tlist\"",
+      "        rm -f \"$tlist\"",
+      "        test -n \"$equiv\" && work_on_branch=1 && break",
+      "      fi",
+      "    else",
+      "      rm -f \"$tidx\"",
+      "    fi",
+      "  fi",
+      "  test \"$c\" = \"$mb\" && break",
+      "  i=$((i+1))",
       "done",
       "test -n \"$work_on_branch\" || fail \"captured patch is not on " + integrationBranch +
-        ": no candidate base turns patch+base into HEAD's content modulo whitespace; branch delta: $(git diff --stat \"$(git merge-base HEAD " + shellQuote(BASE_BRANCH) + ")\" HEAD | tail -1)\""
+        ": no commit from HEAD down to the merge-base equals parent+patch modulo whitespace; branch delta: $(git diff --stat \"$(git merge-base HEAD " + shellQuote(BASE_BRANCH) + ")\" HEAD | tail -1)\""
     ].join("\n"));
   }
   for (const issueRef of issueRefs) {
@@ -1207,6 +1221,7 @@ if (blockedAxes.length && !(PR_WAIVER_REASON && !skipPR)) {
     "Fix must-fix defects in YOUR managed worktree (already branched from",
     integrationBranch + "), keep the intermediate gate green: " + (NARROW_GATE && NARROW_GATE.command),
     "",
+    "Run the repo's configured pre-commit formatter over the files you changed before finishing (see .pre-commit-config.yaml; the command is in docs/agents/verification.md or CODING_STANDARDS.md), then re-run the gate: the merger's commit-time hook reformats anything left unformatted (JRB-018).",
     "Leave changes uncommitted — the orchestrator's merger captures and commits them.",
     "Do NOT spawn subagents. End with the acceptance-report block."
   ].join("\n");

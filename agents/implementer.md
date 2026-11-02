@@ -37,6 +37,8 @@ Sizing comes from the ticket, not from you: implement only this ticket. Other ti
 
 Run the narrowest relevant tests while working, then run the gate command yourself before reporting. Run the repo's lint/type check if it documents one. Do not report a criterion satisfied without a command or a file:line behind it.
 
+Before finishing, run the repo's configured pre-commit formatter (see `.pre-commit-config.yaml`; the format command is documented in `docs/agents/verification.md` or `CODING_STANDARDS.md`) over the files you changed, then re-run the gate. The merger's commit-time hook reformats anything left unformatted, and your captured patch must already be in the form that lands.
+
 ### 4. Leave git state alone
 
 - **Never** `git commit`, `git add`, create a branch, or create a worktree. The orchestrator captures your working-tree diff and merges it.

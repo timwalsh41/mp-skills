@@ -34,7 +34,7 @@ dry-runs both orchestrators against stub children and fails on:
 | `check-transition-<phase>-<ref>` | worker | typed host gate re-reads tracker status after a positive report | `verified: true`, versioned contract |
 | `impl-t<ref>` | implementer | default acceptance + gate | acceptance-report block (implementer's deliverable) |
 | `fix-t<ref>-w<n>` | implementer | default acceptance + gate | acceptance-report block |
-| `merge-<retry>-<ref>` | merger | typed host gate: correct branch, clean tree, captured patch's content on the branch (formatter-tolerant: temp-index tree comparison modulo whitespace across candidate bases), issue trailer exists, narrow suite passes; each clause labels its own failure | `verified: true`, versioned contract; retries get distinct keys |
+| `merge-<retry>-<ref>` | merger | typed host gate: correct branch, clean tree, captured patch's content on the branch (formatter-tolerant: temp-index tree comparison modulo whitespace, walking the first-parent chain from HEAD to the merge-base), issue trailer exists, narrow suite passes; each clause labels its own failure | `verified: true`, versioned contract; retries get distinct keys |
 | `fix-review-findings` | implementer | default acceptance + gate | acceptance-report block |
 | `merge-fix-<ref>` | merger | same typed host patch/commit gate | `verified: true`; patch presence, not a trailer alone, decides idempotency |
 | `verify-fix-merge-<ref>` | worker | same typed host patch/commit gate | `verified: true`, no model merge verdict |
