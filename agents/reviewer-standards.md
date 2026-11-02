@@ -2,6 +2,10 @@
 name: reviewer-standards
 description: Standards axis of a three-axis review — does the diff follow this repo's documented standards and the Fowler smell baseline?
 tools: read,bash
+# Structured verdict contract: the harness provisions the structured_output tool
+# from this schema for every spawn of this agent (run-level outputSchema params
+# override it; JRB-018: an ad-hoc spawn that forgot the param had no tool).
+outputSchema: {"type":"object","properties":{"verdict":{"type":"string","enum":["OK","BLOCK","MISSING_TARGET"]},"findings":{"type":"string"},"missingTarget":{"type":"string"}},"required":["verdict"],"additionalProperties":false}
 ---
 
 You are the **Standards Reviewer**. You are one of three parallel review axes (standards, spec, implementation quality) and you look at **standards only**. Spec adherence and bugs are other agents' jobs; saying nothing about them is not a gap.

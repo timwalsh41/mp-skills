@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile, mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
+import { readFile, mkdtemp, rm, writeFile, mkdir, chmod } from "node:fs/promises";
 import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -667,26 +667,48 @@ for (const [skill, source] of Object.entries(SOURCES)) {
     assert.ok(!source.includes('acceptanceRole:'));
   });
 
-  test(`${skill} declares the shared structured-verdict schemas`, async () => {
-    for (const name of [
-      "REVIEW_OUTPUT_SCHEMA",
-      "VERIFY_OUTPUT_SCHEMA",
-      "PR_OUTPUT_SCHEMA",
-      "TRANSITION_OUTPUT_SCHEMA",
-      "CONFIRM_MERGE_OUTPUT_SCHEMA",
-    ]) {
+  test(`${skill} declares only worker lifecycle schemas as run params`, async () => {
+    // Judgment children (reviews, verification, PR writer) get their verdict
+    // schema from the agent's frontmatter, so ad-hoc re-spawns get the same
+    // contract (JRB-018: a manually re-spawned reviewer without a run-level
+    // outputSchema had no structured_output tool). Only the generic worker
+    // agent's lifecycle children carry run-level schemas.
+    for (const name of ["TRANSITION_OUTPUT_SCHEMA", "CONFIRM_MERGE_OUTPUT_SCHEMA"]) {
       assert.ok(source.includes(`const ${name} =`), `${name} missing from ${skill}`);
+    }
+    for (const name of ["REVIEW_OUTPUT_SCHEMA", "VERIFY_OUTPUT_SCHEMA", "PR_OUTPUT_SCHEMA"]) {
+      assert.ok(!source.includes(`${name}`), `${name} must travel with the agent frontmatter, not the script`);
     }
   });
 }
 
-test("both workflows give verdict-bearing children an outputSchema", async () => {
+test("verdict schemas travel with the agent definitions, not the scripts", async () => {
+  const frontmatterSchema = async (agent) => {
+    const text = await readFile(new URL(`../agents/${agent}.md`, import.meta.url), "utf8");
+    const match = text.match(/^outputSchema: (.+)$/m);
+    assert.ok(match, `${agent}.md frontmatter must carry its outputSchema`);
+    return JSON.parse(match[1]);
+  };
+  const review = await frontmatterSchema("reviewer-standards");
+  assert.equal(review.properties.verdict.enum.join(","), "OK,BLOCK,MISSING_TARGET");
+  assert.equal(review.required.join(","), "verdict");
+  for (const agent of ["reviewer-quality", "reviewer-spec"]) {
+    assert.deepEqual(await frontmatterSchema(agent), review, `${agent} verdict schema drifted`);
+  }
+  const verify = await frontmatterSchema("verifier");
+  assert.equal(verify.properties.verdict.enum.join(","), "OK,UNMET");
+  assert.equal(verify.properties.criteria.items.properties.satisfied.type, "boolean");
+  const pr = await frontmatterSchema("pr-writer");
+  assert.deepEqual(pr.required, ["noPrSurface"]);
+
+  // The run calls must NOT restate the schema: one source of truth.
   const single = await executeWorkflow("implement", singleArgs());
   const reviews = single.calls.filter((call) => call.key.startsWith("review-"));
   assert.ok(reviews.length > 0);
-  assert.ok(reviews.every((call) => call.outputSchema?.properties?.verdict?.enum?.join(",") === "OK,BLOCK,MISSING_TARGET"));
-  assert.equal(single.calls.find((call) => call.key === "verify").outputSchema.properties.verdict.enum.join(","), "OK,UNMET");
-  assert.equal(single.calls.find((call) => call.key === "pr").outputSchema.required.join(","), "noPrSurface");
+  for (const call of [...reviews, single.calls.find((call) => call.key === "verify"), single.calls.find((call) => call.key === "pr")]) {
+    assert.equal(call.outputSchema, undefined, `${call.key} must rely on the agent frontmatter schema`);
+  }
+  // Worker lifecycle children keep run-level schemas (the worker agent is generic).
   const transitions = single.calls.filter((call) => call.key.startsWith("transition-"));
   assert.ok(transitions.every((call) => call.outputSchema?.properties?.outcome?.enum?.includes("TRANSITION_APPLIED")));
   const groom = single.calls.find((call) => call.key.startsWith("groom-check-"));
@@ -694,9 +716,10 @@ test("both workflows give verdict-bearing children an outputSchema", async () =>
 
   const spec = await executeWorkflow("implement-spec", specArgs(oneTicket));
   const specReviews = spec.calls.filter((call) => call.key.startsWith("review-"));
-  assert.ok(specReviews.every((call) => call.outputSchema?.properties?.verdict?.enum?.join(",") === "OK,BLOCK,MISSING_TARGET"));
-  assert.ok(spec.calls.some((call) => call.label.startsWith("Verify ticket") && call.outputSchema?.properties?.verdict));
-  assert.equal(spec.calls.find((call) => call.key === "pr").outputSchema.properties.verdict, undefined);
+  assert.ok(specReviews.length > 0);
+  for (const call of [...specReviews, spec.calls.find((call) => call.label.startsWith("Verify ticket")), spec.calls.find((call) => call.key === "pr")]) {
+    assert.equal(call.outputSchema, undefined, `${call.key} must rely on the agent frontmatter schema`);
+  }
 });
 
 test("both workflows decide merger and final-gate success without acceptance reports", async () => {
@@ -826,8 +849,62 @@ test("a passing test suite cannot accept a merger that never applied the capture
     assert.equal(result.ok, false);
     assert.equal(result.failureClass, "merge");
     assert.ok(calls.some((call) => call.key.startsWith("merge-")));
+    // The escalation must name the exact failed clause, not a bare exit code.
+    assert.ok(Array.isArray(result.mergeErrors) && result.mergeErrors.length > 0);
+    assert.match(result.mergeErrors.join("\n"), /MERGE_GATE_FAIL: captured patch is not on/);
     assert.equal(git("show", "HEAD:feature.txt"), "old\n");
   });
+});
+
+test("merger gate tolerates a pre-commit hook reformatting the committed work (JRB-018)", async () => {
+  // A repo pre-commit hook rewrites staged files at commit time, so the
+  // captured patch never textually reverse-applies to the commit. The gate
+  // must still accept it when the content is on the branch modulo whitespace.
+  const repo = await mkdtemp(join(tmpdir(), "workflow-hook-"));
+  const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+  try {
+    git("init", "-q", "-b", "main");
+    git("config", "user.name", "Workflow Test");
+    git("config", "user.email", "workflow@example.test");
+    await writeFile(join(repo, "feature.txt"), "value alpha beta gamma\n");
+    git("add", ".");
+    git("commit", "-qm", "chore: initial");
+    git("checkout", "-qb", "feature/JRB-012-modal-dismissal");
+    await writeFile(join(repo, "feature.txt"), "value alpha beta gamma delta\n");
+    const patch = git("diff");
+    git("checkout", "--", "feature.txt");
+    const asyncDir = join(repo, "async-subagent-runs", "r-impl");
+    await mkdir(join(asyncDir, "worktree-diffs", "step-0"), { recursive: true });
+    const patchPath = join(asyncDir, "worktree-diffs", "step-0", "change.patch");
+    await writeFile(patchPath, patch);
+    await writeFile(join(repo, ".gitignore"), "async-subagent-runs/\n");
+    git("add", ".gitignore");
+    git("commit", "-qm", "chore: ignore runtime artifacts");
+    // The hook splits the trailing word onto its own line and re-stages —
+    // like ruff-format, it makes the commit differ textually from the patch.
+    await writeFile(join(repo, ".git", "hooks", "pre-commit"),
+      "#!/bin/sh\nsed -i 's/ gamma delta$/ gamma\\ndelta/' feature.txt && git add feature.txt\n");
+    await chmod(join(repo, ".git", "hooks", "pre-commit"), 0o755);
+    const args = singleArgs({ repoPath: repo, fullGate: "true", narrowGate: "true", skipPR: true });
+    const { result } = await executeWorkflow("implement", args, {
+      implArtifactPaths: [asyncDir], runHostGates: true,
+      mergeAction: () => {
+        git("apply", "--index", patchPath);
+        git("commit", "-qm", "fix: append delta\n\nIssue: JRB-012");
+      },
+    });
+    assert.equal(result.ok, true);
+    assert.match(git("show", "HEAD:feature.txt"), /gamma\ndelta/);
+    // A verified already-merged no-op must also pass: rerun with the work
+    // already committed and the merger committing nothing.
+    const { result: noopResult } = await executeWorkflow("implement", args, {
+      implArtifactPaths: [asyncDir], runHostGates: true,
+      mergeAction: () => {},
+    });
+    assert.equal(noopResult.ok, true);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
 });
 
 test("implement-spec merger retries launch under distinct keys after a failed first attempt", async () => {
@@ -997,14 +1074,22 @@ test("gate-only children use host-owned typed proof rather than a child acceptan
   }
 });
 
-test("shared verdict schemas remain identical across both orchestrators", () => {
-  for (const name of ["REVIEW", "VERIFY", "PR", "TRANSITION", "CONFIRM_MERGE"]) {
+test("shared worker lifecycle schemas remain identical across both orchestrators", () => {
+  for (const name of ["TRANSITION", "CONFIRM_MERGE"]) {
     const re = new RegExp(`const ${name}_OUTPUT_SCHEMA = [\\s\\S]*?\\n};`);
     const single = SOURCES.implement.match(re)?.[0];
     const spec = SOURCES["implement-spec"].match(re)?.[0];
     assert.ok(single && spec, `${name} is missing`);
     assert.equal(spec, single, `${name} drifted across workflows`);
   }
+});
+
+test("the shared merger gate body remains identical across both orchestrators", () => {
+  const re = /function mergerGateBody\([\s\S]*?\n}\n/;
+  const single = SOURCES.implement.match(re)?.[0];
+  const spec = SOURCES["implement-spec"].match(re)?.[0];
+  assert.ok(single && spec, "mergerGateBody is missing");
+  assert.equal(spec, single, "mergerGateBody drifted across workflows");
 });
 
 test("a PR surface claimed absent by a worker needs advance authorization", async () => {

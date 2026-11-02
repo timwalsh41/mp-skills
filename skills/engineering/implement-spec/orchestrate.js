@@ -355,52 +355,18 @@ const REVIEW_AXES = [
   { name: "quality", agent: AG.reviewerQuality, focus: "correctness, robustness, test coverage, maintainability" }
 ];
 
-// Structured verdict schemas. Verdict-bearing children must finish by calling
-// the harness's structured_output tool with one of these shapes; the workflow
-// reads result.structuredOutput and never parses the child's prose.
-// (JRB-016/JRB-017: prose token parsing rejected green children and misread
-// compliance statements.)
-const REVIEW_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    verdict: { type: "string", enum: ["OK", "BLOCK", "MISSING_TARGET"] },
-    findings: { type: "string" },
-    missingTarget: { type: "string" }
-  },
-  required: ["verdict"],
-  additionalProperties: false
-};
-const VERIFY_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    verdict: { type: "string", enum: ["OK", "UNMET"] },
-    criteria: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          criterion: { type: "string" },
-          satisfied: { type: "boolean" },
-          evidence: { type: "string" }
-        },
-        required: ["criterion", "satisfied"],
-        additionalProperties: false
-      }
-    },
-    unmet: { type: "string" }
-  },
-  required: ["verdict"],
-  additionalProperties: false
-};
-const PR_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    prUrl: { type: "string" },
-    noPrSurface: { type: "boolean" }
-  },
-  required: ["noPrSurface"],
-  additionalProperties: false
-};
+// Structured verdict contracts for judgment children (reviews, verification,
+// the PR writer) travel with the agent definitions: agents/reviewer-*.md,
+// agents/verifier.md and agents/pr-writer.md carry the schema in frontmatter,
+// so EVERY spawn — orchestrator-driven or an ad-hoc lead continuation — is
+// provisioned with the harness's structured_output tool, and the workflow
+// reads result.structuredOutput without ever parsing child prose. Do not pass
+// a run-level outputSchema for those children here: a second schema source is
+// drift, and a forgotten one is how JRB-018's manually re-spawned reviewer
+// ended up with no structured_output tool at all. Worker lifecycle children
+// keep run-level schemas below because the generic worker agent stays
+// schema-free. (JRB-016/JRB-017: prose token parsing rejected green children
+// and misread compliance statements.)
 const TRANSITION_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
@@ -890,20 +856,91 @@ function spawnFixer(ticket, priorResult, wave) {
 // continue-children) onto the integration branch in the main checkout, then
 // re-verifies the gate there. The commit check is idempotent so a retried
 // merger after a partial merge succeeds cleanly.
+// Merger gate body, shared with implement/orchestrate.js (duplicated because
+// the workflow sandbox cannot import modules). Proves on the host: right
+// branch, clean tree, the captured patch's content is on the branch, issue
+// trailers exist, and the suite is green. Every clause labels its own failure
+// on stderr, so an escalation names the exact failed check instead of a bare
+// exit code (JRB-018: a five-clause && chain produced one opaque failure and
+// forced manual forensics).
+//
+// The patch check is formatter-tolerant: a repo pre-commit hook (ruff-format
+// et al.) rewrites staged files at commit time, so the captured patch never
+// textually reverse-applies to the commit even though the work landed. For
+// each candidate base (merge-base with the base branch, HEAD~1, HEAD~2), the
+// patch is applied to a temp index and the patched tree must equal HEAD's
+// tree modulo whitespace. That passes when the work is committed (exactly,
+// hook-reformatted, or already merged as a verified no-op) and fails when it
+// is absent — the no-op success path JRB-018's second merger was denied.
+function mergerGateBody(patchPrologue, issueRefs, testCommand) {
+  const body = [
+    "fail() { echo 'MERGE_GATE_FAIL:' \"$1\" >&2; exit 1; }",
+    "cd " + shellQuote(REPO_PATH) + " || fail \"cannot enter checkout " + REPO_PATH + "\"",
+    "test \"$(git branch --show-current)\" = " + shellQuote(integrationBranch) +
+      " || fail \"checkout is on '$(git branch --show-current)', expected " + integrationBranch + "\"",
+    "test -z \"$(git status --porcelain)\" || fail \"checkout has uncommitted or untracked changes\""
+  ];
+  if (!patchPrologue) {
+    // Never search another run's patch by filename or ticket label.
+    body.push("fail \"no captured patch is attributable to this run\"");
+  } else {
+    body.push(patchPrologue);
+    body.push([
+      "work_on_branch=''",
+      "mb=$(git merge-base HEAD " + shellQuote(BASE_BRANCH) + " 2>/dev/null || true)",
+      "for cand in \"$mb\" HEAD~1 HEAD~2; do",
+      "  test -n \"$cand\" || continue",
+      "  git rev-parse -q --verify \"$cand^{tree}\" >/dev/null 2>&1 || continue",
+      "  tidx=$(mktemp) && rm -f \"$tidx\"",
+      "  if GIT_INDEX_FILE=\"$tidx\" git read-tree \"$cand\" 2>/dev/null &&",
+      "     GIT_INDEX_FILE=\"$tidx\" git apply --cached --whitespace=fix \"$pfile\" 2>/dev/null; then",
+      "    ptree=$(GIT_INDEX_FILE=\"$tidx\" git write-tree 2>/dev/null)",
+      "    rm -f \"$tidx\"",
+      "    test -n \"$ptree\" || continue",
+      "    tlist=$(mktemp)",
+      "    git diff --name-only -z \"$ptree\" HEAD | tr '\\0' '\\n' > \"$tlist\" 2>/dev/null",
+      "    equiv=1",
+      "    while IFS= read -r p; do",
+      "      test -n \"$p\" || continue",
+      "      a=$(git show \"$ptree:$p\" 2>/dev/null | tr -d '[:space:]')",
+      "      b=$(git show \"HEAD:$p\" 2>/dev/null | tr -d '[:space:]')",
+      "      if ! test \"$a\" = \"$b\"; then equiv=''; break; fi",
+      "    done < \"$tlist\"",
+      "    rm -f \"$tlist\"",
+      "    if test -n \"$equiv\"; then work_on_branch=1; break; fi",
+      "  else",
+      "    rm -f \"$tidx\"",
+      "  fi",
+      "done",
+      "test -n \"$work_on_branch\" || fail \"captured patch is not on " + integrationBranch +
+        ": no candidate base turns patch+base into HEAD's content modulo whitespace; branch delta: $(git diff --stat \"$(git merge-base HEAD " + shellQuote(BASE_BRANCH) + ")\" HEAD | tail -1)\""
+    ].join("\n"));
+  }
+  for (const issueRef of issueRefs) {
+    body.push("git log --format=%B " + shellQuote(BASE_BRANCH + "..HEAD") +
+      " | grep -Fxq " + shellQuote("Issue: " + issueRef) +
+      " || fail \"no commit on " + integrationBranch + " carries the 'Issue: " + issueRef + "' trailer\"");
+  }
+  body.push("(" + testCommand + ") || fail \"verification command failed on " + integrationBranch + "\"");
+  return body.join("\n");
+}
 function mergeGate(ref, result, worktreePath, affectedRefs) {
   const hint = patchHint(result);
-  const patchCheck = worktreePath
-    ? "git -C " + shellQuote(worktreePath) + " diff HEAD --no-ext-diff | git apply --check --reverse -"
-    : hint.dir
-      ? "(set -- " + shellQuote(hint.dir) + "/*.patch; [ \"$#\" -eq 1 ] && [ -f \"$1\" ] && git apply --check --reverse \"$1\")"
-      : "false"; // Never search another run's patch by filename or ticket label.
-  const commitChecks = (affectedRefs || [ref]).map(function(issue) {
-    return "(git log --format=%B " + shellQuote(BASE_BRANCH + "..HEAD") + " | grep -Fx " + shellQuote("Issue: " + issue) + ")";
-  }).join(" && ");
-  return hostGate("cd " + shellQuote(REPO_PATH) + " && " +
-    "test \"$(git branch --show-current)\" = " + shellQuote(integrationBranch) + " && " +
-    "test -z \"$(git status --porcelain)\" && " + patchCheck + " && " +
-    commitChecks + " && (" + gateCommand(ref) + ")", GATE_TIMEOUT_MS);
+  let prologue = null;
+  if (worktreePath) {
+    prologue = [
+      "pfile=$(mktemp)",
+      "git -C " + shellQuote(worktreePath) + " diff HEAD --no-ext-diff > \"$pfile\" 2>/dev/null || fail \"could not capture diff from worktree " + worktreePath + "\"",
+      "test -s \"$pfile\" || { rm -f \"$pfile\"; fail \"worktree " + worktreePath + " has no uncommitted changes to capture\"; }"
+    ].join("\n");
+  } else if (hint.dir) {
+    prologue = [
+      "set -- " + shellQuote(hint.dir) + "/*.patch",
+      "test \"$#\" -eq 1 && test -f \"$1\" || fail \"expected exactly one captured patch in " + hint.dir + ", found $#\"",
+      "pfile=$1"
+    ].join("\n");
+  }
+  return hostGate(mergerGateBody(prologue, affectedRefs || [ref], gateCommand(ref)), GATE_TIMEOUT_MS);
 }
 function spawnMerger(ticket, implResult, wave, worktreePath, attempt) {
   const hint = patchHint(implResult);
@@ -946,8 +983,17 @@ function spawnMerger(ticket, implResult, wave, worktreePath, attempt) {
     "   merged. Run: git apply --check --reverse <patch>",
     "   Exit 0 means the captured patch is ALREADY applied to this branch: do NOT",
     "   apply or commit; report that the merge was already done, with the existing",
-    "   commit hash, and exit successfully. A non-zero exit means it is NOT applied:",
-    "   continue. Never decide this from `Issue:` trailer grep or `git log --grep`:",
+    "   commit hash, and exit successfully — the host gate verifies content",
+    "   equivalence while ignoring whitespace-only differences, so a formatting",
+    "   pre-commit hook cannot make a verified no-op fail (JRB-018). A non-zero",
+    "   exit usually means it is NOT applied: continue. But if the patch will not",
+    "   forward-apply either (its content is already committed and possibly",
+    "   reformatted), verify content equivalence yourself: apply the patch to a",
+    "   temp index or worktree at a candidate base (merge-base HEAD " + BASE_BRANCH + ", or the",
+    "   parent of the existing ticket commit) and compare with HEAD using",
+    "   git diff -w; if the content matches, treat it as already merged and report",
+    "   the existing commit hash without committing anything.",
+    "   Never decide this from `Issue:` trailer grep or `git log --grep`:",
     "   a trailer proves only that some commit for this ticket exists, not that",
     "   THIS patch is applied (JRB-017: a fix merge was skipped because the",
     "   implementation commit already carried the trailer).",
@@ -1048,8 +1094,7 @@ function spawnVerifier(ticket, wave) {
     agent: AG.verifier,
     task: task.join("\n"),
     timeoutMs: MERGE_TIMEOUT_MS,
-    control: childControl(),
-    outputSchema: VERIFY_OUTPUT_SCHEMA
+    control: childControl()
   });
 }
 
@@ -1115,8 +1160,7 @@ function spawnReviews(stage, wave) {
         agent: a.agent,
         task: reviewAxisTask(a.name, a.focus),
         timeoutMs: MERGE_TIMEOUT_MS,
-        control: childControl(),
-        outputSchema: REVIEW_OUTPUT_SCHEMA
+        control: childControl()
       });
     }).then(function(result) {
       return reviewRecord(a.name, result);
@@ -1133,8 +1177,7 @@ function respawnReview(stage, wave, axis, attempt) {
     agent: cfg.agent,
     task: reviewAxisTask(axis, cfg.focus),
     timeoutMs: MERGE_TIMEOUT_MS,
-    control: childControl(),
-    outputSchema: REVIEW_OUTPUT_SCHEMA
+    control: childControl()
   });
 }
 
@@ -1918,8 +1961,14 @@ if (merged.length) {
         "2. CONTENT-BASED IDEMPOTENCY CHECK. Run: git apply --check --reverse <patch>",
         "   Exit 0 means the fix patch is ALREADY applied to this branch: do NOT apply",
         "   or commit; report that the merge was already done, with the existing commit",
-        "   hash, and exit successfully. A non-zero exit means it is NOT applied:",
-        "   continue. Never decide this from `Issue:` trailer grep or `git log --grep`",
+        "   hash, and exit successfully — the host gate verifies content equivalence",
+        "   while ignoring whitespace-only differences, so a formatting pre-commit",
+        "   hook cannot make a verified no-op fail (JRB-018). A non-zero exit usually",
+        "   means it is NOT applied: continue; if the patch will not forward-apply",
+        "   either, verify content equivalence as in the merger instructions (temp",
+        "   index/worktree at a candidate base, then git diff -w against HEAD) and",
+        "   treat a match as already merged. Never decide this from `Issue:` trailer",
+        "   grep or `git log --grep`",
         "   (JRB-017: a fix merge was skipped because an earlier commit for the same",
         "   ticket already carried the trailer).",
         "3. Locate and apply the captured patch (git apply --whitespace=fix --index <patch>).",
@@ -1973,6 +2022,7 @@ if (merged.length) {
           emit("ESCALATION: review fixes were produced but NOT merged into " +
                integrationBranch + " — the fixer's worktree may hold uncommitted work, and " +
                "the git-state verification did not confirm it is on the branch. " +
+               "Gate label: " + String((gmVerify && gmVerify.error) || (fixMergerRun && fixMergerRun.error) || "unknown").slice(0, 500) + ". " +
                "Lead decision needed before any PR.");
         }
       }
@@ -2104,8 +2154,7 @@ if (merged.length) {
         agent: AG.prWriter,
         task: prTask.join("\n"),
         timeoutMs: MERGE_TIMEOUT_MS,
-        control: childControl(),
-        outputSchema: PR_OUTPUT_SCHEMA
+        control: childControl()
       });
     } catch (eP) {
       emit("implement-spec: pr run rejected (" + eP + ")");

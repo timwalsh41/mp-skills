@@ -194,50 +194,17 @@ function reviewAxisTask(axis, focus, integrationBranch, baseBranch, repoPath, ti
   );
   return task.join("\n");
 }
-// Structured verdict schemas. Verdict-bearing children must finish by calling
-// the harness's structured_output tool with one of these shapes; the workflow
-// reads result.structuredOutput and never parses the child's prose.
-const REVIEW_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    verdict: { type: "string", enum: ["OK", "BLOCK", "MISSING_TARGET"] },
-    findings: { type: "string" },
-    missingTarget: { type: "string" }
-  },
-  required: ["verdict"],
-  additionalProperties: false
-};
-const VERIFY_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    verdict: { type: "string", enum: ["OK", "UNMET"] },
-    criteria: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          criterion: { type: "string" },
-          satisfied: { type: "boolean" },
-          evidence: { type: "string" }
-        },
-        required: ["criterion", "satisfied"],
-        additionalProperties: false
-      }
-    },
-    unmet: { type: "string" }
-  },
-  required: ["verdict"],
-  additionalProperties: false
-};
-const PR_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    prUrl: { type: "string" },
-    noPrSurface: { type: "boolean" }
-  },
-  required: ["noPrSurface"],
-  additionalProperties: false
-};
+// Structured verdict contracts for judgment children (reviews, verification,
+// the PR writer) travel with the agent definitions: agents/reviewer-*.md,
+// agents/verifier.md and agents/pr-writer.md carry the schema in frontmatter,
+// so EVERY spawn — orchestrator-driven or an ad-hoc lead continuation — is
+// provisioned with the harness's structured_output tool, and the workflow
+// reads result.structuredOutput without ever parsing child prose. Do not pass
+// a run-level outputSchema for those children here: a second schema source is
+// drift, and a forgotten one is how JRB-018's manually re-spawned reviewer
+// ended up with no structured_output tool at all. Worker lifecycle children
+// keep run-level schemas below because the generic worker agent stays
+// schema-free.
 const TRANSITION_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
@@ -641,16 +608,84 @@ function spawnFixer(priorResult, wave) {
   });
 }
 
+// Merger gate body, shared with implement-spec/orchestrate.js (duplicated
+// because the workflow sandbox cannot import modules). Proves on the host:
+// right branch, clean tree, the captured patch's content is on the branch,
+// issue trailers exist, and the suite is green. Every clause labels its own
+// failure on stderr, so an escalation names the exact failed check instead of
+// a bare exit code (JRB-018: a five-clause && chain produced one opaque
+// failure and forced manual forensics).
+//
+// The patch check is formatter-tolerant: a repo pre-commit hook (ruff-format
+// et al.) rewrites staged files at commit time, so the captured patch never
+// textually reverse-applies to the commit even though the work landed. For
+// each candidate base (merge-base with the base branch, HEAD~1, HEAD~2), the
+// patch is applied to a temp index and the patched tree must equal HEAD's
+// tree modulo whitespace. That passes when the work is committed (exactly,
+// hook-reformatted, or already merged as a verified no-op) and fails when it
+// is absent — the no-op success path JRB-018's second merger was denied.
+function mergerGateBody(patchPrologue, issueRefs, testCommand) {
+  const body = [
+    "fail() { echo 'MERGE_GATE_FAIL:' \"$1\" >&2; exit 1; }",
+    "cd " + shellQuote(REPO_PATH) + " || fail \"cannot enter checkout " + REPO_PATH + "\"",
+    "test \"$(git branch --show-current)\" = " + shellQuote(integrationBranch) +
+      " || fail \"checkout is on '$(git branch --show-current)', expected " + integrationBranch + "\"",
+    "test -z \"$(git status --porcelain)\" || fail \"checkout has uncommitted or untracked changes\""
+  ];
+  if (!patchPrologue) {
+    // Never search another run's patch by filename or ticket label.
+    body.push("fail \"no captured patch is attributable to this run\"");
+  } else {
+    body.push(patchPrologue);
+    body.push([
+      "work_on_branch=''",
+      "mb=$(git merge-base HEAD " + shellQuote(BASE_BRANCH) + " 2>/dev/null || true)",
+      "for cand in \"$mb\" HEAD~1 HEAD~2; do",
+      "  test -n \"$cand\" || continue",
+      "  git rev-parse -q --verify \"$cand^{tree}\" >/dev/null 2>&1 || continue",
+      "  tidx=$(mktemp) && rm -f \"$tidx\"",
+      "  if GIT_INDEX_FILE=\"$tidx\" git read-tree \"$cand\" 2>/dev/null &&",
+      "     GIT_INDEX_FILE=\"$tidx\" git apply --cached --whitespace=fix \"$pfile\" 2>/dev/null; then",
+      "    ptree=$(GIT_INDEX_FILE=\"$tidx\" git write-tree 2>/dev/null)",
+      "    rm -f \"$tidx\"",
+      "    test -n \"$ptree\" || continue",
+      "    tlist=$(mktemp)",
+      "    git diff --name-only -z \"$ptree\" HEAD | tr '\\0' '\\n' > \"$tlist\" 2>/dev/null",
+      "    equiv=1",
+      "    while IFS= read -r p; do",
+      "      test -n \"$p\" || continue",
+      "      a=$(git show \"$ptree:$p\" 2>/dev/null | tr -d '[:space:]')",
+      "      b=$(git show \"HEAD:$p\" 2>/dev/null | tr -d '[:space:]')",
+      "      if ! test \"$a\" = \"$b\"; then equiv=''; break; fi",
+      "    done < \"$tlist\"",
+      "    rm -f \"$tlist\"",
+      "    if test -n \"$equiv\"; then work_on_branch=1; break; fi",
+      "  else",
+      "    rm -f \"$tidx\"",
+      "  fi",
+      "done",
+      "test -n \"$work_on_branch\" || fail \"captured patch is not on " + integrationBranch +
+        ": no candidate base turns patch+base into HEAD's content modulo whitespace; branch delta: $(git diff --stat \"$(git merge-base HEAD " + shellQuote(BASE_BRANCH) + ")\" HEAD | tail -1)\""
+    ].join("\n"));
+  }
+  for (const issueRef of issueRefs) {
+    body.push("git log --format=%B " + shellQuote(BASE_BRANCH + "..HEAD") +
+      " | grep -Fxq " + shellQuote("Issue: " + issueRef) +
+      " || fail \"no commit on " + integrationBranch + " carries the 'Issue: " + issueRef + "' trailer\"");
+  }
+  body.push("(" + testCommand + ") || fail \"verification command failed on " + integrationBranch + "\"");
+  return body.join("\n");
+}
 function mergeGate(result) {
   const loc = patchLocation(result);
-  const patchCheck = loc.dir
-    ? "(set -- " + shellQuote(loc.dir) + "/*.patch; [ \"$#\" -eq 1 ] && [ -f \"$1\" ] && git apply --check --reverse \"$1\")"
-    : "false"; // No attributable patch: never guess from another run's artifacts.
-  return hostGate("cd " + shellQuote(REPO_PATH) + " && " +
-    "test \"$(git branch --show-current)\" = " + shellQuote(integrationBranch) + " && " +
-    "test -z \"$(git status --porcelain)\" && " + patchCheck + " && " +
-    "git log --format=%B " + shellQuote(BASE_BRANCH + "..HEAD") + " | grep -Fx " + shellQuote("Issue: " + ticketRef) +
-    " && (" + NARROW_GATE.command + ")", GATE_TIMEOUT_MS);
+  const prologue = loc.dir
+    ? [
+        "set -- " + shellQuote(loc.dir) + "/*.patch",
+        "test \"$#\" -eq 1 && test -f \"$1\" || fail \"expected exactly one captured patch in " + loc.dir + ", found $#\"",
+        "pfile=$1"
+      ].join("\n")
+    : null;
+  return hostGate(mergerGateBody(prologue, [ticketRef], NARROW_GATE.command), GATE_TIMEOUT_MS);
 }
 function spawnMerger(result, retry) {
   const loc = patchLocation(result);
@@ -677,8 +712,17 @@ function spawnMerger(result, retry) {
     "2. CONTENT-BASED IDEMPOTENCY CHECK. This decides whether the work is already",
     "   merged. Run: git apply --check --reverse <patch>",
     "   Exit 0 means the captured patch is ALREADY applied to this branch: do NOT",
-    "   apply the patch and do NOT commit; skip straight to step 6 and report the",
-    "   existing commit hash. A non-zero exit means it is NOT applied: continue.",
+    "   apply the patch and do NOT commit; skip straight to step 6, report the",
+    "   existing commit hash, and finish successfully — the host gate verifies",
+    "   content equivalence while ignoring whitespace-only differences, so a",
+    "   formatting pre-commit hook cannot make a verified no-op fail (JRB-018).",
+    "   A non-zero exit usually means it is NOT applied: continue. But if the",
+    "   patch will not forward-apply either (its content is already committed and",
+    "   possibly reformatted), verify content equivalence yourself: apply the",
+    "   patch to a temp index or worktree at a candidate base (merge-base HEAD " + BASE_BRANCH + ",",
+    "   or the parent of the existing ticket commit) and compare with HEAD using",
+    "   git diff -w; if the content matches, treat it as already merged and report",
+    "   the existing commit hash without committing anything.",
     "   Never decide this from `Issue:` trailer grep or `git log --grep`: a trailer",
     "   proves only that some commit for this ticket exists, not that THIS patch is",
     "   applied (JRB-017: the fix merge was skipped because the implementation",
@@ -732,8 +776,9 @@ function respawnReview(stage, axis, attempt) {
     agent: cfg.agent,
     task: reviewAxisTask(axis, cfg.focus, integrationBranch, BASE_BRANCH, REPO_PATH, ticketRef),
     timeoutMs: REVIEW_TIMEOUT_MS,
-    control: childControl(REVIEW_TIMEOUT_MS),
-    outputSchema: REVIEW_OUTPUT_SCHEMA
+    control: childControl(REVIEW_TIMEOUT_MS)
+    // No run-level outputSchema: the reviewer agent's frontmatter carries the
+    // verdict schema, so ad-hoc re-spawns get the same contract.
   });
 }
 
@@ -746,8 +791,7 @@ function spawnReviews(stage) {
         agent: a.agent,
         task: reviewAxisTask(a.name, a.focus, integrationBranch, BASE_BRANCH, REPO_PATH, ticketRef),
         timeoutMs: REVIEW_TIMEOUT_MS,
-        control: childControl(REVIEW_TIMEOUT_MS),
-        outputSchema: REVIEW_OUTPUT_SCHEMA
+        control: childControl(REVIEW_TIMEOUT_MS)
       });
     }).then(function(result) {
       return reviewRecord(a.name, result);
@@ -845,8 +889,7 @@ function spawnVerifier() {
     agent: AG.verifier,
     task: task.join("\n"),
     timeoutMs: REVIEW_TIMEOUT_MS,
-    control: childControl(REVIEW_TIMEOUT_MS),
-    outputSchema: VERIFY_OUTPUT_SCHEMA
+    control: childControl(REVIEW_TIMEOUT_MS)
   });
 }
 
@@ -907,8 +950,7 @@ function spawnPrWriter(waiverReason, blockedReviews) {
     agent: AG.prWriter,
     task: task.join("\n"),
     timeoutMs: REVIEW_TIMEOUT_MS,
-    control: childControl(REVIEW_TIMEOUT_MS),
-    outputSchema: PR_OUTPUT_SCHEMA
+    control: childControl(REVIEW_TIMEOUT_MS)
   });
 }
 
@@ -1107,6 +1149,7 @@ while (!implResult || !implResult.ok) {
 // Phase 1.5: capture the implementer's uncommitted work and commit it
 // onto the integration branch via a merger child.
 let mergeResult = null;
+const mergeErrors = [];
 try {
   mergeResult = await spawnMerger(implResult);
 } catch (e) {
@@ -1117,26 +1160,32 @@ try {
       configError: true
     };
   }
+  mergeErrors.push(String(e));
   emit("implement: merger for " + ticketRef + " rejected (" + e + ")");
 }
 if (!hostVerified(mergeResult)) {
+  mergeErrors.push((mergeResult && mergeResult.error) ? String(mergeResult.error) : "merger returned no host proof");
   // One idempotent retry — a transient lock or race on the checkout.
   try {
     mergeResult = await spawnMerger(implResult, 2);
   } catch (e2) {
+    mergeErrors.push(String(e2));
     emit("implement: merger retry rejected (" + e2 + ")");
   }
 }
 if (!hostVerified(mergeResult)) {
+  if (mergeResult && mergeResult.error) mergeErrors.push(String(mergeResult.error));
   return {
     ok: false,
     error: "ESCALATION: " + ticketRef + " was implemented but the merger FAILED to commit its work. " +
       "The implementer's retained worktree still holds uncommitted changes. " +
-      "Lead decision needed before any PR.",
+      "Each gate attempt's MERGE_GATE_FAIL label (in mergeErrors) names the exact failed clause — " +
+      "diagnose from it before relaunching. Lead decision needed before any PR.",
     escalated: true,
     ticket: ticketRef,
     failureClass: "merge",
-    runId: implResult && implResult.runId
+    runId: implResult && implResult.runId,
+    mergeErrors: mergeErrors.map(function(e) { return String(e).slice(0, 800); })
   };
 }
 
@@ -1217,10 +1266,12 @@ if (blockedAxes.length && !(PR_WAIVER_REASON && !skipPR)) {
           error: "ESCALATION: review findings were fixed but NOT merged into " +
             integrationBranch + " — the fixer's worktree holds uncommitted work, and " +
             "the git-state verification did not confirm it is on the branch. " +
+            "Gate label: " + String((gmVerify && gmVerify.error) || "unknown").slice(0, 500) + ". " +
             "Lead decision needed before any PR.",
           escalated: true,
           ticket: ticketRef,
-          failureClass: "merge"
+          failureClass: "merge",
+          gateDetail: String((gmVerify && gmVerify.error) || "").slice(0, 2000)
         };
       }
     }

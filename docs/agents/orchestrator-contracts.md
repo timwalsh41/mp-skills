@@ -10,7 +10,7 @@ from an incident. The rule underneath the table:
 Mechanisms:
 
 - **gate** - the host command emits `{"verified":true}` through a typed gate only after its checks pass. The orchestrator requires `result.structuredOutput.verified === true`. Gate-only children use `agentContract: { version: 1 }` so a missing acceptance report cannot reject a successful check; a child's successful exit cannot replace host evidence.
-- **structured** - the child must finish by calling the harness's `structured_output` tool; the orchestrator reads parsed fields.
+- **structured** - the child must finish by calling the harness's `structured_output` tool; the orchestrator reads parsed fields. For reviewer, verifier and pr-writer children the schema lives in the agent definition's frontmatter (`outputSchema:`), so every spawn — orchestrator-driven or an ad-hoc lead continuation (JRB-018) — is provisioned with the tool; those run calls carry no `outputSchema` param.
 - **structured then gate** - separate children: the first reports a judgment, then a typed host gate checks the resulting external state. Typed gates cannot be combined with a child's `outputSchema`.
 - **default acceptance** - the implementer keeps the harness's attested acceptance plus its acceptance-report block and gate. Its judgment is the deliverable.
 
@@ -20,8 +20,8 @@ dry-runs both orchestrators against stub children and fails on:
 - any `acceptanceRole` run param (agent config only; silently ignored by `runs.run`)
 - gate-decided children with no `acceptance: false`, versioned agent contract, or typed host proof
 - any prose-token decision scan (`Review verdict:`, `TRANSITION_APPLIED` regexes, `PR_CREATED:` matchers, trailer-grep idempotency)
-- verdict-bearing children missing an `outputSchema`
-- schema parity drift between `implement` and `implement-spec`
+- verdict-bearing run calls that carry an `outputSchema` param (schemas travel with the agent frontmatter), or agent definitions missing their frontmatter schema
+- schema parity drift between `implement` and `implement-spec` (schemas, merger gate body)
 
 ## implement/orchestrate.js
 
@@ -34,14 +34,14 @@ dry-runs both orchestrators against stub children and fails on:
 | `check-transition-<phase>-<ref>` | worker | typed host gate re-reads tracker status after a positive report | `verified: true`, versioned contract |
 | `impl-t<ref>` | implementer | default acceptance + gate | acceptance-report block (implementer's deliverable) |
 | `fix-t<ref>-w<n>` | implementer | default acceptance + gate | acceptance-report block |
-| `merge-<retry>-<ref>` | merger | typed host gate: correct branch, clean tree, captured patch reverse-applies, issue trailer exists, narrow suite passes | `verified: true`, versioned contract; retries get distinct keys |
+| `merge-<retry>-<ref>` | merger | typed host gate: correct branch, clean tree, captured patch's content on the branch (formatter-tolerant: temp-index tree comparison modulo whitespace across candidate bases), issue trailer exists, narrow suite passes; each clause labels its own failure | `verified: true`, versioned contract; retries get distinct keys |
 | `fix-review-findings` | implementer | default acceptance + gate | acceptance-report block |
 | `merge-fix-<ref>` | merger | same typed host patch/commit gate | `verified: true`; patch presence, not a trailer alone, decides idempotency |
 | `verify-fix-merge-<ref>` | worker | same typed host patch/commit gate | `verified: true`, no model merge verdict |
-| `review-<stage>-<axis>` (+ retries) | reviewer | structured: `verdict` (`OK`/`BLOCK`/`MISSING_TARGET`) | REVIEW_OUTPUT_SCHEMA |
-| `verify` | verifier | structured: `verdict` (`OK`/`UNMET`) | VERIFY_OUTPUT_SCHEMA |
+| `review-<stage>-<axis>` (+ retries) | reviewer | structured: `verdict` (`OK`/`BLOCK`/`MISSING_TARGET`) | schema from the reviewer agent's frontmatter; run call carries none |
+| `verify` | verifier | structured: `verdict` (`OK`/`UNMET`) | schema from the verifier agent's frontmatter |
 | `final-gate` (`final-verify` in implement-spec) | worker | typed host gate (full) on integration branch | `verified: true`, versioned contract |
-| `pr` | pr-writer | structured: `prUrl`, `noPrSurface` | PR_OUTPUT_SCHEMA; no-PR claim needs lead-confirmed `noPrSurface` |
+| `pr` | pr-writer | structured: `prUrl`, `noPrSurface` | schema from the pr-writer agent's frontmatter; no-PR claim needs lead-confirmed `noPrSurface` |
 | `confirm-pr` | worker | typed host gate: query `$PR_URL` on `$BRANCH` after writer completes | `verified: true`, versioned contract |
 | `confirm-merge-<ref>` | worker | structured `confirmed` | CONFIRM_MERGE_OUTPUT_SCHEMA, `acceptance: false` |
 | `check-merge-<ref>` | worker | typed host gate checks merge reference after a positive report | `verified: true`, versioned contract |

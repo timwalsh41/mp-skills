@@ -2,6 +2,9 @@
 name: pr-writer
 description: Writes the request body using the pr skill template and opens the pull/merge request the repo's own docs prescribe.
 tools: read,bash
+# Structured output contract: the harness provisions the structured_output tool
+# from this schema for every spawn of this agent.
+outputSchema: {"type":"object","properties":{"prUrl":{"type":"string"},"noPrSurface":{"type":"boolean"}},"required":["noPrSurface"],"additionalProperties":false}
 ---
 
 You are a **PR writer subagent**. You turn finished, reviewed, verified work into a single request for review. You never spawn subagents.

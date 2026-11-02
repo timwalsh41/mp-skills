@@ -35,10 +35,10 @@ The script lives next to this skill. Use its absolute installed path, not `~/`, 
 - **Worktree isolation:** implementation and review-fix work happen in managed worktrees.
 - **Grooming gate:** an issue that fails the documented preflight is not implemented until it is groomed.
 - **Gate enforcement:** every implementation and merge carries a host-run verification gate; claims alone do not count.
-- **Structured verdicts:** reviews, verification, the PR writer, transitions, merge confirmation, and grooming all report through the harness's structured_output tool. The orchestrator reads parsed fields and never scans child prose for decision tokens. A missing structured verdict is incomplete, not a pass, and suppresses the PR.
+- **Structured verdicts:** reviews, verification, the PR writer, transitions, merge confirmation, and grooming all report through the harness's structured_output tool (reviewer/verifier/pr-writer schemas live in the agent definitions' frontmatter). The orchestrator reads parsed fields and never scans child prose for decision tokens. A missing structured verdict is incomplete, not a pass, and suppresses the PR.
 - **Host-decided facts:** a valid, clean checkout and branch, the captured patch applied on the integration branch with an issue commit, lifecycle states, and PR or merge existence are verified by host-run gates. Merger and final-gate children use `acceptance: false` so missing prose reports do not reject green gates.
 - **Independent verification:** a verifier re-derives acceptance criteria from the committed code before PR eligibility.
-- **Conventional Commits:** the merger validates a Conventional Commit subject and an `Issue: <ref>` body trailer. Whether the work is already merged is decided from the captured patch itself (`git apply --check --reverse`), never from trailer grep; the trailer lets later runs recognize already-landed work only as context.
+- **Conventional Commits:** the merger validates a Conventional Commit subject and an `Issue: <ref>` body trailer. Whether the work is already merged is decided from the captured patch's content against the branch, tolerating reformatting pre-commit hooks (never trailer grep); a verified already-merged no-op passes. Escalations name the exact failed gate clause.
 - **PR gate:** no PR without passing verification, complete reviews, and verified acceptance criteria, except for the explicit review waiver described above.
 - **Recovery:** transient UNVERDICTED reviews are retried, and implementation failures use the configured remediation ladder.
 
